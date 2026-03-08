@@ -24,6 +24,9 @@ pub const Config = struct {
     buffer_size: u32 = constants.buffer_size_default,
     /// Maximum concurrent CON exchanges for duplicate detection.
     exchange_count: u16 = 256,
+    /// Link-format payload for GET /.well-known/core (RFC 6690).
+    /// If null, requests pass through to the handler.
+    well_known_core: ?[]const u8 = null,
 };
 
 allocator: std.mem.Allocator,
@@ -234,7 +237,24 @@ fn handle_recv(
         .arena = arena,
     };
 
-    const maybe_response = server.handler_fn(request);
+    const maybe_response = blk: {
+        if (server.config.well_known_core) |wkc| {
+            if (is_well_known_core(packet)) {
+                var cf_buf: [2]u8 = undefined;
+                const cf_opt = coapz.Option.content_format(
+                    .link_format,
+                    &cf_buf,
+                );
+                const opts = try arena.dupe(coapz.Option, &.{cf_opt});
+                break :blk @as(?handler.Response, .{
+                    .code = .content,
+                    .options = opts,
+                    .payload = wkc,
+                });
+            }
+        }
+        break :blk server.handler_fn(request);
+    };
 
     if (maybe_response) |response| {
         const response_kind: coapz.MessageKind = if (is_con)
@@ -337,6 +357,19 @@ fn send_data(
     };
 
     try server.io.send_msg(&server.msgs_response[index]);
+}
+
+/// Check if the packet is a GET /.well-known/core request.
+fn is_well_known_core(packet: coapz.Packet) bool {
+    if (packet.code != .get) return false;
+
+    var it = packet.find_options(.uri_path);
+    const seg1 = it.next() orelse return false;
+    if (!std.mem.eql(u8, seg1.value, ".well-known")) return false;
+    const seg2 = it.next() orelse return false;
+    if (!std.mem.eql(u8, seg2.value, "core")) return false;
+    // Must be exactly two segments.
+    return it.next() == null;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -683,4 +716,86 @@ test "RST cancels CON exchange" {
     const raw2 = try send_tick_recv(&server, client_fd, con_wire);
     defer testing.allocator.free(raw2);
     try testing.expectEqual(@as(u32, 2), handler_call_count);
+}
+
+test "GET /.well-known/core returns link format" {
+    const port: u16 = 19689;
+    const wkc_payload = "</sensors>;rt=\"temperature\"";
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .well_known_core = wkc_payload,
+    }, null_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x7777,
+        .token = &.{0x42},
+        .options = &.{
+            .{ .kind = .uri_path, .value = ".well-known" },
+            .{ .kind = .uri_path, .value = "core" },
+        },
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, wkc_payload, response.payload);
+
+    // Verify content-format option is present (value 40 = link_format).
+    var cf_it = response.find_options(.content_format);
+    const cf_opt = cf_it.next();
+    try testing.expect(cf_opt != null);
+}
+
+test "well_known_core null passes to handler" {
+    const port: u16 = 19690;
+
+    handler_call_count = 0;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, counting_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    // Send a /.well-known/core request — should pass to handler.
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x8888,
+        .token = &.{0x01},
+        .options = &.{
+            .{ .kind = .uri_path, .value = ".well-known" },
+            .{ .kind = .uri_path, .value = "core" },
+        },
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+    try testing.expectEqual(@as(u32, 1), handler_call_count);
 }
