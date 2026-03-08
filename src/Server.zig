@@ -49,12 +49,17 @@ msgs_response: []linux.msghdr_const,
 iovs_response: []posix.iovec,
 buffer_response: []u8,
 
+/// Pre-allocated emergency ACK buffers for OOM conditions.
+/// Each slot holds a 4-byte empty ACK (one per batch slot).
+emergency_ack: []u8,
+
 // Recv state.
 addr_recv: linux.sockaddr,
 msg_recv: linux.msghdr,
 
 // Eviction timer.
 last_eviction_ns: i128,
+tick_count: u64,
 
 /// Initialize with a simple handler (no context). Backward compatible.
 pub fn init(
@@ -134,6 +139,9 @@ fn init_raw(
     );
     errdefer allocator.free(buffer_response);
 
+    const emergency_ack = try allocator.alloc(u8, batch * 4);
+    errdefer allocator.free(emergency_ack);
+
     return .{
         .allocator = allocator,
         .io = io,
@@ -147,9 +155,11 @@ fn init_raw(
         .msgs_response = msgs_response,
         .iovs_response = iovs_response,
         .buffer_response = buffer_response,
+        .emergency_ack = emergency_ack,
         .addr_recv = std.mem.zeroes(linux.sockaddr),
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
+        .tick_count = 0,
     };
 }
 
@@ -161,6 +171,7 @@ pub fn deinit(server: *Server) void {
     server.allocator.free(server.msgs_response);
     server.allocator.free(server.iovs_response);
     server.allocator.free(server.buffer_response);
+    server.allocator.free(server.emergency_ack);
 }
 
 /// Bind the socket, register buffers, and arm the multishot recv.
@@ -254,7 +265,7 @@ pub fn tick(server: *Server) !void {
         // before the provided buffer pool is exhausted.
         processed += 1;
         if (processed % 64 == 0) {
-            _ = try server.io.submit();
+            _ = server.io.submit() catch {};
         }
     }
 
@@ -275,7 +286,13 @@ pub fn tick(server: *Server) !void {
     }
 
     _ = try server.io.submit();
-    _ = server.arena.reset(.retain_capacity);
+
+    server.tick_count += 1;
+    if (server.tick_count % 1000 == 0) {
+        _ = server.arena.reset(.free_all);
+    } else {
+        _ = server.arena.reset(.retain_capacity);
+    }
 }
 
 fn handle_recv(
@@ -287,9 +304,21 @@ fn handle_recv(
 
     const recv = try server.io.decode_recv(cqe);
 
+    // Save raw header bytes before buffer release for emergency ACK.
+    var raw_header: [4]u8 = .{ 0, 0, 0, 0 };
+    if (recv.payload.len >= 4) {
+        @memcpy(&raw_header, recv.payload[0..4]);
+    }
+
     const packet = coapz.Packet.read(arena, recv.payload) catch |err| {
         server.io.release_buffer(recv.buffer_id) catch {};
-        log.debug("malformed CoAP packet: {}", .{err});
+        switch (err) {
+            error.OutOfMemory => {
+                log.warn("OOM parsing packet, sending emergency ACK", .{});
+                server.send_emergency_ack(&raw_header, recv.peer_address, index);
+            },
+            else => log.debug("malformed CoAP packet: {}", .{err}),
+        }
         return;
     };
 
@@ -336,7 +365,15 @@ fn handle_recv(
                     .link_format,
                     &cf_buf,
                 );
-                const opts = try arena.dupe(coapz.Option, &.{cf_opt});
+                const opts = arena.dupe(coapz.Option, &.{cf_opt}) catch |err| {
+                    switch (err) {
+                        error.OutOfMemory => {
+                            log.warn("OOM building well-known response, sending emergency ACK", .{});
+                            if (is_con) server.send_emergency_ack(&raw_header, recv.peer_address, index);
+                            return;
+                        },
+                    }
+                };
                 break :blk @as(?handler.Response, .{
                     .code = .content,
                     .options = opts,
@@ -363,7 +400,16 @@ fn handle_recv(
             .data_buf = &.{},
         };
 
-        const data_wire = try response_packet.write(arena);
+        const data_wire = response_packet.write(arena) catch |err| {
+            switch (err) {
+                error.OutOfMemory => {
+                    log.warn("OOM encoding response, sending emergency ACK", .{});
+                    if (is_con) server.send_emergency_ack(&raw_header, recv.peer_address, index);
+                },
+                else => log.err("response write failed: {}", .{err}),
+            }
+            return;
+        };
         try server.send_data(data_wire, recv.peer_address, index);
 
         // Cache the response for CON dedup.
@@ -400,7 +446,16 @@ fn handle_recv(
             .payload = &.{},
             .data_buf = &.{},
         };
-        const data_wire = try ack.write(arena);
+        const data_wire = ack.write(arena) catch |err| {
+            switch (err) {
+                error.OutOfMemory => {
+                    log.warn("OOM encoding empty ACK, sending emergency ACK", .{});
+                    server.send_emergency_ack(&raw_header, recv.peer_address, index);
+                },
+                else => log.err("ack write failed: {}", .{err}),
+            }
+            return;
+        };
         try server.send_data(data_wire, recv.peer_address, index);
 
         // Cache the empty ACK too.
@@ -424,6 +479,34 @@ fn handle_recv(
             }
         }
     }
+}
+
+/// Send a pre-allocated empty ACK when OOM prevents normal response.
+/// Extracts msg_id from raw CoAP header bytes (first 4 bytes of payload).
+fn send_emergency_ack(
+    server: *Server,
+    raw_payload: []const u8,
+    peer_address: std.net.Address,
+    index: usize,
+) void {
+    if (raw_payload.len < 4) return;
+
+    // CoAP header: ver|type|tkl(1B) code(1B) msg_id(2B)
+    // Check if CON (type bits = 0b00 in bits 5:4)
+    const type_bits = (raw_payload[0] >> 4) & 0x03;
+    if (type_bits != 0) return; // not CON
+
+    const slot = index * 4;
+    if (slot + 4 > server.emergency_ack.len) return;
+
+    // Build empty ACK: version=1, type=ACK(2), tkl=0, code=0.00, same msg_id
+    server.emergency_ack[slot + 0] = 0x60; // ver=1, type=ACK(10), tkl=0
+    server.emergency_ack[slot + 1] = 0x00; // code = 0.00 (empty)
+    server.emergency_ack[slot + 2] = raw_payload[2]; // msg_id high
+    server.emergency_ack[slot + 3] = raw_payload[3]; // msg_id low
+
+    const ack_data = server.emergency_ack[slot..][0..4];
+    server.send_data(ack_data, peer_address, index) catch {};
 }
 
 /// Encode and queue a UDP response to the peer.
