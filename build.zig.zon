@@ -1,13 +1,20 @@
 .{
-    .name = .udpd,
-    .version = "0.0.1",
+    .name = .coapd,
+    .version = "0.1.0",
     .minimum_zig_version = "0.15.1",
-    .fingerprint = 0x579b30f9e3660291, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.14.1",
-    .dependencies = .{},
+    .fingerprint = 0x57006075d3104028,
+    .dependencies = .{
+        .coapz = .{
+            .url = "git+https://github.com/cvik/coapz#v0.2.0",
+            .hash = "coapz-0.2.0-kDItyH7xAAAAhoL1o4PWRY1mkwoNAYPK0rNLL9o8rWI_",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "examples",
+        "bench",
+        "README.md",
     },
 }
