@@ -27,6 +27,9 @@ pub const Config = struct {
     /// Link-format payload for GET /.well-known/core (RFC 6690).
     /// If null, requests pass through to the handler.
     well_known_core: ?[]const u8 = null,
+    /// Number of server threads. Each gets its own socket/ring/exchange pool.
+    /// Kernel distributes packets via SO_REUSEPORT.
+    thread_count: u16 = 1,
 };
 
 allocator: std.mem.Allocator,
@@ -140,11 +143,38 @@ pub fn listen(server: *Server) !void {
 pub fn run(server: *Server) !void {
     try server.listen();
 
-    log.info("coapd listening on port {d}", .{server.config.port});
+    const extra = server.config.thread_count -| 1;
+    const threads = try server.allocator.alloc(std.Thread, extra);
+    defer server.allocator.free(threads);
+
+    for (threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, run_worker, .{
+            server.allocator,
+            server.config,
+            server.handler_fn,
+        });
+    }
+
+    log.info("coapd listening on port {d} ({d} thread{s})", .{
+        server.config.port,
+        server.config.thread_count,
+        if (server.config.thread_count > 1) "s" else "",
+    });
 
     while (true) {
         try server.tick();
     }
+}
+
+fn run_worker(
+    allocator: std.mem.Allocator,
+    config: Config,
+    handler_fn: handler.HandlerFn,
+) void {
+    var worker = Server.init(allocator, config, handler_fn) catch return;
+    defer worker.deinit();
+    worker.listen() catch return;
+    while (true) worker.tick() catch return;
 }
 
 pub fn tick(server: *Server) !void {

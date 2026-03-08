@@ -17,6 +17,7 @@ const Config = struct {
     use_confirmable: bool = false,
     window_size: u16 = 256,
     embedded_server: bool = true,
+    thread_count: u16 = 1,
 };
 
 pub fn main() !void {
@@ -34,7 +35,7 @@ pub fn main() !void {
     };
 
     if (config.embedded_server) {
-        server_pid = try fork_server(config.port);
+        server_pid = try fork_server(config.port, config.thread_count);
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
@@ -144,7 +145,7 @@ fn echo_handler(request: coapd.Request) ?coapd.Response {
     return .{ .payload = request.packet.payload };
 }
 
-fn fork_server(port: u16) !posix.pid_t {
+fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // Child process: run the echo server.
@@ -154,6 +155,7 @@ fn fork_server(port: u16) !posix.pid_t {
                 .port = port,
                 .buffer_count = 1024,
                 .buffer_size = 1280,
+                .thread_count = thread_count,
             },
             echo_handler,
         ) catch std.process.exit(1);
@@ -419,6 +421,13 @@ fn parse_args() Config {
             ) catch 256;
         } else if (std.mem.eql(u8, arg, "--no-server")) {
             config.embedded_server = false;
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            const val = args.next() orelse "1";
+            config.thread_count = std.fmt.parseInt(
+                u16,
+                val,
+                10,
+            ) catch 1;
         }
     }
 
