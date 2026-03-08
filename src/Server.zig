@@ -54,6 +54,9 @@ pub const Config = struct {
     handler_warn_ns: u64 = 0,
     /// Maximum worker restart attempts before giving up.
     max_worker_restarts: u16 = 5,
+    /// CPU core IDs for thread pinning. Thread i pins to
+    /// cpu_affinity[i % len]. null = no pinning (default).
+    cpu_affinity: ?[]const u16 = null,
 };
 
 allocator: std.mem.Allocator,
@@ -137,6 +140,10 @@ fn init_raw(
     if (config.buffer_count == 0 or
         config.buffer_size < 64 or
         config.port == 0) return error.InvalidConfig;
+
+    if (config.cpu_affinity) |cores| {
+        if (cores.len == 0) return error.InvalidConfig;
+    }
 
     var io = try Io.init(
         allocator,
@@ -263,6 +270,10 @@ const WorkerState = struct {
 pub fn run(server: *Server) !void {
     try server.listen();
 
+    if (server.config.cpu_affinity) |cores| {
+        setCpuAffinity(cores[0]);
+    }
+
     const extra = server.config.thread_count -| 1;
     const workers = try server.allocator.alloc(WorkerState, extra);
     defer server.allocator.free(workers);
@@ -370,6 +381,20 @@ fn monitor_workers(
     }
 }
 
+fn setCpuAffinity(core: u16) void {
+    var set = std.mem.zeroes(linux.cpu_set_t);
+    const usize_bits = @bitSizeOf(usize);
+    const word = core / usize_bits;
+    if (word >= set.len) {
+        log.warn("cpu affinity: core {d} exceeds max {d}", .{ core, set.len * usize_bits - 1 });
+        return;
+    }
+    set[word] = @as(usize, 1) << @intCast(core % usize_bits);
+    linux.sched_setaffinity(0, &set) catch |err| {
+        log.warn("sched_setaffinity core {d}: {}", .{ core, err });
+    };
+}
+
 fn run_worker(
     allocator: std.mem.Allocator,
     config: Config,
@@ -392,6 +417,10 @@ fn run_worker(
             backoff_ms,
         });
         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+    }
+
+    if (config.cpu_affinity) |cores| {
+        setCpuAffinity(cores[(state.index + 1) % cores.len]);
     }
 
     var worker = init_raw(allocator, config, handler_fn, handler_context) catch |err| {
@@ -1431,6 +1460,15 @@ test "init rejects invalid config" {
     try testing.expectError(error.InvalidConfig, Server.init(
         testing.allocator,
         .{ .port = 0, .buffer_count = 4, .buffer_size = 256 },
+        echo_handler,
+    ));
+}
+
+test "cpu_affinity rejects empty list" {
+    const empty: []const u16 = &.{};
+    try testing.expectError(error.InvalidConfig, Server.init(
+        testing.allocator,
+        .{ .port = 19701, .buffer_count = 4, .buffer_size = 256, .cpu_affinity = empty },
         echo_handler,
     ));
 }

@@ -216,6 +216,7 @@ var server = try coapd.Server.init(allocator, .{
     .load_shed_recover_pct = 50,      // % utilization to recover
     .handler_warn_ns = 0,             // slow handler warning threshold (ns)
     .max_worker_restarts = 5,         // max worker restart attempts
+    .cpu_affinity = &.{ 0, 1, 2, 3 }, // pin threads to CPU cores
 }, handler);
 ```
 
@@ -313,6 +314,24 @@ handlers in production.
 Maximum number of times a crashed worker thread is automatically restarted.
 After this limit, the worker is not respawned and a log error is emitted.
 Default: `5`.
+
+### `cpu_affinity`
+
+Pin server threads to specific CPU cores. Thread *i* is pinned to
+`cpu_affinity[i % len]` — the main thread uses index 0, workers use
+indices 1..N-1. This keeps each thread's io_uring buffers hot in L1/L2
+cache and reduces latency jitter from OS thread migration.
+
+```zig
+var server = try coapd.Server.init(allocator, .{
+    .thread_count = 4,
+    .cpu_affinity = &.{ 0, 2, 4, 6 },  // pin to even cores
+}, handler);
+```
+
+When `null` (default), no affinity is set — the OS schedules threads
+freely. If pinning fails (e.g., core ID out of range or insufficient
+permissions), a warning is logged and the thread continues unpinned.
 
 ## Rate Limiting
 
