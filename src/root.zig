@@ -8,9 +8,11 @@ pub const coap = @import("coapz");
 
 const constants = @import("constants.zig");
 const Io = @import("Io.zig");
+const Exchange = @import("exchange.zig");
 
 test {
     _ = constants;
     _ = Io;
     _ = Server;
+    _ = Exchange;
 }
