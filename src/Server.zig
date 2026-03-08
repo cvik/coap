@@ -673,17 +673,16 @@ fn handle_recv(
             .data_buf = &.{},
         };
 
-        const data_wire = response_packet.write(arena) catch |err| {
+        const data_wire = server.send_packet(response_packet, recv.peer_address, index) catch |err| {
             switch (err) {
-                error.OutOfMemory => {
-                    log.warn("OOM encoding response, sending emergency ACK", .{});
+                error.OutOfMemory, error.BufferTooSmall => {
+                    log.warn("encoding response failed, sending emergency ACK", .{});
                     if (is_con) server.send_emergency_ack(&raw_header, recv.peer_address, index);
                 },
-                else => log.err("response write failed: {}", .{err}),
+                else => log.err("response send failed: {}", .{err}),
             }
             return;
         };
-        try server.send_data(data_wire, recv.peer_address, index);
 
         // Cache the response for CON dedup.
         if (is_con) {
@@ -718,17 +717,16 @@ fn handle_recv(
             .payload = &.{},
             .data_buf = &.{},
         };
-        const data_wire = ack.write(arena) catch |err| {
+        const data_wire = server.send_packet(ack, recv.peer_address, index) catch |err| {
             switch (err) {
-                error.OutOfMemory => {
-                    log.warn("OOM encoding empty ACK, sending emergency ACK", .{});
+                error.OutOfMemory, error.BufferTooSmall => {
+                    log.warn("encoding empty ACK failed, sending emergency ACK", .{});
                     server.send_emergency_ack(&raw_header, recv.peer_address, index);
                 },
-                else => log.err("ack write failed: {}", .{err}),
+                else => log.err("ack send failed: {}", .{err}),
             }
             return;
         };
-        try server.send_data(data_wire, recv.peer_address, index);
 
         // Cache the empty ACK too.
         const key = Exchange.peer_key(
@@ -847,7 +845,26 @@ fn update_load_level(server: *Server) void {
     }
 }
 
-/// Encode and queue a UDP response to the peer.
+/// Get the response buffer slot for a given CQE index.
+fn response_buf(server: *Server, index: usize) []u8 {
+    const offset_buf = index * server.config.buffer_size;
+    return server.buffer_response[offset_buf..][0..server.config.buffer_size];
+}
+
+/// Encode a packet directly into the response buffer and queue it for sending.
+fn send_packet(
+    server: *Server,
+    pkt: coapz.Packet,
+    peer_address: std.net.Address,
+    index: usize,
+) ![]const u8 {
+    const buf = server.response_buf(index);
+    const data = pkt.writeBuf(buf) catch |err| return err;
+    try server.send_raw(data, peer_address, index);
+    return data;
+}
+
+/// Queue pre-encoded data from the response buffer (or other source) for sending.
 fn send_data(
     server: *Server,
     data: []const u8,
@@ -865,15 +882,31 @@ fn send_data(
         return;
     }
 
+    // If data is not already in the response buffer, copy it in.
     const offset_buf = index * server.config.buffer_size;
-    const slot = server.buffer_response[offset_buf..][0..data.len];
-    @memcpy(slot, data);
+    const slot_start = @intFromPtr(server.buffer_response.ptr) + offset_buf;
+    const data_start = @intFromPtr(data.ptr);
+    if (data_start < slot_start or data_start >= slot_start + server.config.buffer_size) {
+        const slot = server.buffer_response[offset_buf..][0..data.len];
+        @memcpy(slot, data);
+        return server.send_raw(slot, peer_address, index);
+    }
 
+    return server.send_raw(data, peer_address, index);
+}
+
+/// Queue a sendmsg for data already positioned correctly.
+fn send_raw(
+    server: *Server,
+    data: []const u8,
+    peer_address: std.net.Address,
+    index: usize,
+) !void {
     server.addrs_response[index] = peer_address.any;
 
     server.iovs_response[index] = .{
-        .base = @ptrCast(slot.ptr),
-        .len = slot.len,
+        .base = @ptrCast(@constCast(data.ptr)),
+        .len = data.len,
     };
 
     server.msgs_response[index] = .{

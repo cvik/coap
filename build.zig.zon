@@ -5,8 +5,8 @@
     .fingerprint = 0x57006075d3104028,
     .dependencies = .{
         .coapz = .{
-            .url = "git+https://github.com/cvik/coapz#v0.2.0",
-            .hash = "coapz-0.2.0-kDItyH7xAAAAhoL1o4PWRY1mkwoNAYPK0rNLL9o8rWI_",
+            .url = "git+https://github.com/cvik/coapz#v0.2.1",
+            .hash = "coapz-0.2.1-kDItyE38AABNjQWC5ANU31XsJdHR9PBmfA4zJ3NmWcrB",
         },
     },
     .paths = .{
