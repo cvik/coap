@@ -32,12 +32,25 @@ fn echo(request: coapd.Request) ?coapd.Response {
 
 ## Roadmap
 
-- [ ] CON/ACK reliability (retransmission, duplicate detection)
-- [ ] io_uring benchmark client
+- [x] CON/ACK reliability (duplicate detection, piggybacked ACK, response caching)
+- [x] Pipelined benchmark client with embedded server
 - [ ] Routing
 - [ ] Multi-threading with SO_REUSEPORT
 - [ ] .well-known/core resource discovery
 
 ## Benchmarks
 
-TBD
+Single-threaded echo server, loopback, minimal CoAP NON GET (6 bytes):
+
+```
+zig build bench -Doptimize=ReleaseFast -- --count 10000000
+```
+
+| Metric | Value |
+|--------|-------|
+| Throughput | ~870K req/s |
+| Avg latency | ~73µs (window=64) |
+| Min latency | ~8µs |
+| Packet loss | 0% |
+
+Benchmark options: `--count`, `--window`, `--payload`, `--con`, `--no-server`.
