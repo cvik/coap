@@ -10,6 +10,7 @@ const posix = std.posix;
 const coapz = @import("coapz");
 const Io = @import("Io.zig");
 const Exchange = @import("exchange.zig");
+const RateLimiter = @import("rate_limiter.zig");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
 const log = std.log.scoped(.coapd);
@@ -17,6 +18,8 @@ const log = std.log.scoped(.coapd);
 const Cqe = linux.io_uring_cqe;
 
 const Server = @This();
+
+pub const LoadLevel = enum { normal, throttled, shedding };
 
 pub const Config = struct {
     port: u16 = constants.port_default,
@@ -34,6 +37,18 @@ pub const Config = struct {
     bind_address: []const u8 = "0.0.0.0",
     /// Maximum arena size in bytes. Arena is trimmed after each tick.
     max_arena_size: usize = 256 * 1024,
+    /// Per-IP rate limit: max tracked IPs. 0 = disabled.
+    rate_limit_ip_count: u16 = 1024,
+    /// Per-IP rate limit: tokens refilled per second.
+    rate_limit_tokens_per_sec: u16 = 100,
+    /// Per-IP rate limit: maximum burst (bucket capacity).
+    rate_limit_burst: u16 = 200,
+    /// Load shedding: enter throttled when any pool reaches this %.
+    load_shed_throttle_pct: u8 = 75,
+    /// Load shedding: enter shedding when any pool reaches this %.
+    load_shed_critical_pct: u8 = 90,
+    /// Load shedding: recover to normal when both pools drop below this %.
+    load_shed_recover_pct: u8 = 50,
 };
 
 allocator: std.mem.Allocator,
@@ -68,6 +83,15 @@ next_msg_id: u16,
 
 // Arena management.
 force_free_all: bool,
+
+// Load shedding and rate limiting.
+load_level: LoadLevel,
+buffers_outstanding: u16,
+rate_limiter: ?RateLimiter,
+tick_now_ns: i128,
+
+/// Pre-allocated RST buffers for rate-limited/shed CON packets.
+rate_limit_rst: []u8,
 
 /// Initialize with a simple handler (no context). Backward compatible.
 pub fn init(
@@ -150,6 +174,19 @@ fn init_raw(
     const emergency_ack = try allocator.alloc(u8, batch * 4);
     errdefer allocator.free(emergency_ack);
 
+    const rate_limit_rst = try allocator.alloc(u8, batch * 4);
+    errdefer allocator.free(rate_limit_rst);
+
+    var rate_limiter: ?RateLimiter = null;
+    if (config.rate_limit_ip_count > 0) {
+        rate_limiter = try RateLimiter.init(allocator, .{
+            .ip_count = config.rate_limit_ip_count,
+            .tokens_per_sec = config.rate_limit_tokens_per_sec,
+            .burst = config.rate_limit_burst,
+        });
+    }
+    errdefer if (rate_limiter) |*rl| rl.deinit(allocator);
+
     return .{
         .allocator = allocator,
         .io = io,
@@ -170,6 +207,11 @@ fn init_raw(
         .tick_count = 0,
         .next_msg_id = std.crypto.random.int(u16),
         .force_free_all = false,
+        .load_level = .normal,
+        .buffers_outstanding = 0,
+        .rate_limiter = rate_limiter,
+        .tick_now_ns = 0,
+        .rate_limit_rst = rate_limit_rst,
     };
 }
 
@@ -182,6 +224,8 @@ pub fn deinit(server: *Server) void {
     server.allocator.free(server.iovs_response);
     server.allocator.free(server.buffer_response);
     server.allocator.free(server.emergency_ack);
+    server.allocator.free(server.rate_limit_rst);
+    if (server.rate_limiter) |*rl| rl.deinit(server.allocator);
 }
 
 /// Bind the socket, register buffers, and arm the multishot recv.
@@ -305,6 +349,8 @@ pub fn tick(server: *Server) !void {
     const batch_max = constants.completion_batch_max;
     var cqes: [batch_max]Cqe = std.mem.zeroes([batch_max]Cqe);
 
+    server.tick_now_ns = std.time.nanoTimestamp();
+
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
     var recv_fail_count: u32 = 0;
@@ -344,15 +390,17 @@ pub fn tick(server: *Server) !void {
     }
 
     // Periodic exchange eviction (~every 10 seconds).
-    const now = std.time.nanoTimestamp();
     const eviction_interval_ns: i128 = 10 * std.time.ns_per_s;
-    if (now - server.last_eviction_ns > eviction_interval_ns) {
-        const evicted = server.exchanges.evict_expired(now);
+    if (server.tick_now_ns - server.last_eviction_ns > eviction_interval_ns) {
+        const evicted = server.exchanges.evict_expired(server.tick_now_ns);
         if (evicted > 0) {
             log.debug("evicted {d} expired exchanges", .{evicted});
         }
-        server.last_eviction_ns = now;
+        server.last_eviction_ns = server.tick_now_ns;
     }
+
+    // Compute load level based on buffer/exchange pool utilization.
+    server.update_load_level();
 
     _ = try server.io.submit();
 
@@ -380,6 +428,7 @@ fn handle_recv(
     const arena = server.arena.allocator();
 
     const recv = try server.io.decode_recv(cqe);
+    server.buffers_outstanding +|= 1;
 
     // Save raw header bytes before buffer release for emergency ACK.
     var raw_header: [4]u8 = .{ 0, 0, 0, 0 };
@@ -387,8 +436,45 @@ fn handle_recv(
         @memcpy(&raw_header, recv.payload[0..4]);
     }
 
+    // Load shedding: drop new packets when critically loaded.
+    if (server.load_level == .shedding) {
+        // Always serve cached CON retransmits.
+        if (recv.payload.len >= 4) {
+            const msg_id = std.mem.readInt(u16, raw_header[2..4], .big);
+            const key = Exchange.peer_key(recv.peer_address, msg_id);
+            if (server.exchanges.find(key)) |slot_idx| {
+                const cached = server.exchanges.cached_response(slot_idx);
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                server.send_data(cached, recv.peer_address, index) catch {};
+                return;
+            }
+        }
+        // CON: send RST. NON: drop silently.
+        const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
+        release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
+        if (is_con_raw) server.send_rst(&raw_header, recv.peer_address, index);
+        return;
+    }
+
+    // Rate limiting in throttled mode.
+    if (server.load_level == .throttled) {
+        if (server.rate_limiter) |*rl| {
+            const ip = recv.peer_address.in.sa.addr;
+            if (!rl.allow(ip, server.tick_now_ns)) {
+                const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                if (is_con_raw) server.send_rst(&raw_header, recv.peer_address, index);
+                return;
+            }
+        }
+    }
+
     const packet = coapz.Packet.read(arena, recv.payload) catch |err| {
         release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
         switch (err) {
             error.OutOfMemory => {
                 log.warn("OOM parsing packet, sending emergency ACK", .{});
@@ -403,6 +489,7 @@ fn handle_recv(
     // data into the arena, so the provided buffer can be returned to
     // the kernel pool without waiting for response construction.
     release_buffer_robust(&server.io, recv.buffer_id);
+    server.buffers_outstanding -|= 1;
 
     // RST cancels the matching exchange.
     if (packet.kind == .reset) {
@@ -493,18 +580,17 @@ fn handle_recv(
                 recv.peer_address,
                 packet.msg_id,
             );
-            const now = std.time.nanoTimestamp();
             if (server.exchanges.insert(
                 key,
                 packet.msg_id,
                 data_wire,
-                now,
+                server.tick_now_ns,
             ) == null) {
                 // Try evicting expired entries before giving up.
-                const evicted = server.exchanges.evict_expired(now);
+                const evicted = server.exchanges.evict_expired(server.tick_now_ns);
                 if (evicted > 0) {
-                    server.last_eviction_ns = now;
-                    _ = server.exchanges.insert(key, packet.msg_id, data_wire, now);
+                    server.last_eviction_ns = server.tick_now_ns;
+                    _ = server.exchanges.insert(key, packet.msg_id, data_wire, server.tick_now_ns);
                 } else {
                     log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
                 }
@@ -538,17 +624,16 @@ fn handle_recv(
             recv.peer_address,
             packet.msg_id,
         );
-        const now = std.time.nanoTimestamp();
         if (server.exchanges.insert(
             key,
             packet.msg_id,
             data_wire,
-            now,
+            server.tick_now_ns,
         ) == null) {
-            const evicted = server.exchanges.evict_expired(now);
+            const evicted = server.exchanges.evict_expired(server.tick_now_ns);
             if (evicted > 0) {
-                server.last_eviction_ns = now;
-                _ = server.exchanges.insert(key, packet.msg_id, data_wire, now);
+                server.last_eviction_ns = server.tick_now_ns;
+                _ = server.exchanges.insert(key, packet.msg_id, data_wire, server.tick_now_ns);
             } else {
                 log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
             }
@@ -582,6 +667,72 @@ fn send_emergency_ack(
 
     const ack_data = server.emergency_ack[slot..][0..4];
     server.send_data(ack_data, peer_address, index) catch {};
+}
+
+/// Send a pre-allocated RST for rate-limited/shed CON packets.
+fn send_rst(
+    server: *Server,
+    raw_header: []const u8,
+    peer_address: std.net.Address,
+    index: usize,
+) void {
+    if (raw_header.len < 4) return;
+
+    const slot = index * 4;
+    if (slot + 4 > server.rate_limit_rst.len) return;
+
+    // Build RST: version=1, type=RST(3), tkl=0, code=0.00, same msg_id
+    server.rate_limit_rst[slot + 0] = 0x70; // ver=1, type=RST(11), tkl=0
+    server.rate_limit_rst[slot + 1] = 0x00;
+    server.rate_limit_rst[slot + 2] = raw_header[2];
+    server.rate_limit_rst[slot + 3] = raw_header[3];
+
+    const rst_data = server.rate_limit_rst[slot..][0..4];
+    server.send_data(rst_data, peer_address, index) catch {};
+}
+
+/// Recompute load level based on pool utilization.
+fn update_load_level(server: *Server) void {
+    const buf_pct: u16 = if (server.config.buffer_count > 0)
+        (server.buffers_outstanding *| 100) / server.config.buffer_count
+    else
+        0;
+    const exch_pct: u16 = if (server.config.exchange_count > 0)
+        (@as(u16, server.exchanges.count_active) *| 100) / server.config.exchange_count
+    else
+        0;
+
+    const max_pct: u16 = @max(buf_pct, exch_pct);
+
+    switch (server.load_level) {
+        .normal => {
+            if (max_pct >= server.config.load_shed_critical_pct) {
+                server.load_level = .shedding;
+                log.warn("load shedding: critical ({d}%)", .{max_pct});
+            } else if (max_pct >= server.config.load_shed_throttle_pct) {
+                server.load_level = .throttled;
+                log.info("load shedding: throttled ({d}%)", .{max_pct});
+            }
+        },
+        .throttled => {
+            if (max_pct >= server.config.load_shed_critical_pct) {
+                server.load_level = .shedding;
+                log.warn("load shedding: critical ({d}%)", .{max_pct});
+            } else if (max_pct < server.config.load_shed_recover_pct) {
+                server.load_level = .normal;
+                log.info("load shedding: recovered", .{});
+            }
+        },
+        .shedding => {
+            if (max_pct < server.config.load_shed_recover_pct) {
+                server.load_level = .normal;
+                log.info("load shedding: recovered", .{});
+            } else if (max_pct < server.config.load_shed_throttle_pct) {
+                server.load_level = .throttled;
+                log.info("load shedding: eased to throttled ({d}%)", .{max_pct});
+            }
+        },
+    }
 }
 
 /// Encode and queue a UDP response to the peer.
