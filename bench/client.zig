@@ -110,6 +110,7 @@ pub fn main() !void {
             template_wire,
             config.warmup_count,
             config.window_size,
+            false,
         );
     }
 
@@ -125,16 +126,18 @@ pub fn main() !void {
     );
 
     const start = std.time.nanoTimestamp();
-    const result = try run_bench(
+    var result = try run_bench(
         allocator,
         fd,
         template_wire,
         config.request_count,
         config.window_size,
+        true,
     );
     const elapsed_ns = std.time.nanoTimestamp() - start;
+    defer allocator.free(result.latencies);
 
-    report(config, result, elapsed_ns);
+    report(config, &result, elapsed_ns);
 }
 
 fn echo_handler(request: coapd.Request) ?coapd.Response {
@@ -169,6 +172,8 @@ const BenchResult = struct {
     latency_min_ns: i128,
     latency_max_ns: i128,
     latency_sum_ns: i128,
+    latencies: []i64,
+    latency_count: u32,
 };
 
 fn run_bench(
@@ -177,9 +182,15 @@ fn run_bench(
     template: []const u8,
     count: u32,
     window: u16,
+    collect_latencies: bool,
 ) !BenchResult {
     std.debug.assert(window > 0);
     std.debug.assert(template.len >= 6);
+
+    const latencies: []i64 = if (collect_latencies)
+        try allocator.alloc(i64, count)
+    else
+        &.{};
 
     var result = BenchResult{
         .sent = 0,
@@ -190,6 +201,8 @@ fn run_bench(
         .latency_min_ns = std.math.maxInt(i128),
         .latency_max_ns = 0,
         .latency_sum_ns = 0,
+        .latencies = latencies,
+        .latency_count = 0,
     };
 
     const timestamps = try allocator.alloc(i128, window);
@@ -272,6 +285,13 @@ fn run_bench(
                 if (latency > result.latency_max_ns) {
                     result.latency_max_ns = latency;
                 }
+                if (collect_latencies and
+                    result.latency_count < count)
+                {
+                    result.latencies[result.latency_count] =
+                        @intCast(latency);
+                    result.latency_count += 1;
+                }
             }
         }
     }
@@ -279,7 +299,18 @@ fn run_bench(
     return result;
 }
 
-fn report(config: Config, result: BenchResult, elapsed_ns: i128) void {
+fn percentile_us(sorted: []i64, p: f64) f64 {
+    if (sorted.len == 0) return 0;
+    const idx: usize = @min(
+        @as(usize, @intFromFloat(
+            @as(f64, @floatFromInt(sorted.len)) * p,
+        )),
+        sorted.len - 1,
+    );
+    return @as(f64, @floatFromInt(sorted[idx])) / 1000.0;
+}
+
+fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
     const elapsed_ms: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e6;
     const elapsed_s: f64 = elapsed_ms / 1000.0;
     const rps: f64 = if (elapsed_s > 0)
@@ -301,6 +332,14 @@ fn report(config: Config, result: BenchResult, elapsed_ns: i128) void {
     else
         0;
 
+    // Sort latencies for percentile computation.
+    const sorted = result.latencies[0..result.latency_count];
+    std.mem.sortUnstable(i64, sorted, {}, std.sort.asc(i64));
+
+    const p50 = percentile_us(sorted, 0.50);
+    const p99 = percentile_us(sorted, 0.99);
+    const p999 = percentile_us(sorted, 0.999);
+
     std.debug.print(
         \\
         \\── coapd benchmark results ──
@@ -309,6 +348,7 @@ fn report(config: Config, result: BenchResult, elapsed_ns: i128) void {
         \\  throughput: {d:.0} req/s
         \\  elapsed:    {d:.1} ms
         \\  latency:    avg={d:.1}µs min={d:.1}µs max={d:.1}µs
+        \\  percentiles: p50={d:.1}µs p99={d:.1}µs p99.9={d:.1}µs
         \\  bytes:      {d} sent, {d} received
         \\  window:     {d}
         \\
@@ -327,6 +367,9 @@ fn report(config: Config, result: BenchResult, elapsed_ns: i128) void {
         avg_latency_us,
         min_us,
         max_us,
+        p50,
+        p99,
+        p999,
         result.bytes_sent,
         result.bytes_received,
         config.window_size,
