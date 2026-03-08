@@ -92,6 +92,7 @@ force_free_all: bool,
 // Load shedding and rate limiting.
 load_level: LoadLevel,
 buffers_outstanding: u16,
+buffers_peak: u16,
 rate_limiter: ?RateLimiter,
 tick_now_ns: i128,
 
@@ -214,6 +215,7 @@ fn init_raw(
         .force_free_all = false,
         .load_level = .normal,
         .buffers_outstanding = 0,
+        .buffers_peak = 0,
         .rate_limiter = rate_limiter,
         .tick_now_ns = 0,
         .rate_limit_rst = rate_limit_rst,
@@ -438,25 +440,6 @@ fn is_transient(err: anyerror) bool {
     };
 }
 
-fn tick_loop(server: *Server) !void {
-    var consecutive_failures: u32 = 0;
-    while (server.running.load(.acquire)) {
-        server.tick() catch |err| {
-            if (is_transient(err)) {
-                consecutive_failures += 1;
-                log.warn("tick transient error ({d}/3): {}", .{
-                    consecutive_failures,
-                    err,
-                });
-                if (consecutive_failures >= 3) return err;
-                continue;
-            }
-            return err;
-        };
-        consecutive_failures = 0;
-    }
-}
-
 /// Drain pending io_uring completions before shutdown.
 fn drain(server: *Server) void {
     _ = server.io.submit() catch {};
@@ -548,6 +531,7 @@ fn handle_recv(
 
     const recv = try server.io.decode_recv(cqe);
     server.buffers_outstanding +|= 1;
+    server.buffers_peak = @max(server.buffers_peak, server.buffers_outstanding);
 
     // Save raw header bytes before buffer release for emergency ACK.
     var raw_header: [4]u8 = .{ 0, 0, 0, 0 };
@@ -821,9 +805,10 @@ fn send_rst(
 /// Recompute load level based on pool utilization.
 fn update_load_level(server: *Server) void {
     const buf_pct: u16 = if (server.config.buffer_count > 0)
-        (server.buffers_outstanding *| 100) / server.config.buffer_count
+        (server.buffers_peak *| 100) / server.config.buffer_count
     else
         0;
+    server.buffers_peak = 0;
     const exch_pct: u16 = if (server.config.exchange_count > 0)
         (@as(u16, server.exchanges.count_active) *| 100) / server.config.exchange_count
     else
