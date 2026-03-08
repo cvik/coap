@@ -73,6 +73,8 @@ pub fn setup(io: *Io, port: u16) !void {
     );
     io.fd_socket = fd;
 
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+
     const address = try std.net.Address.parseIp("0.0.0.0", port);
     try posix.bind(fd, &address.any, address.getOsSockLen());
 
@@ -177,9 +179,10 @@ pub fn decode_recv(io: *const Io, cqe: *const Cqe) !RecvResult {
     const peer_addr: *linux.sockaddr.in =
         @ptrCast(@alignCast(io.buffers.ptr + name_offset));
 
+    // Port from sockaddr is in network byte order; initIp4 expects host order.
     const net_address = std.net.Address.initIp4(
         @bitCast(peer_addr.addr),
-        peer_addr.port,
+        std.mem.bigToNative(u16, peer_addr.port),
     );
 
     return .{

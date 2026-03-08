@@ -216,24 +216,8 @@ fn handle_recv(
     const slot = server.buffer_response[offset_buf..][0..data_wire.len];
     @memcpy(slot, data_wire);
 
-    // Build outgoing address. Port is already in network byte order.
-    const peer_in: *const linux.sockaddr.in = @ptrCast(
-        @alignCast(&recv.peer_address.any),
-    );
-    const port_bytes: [2]u8 = @bitCast(peer_in.port);
-    const addr_bytes: [4]u8 = @bitCast(peer_in.addr);
-
-    server.addrs_response[index] = std.mem.zeroes(linux.sockaddr);
-    server.addrs_response[index].family = peer_in.family;
-    server.addrs_response[index].data = .{
-        @bitCast(port_bytes[0]), @bitCast(port_bytes[1]),
-        @bitCast(addr_bytes[0]), @bitCast(addr_bytes[1]),
-        @bitCast(addr_bytes[2]), @bitCast(addr_bytes[3]),
-        0,                       0,
-        0,                       0,
-        0,                       0,
-        0,                       0,
-    };
+    // Copy the peer address directly — it is already a valid sockaddr.
+    server.addrs_response[index] = recv.peer_address.any;
 
     server.iovs_response[index] = .{
         .base = @ptrCast(slot.ptr),
@@ -251,4 +235,211 @@ fn handle_recv(
     };
 
     try server.io.send_msg(&server.msgs_response[index]);
+}
+
+const testing = std.testing;
+
+fn echo_handler(request: handler.Request) ?handler.Response {
+    return .{ .payload = request.packet.payload };
+}
+
+fn null_handler(_: handler.Request) ?handler.Response {
+    return null;
+}
+
+/// Helper: setup server io and multishot recv (for tests).
+fn setup_for_test(server: *Server) !void {
+    try server.io.setup(server.config.port);
+    server.msg_recv.name = &server.addr_recv;
+    server.msg_recv.namelen = @sizeOf(linux.sockaddr);
+    server.msg_recv.controllen = 0;
+    try server.io.recv_multishot(&server.msg_recv);
+    _ = try server.io.submit();
+}
+
+/// Helper: create a UDP client socket with a receive timeout.
+fn test_client(port: u16) !posix.socket_t {
+    const fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM,
+        0,
+    );
+
+    // Set 1 second receive timeout.
+    const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+    try posix.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&timeout),
+    );
+
+    // Connect so recv works without recvfrom.
+    const dest = try std.net.Address.parseIp("127.0.0.1", port);
+    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+
+    return fd;
+}
+
+test "init and deinit" {
+    var server = try Server.init(testing.allocator, .{
+        .port = 19680,
+        .buffer_count = 4,
+        .buffer_size = 256,
+    }, echo_handler);
+    server.deinit();
+}
+
+test "init and deinit with null handler" {
+    var server = try Server.init(testing.allocator, .{
+        .port = 19681,
+        .buffer_count = 4,
+        .buffer_size = 256,
+    }, null_handler);
+    server.deinit();
+}
+
+test "round-trip: NON echo via UDP" {
+    const port: u16 = 19683;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x1234,
+        .token = &.{ 0xAA, 0xBB },
+        .options = &.{},
+        .payload = "hello",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    _ = try posix.send(client_fd, wire, 0);
+
+    // First tick: recv the request, queue the sendmsg, submit.
+    try server.tick();
+    // Second tick: the sendmsg CQE completes, no new recv yet.
+    // Use non-blocking wait to avoid hanging if no CQEs ready.
+    {
+        var cqes: [constants.completion_batch_max]Cqe =
+            std.mem.zeroes([constants.completion_batch_max]Cqe);
+        _ = try server.io.wait_cqes(cqes[0..], 0);
+    }
+
+    var buf: [1280]u8 = undefined;
+    const n = try posix.recv(client_fd, &buf, 0);
+    try testing.expect(n > 0);
+
+    const response = try coapz.Packet.read(
+        testing.allocator,
+        buf[0..n],
+    );
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.non_confirmable, response.kind);
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqual(@as(u16, 0x1234), response.msg_id);
+    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB }, response.token);
+    try testing.expectEqualSlices(u8, "hello", response.payload);
+}
+
+test "round-trip: CON echoes as ACK" {
+    const port: u16 = 19684;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .post,
+        .msg_id = 0xABCD,
+        .token = &.{0x01},
+        .options = &.{},
+        .payload = "data",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    _ = try posix.send(client_fd, wire, 0);
+    try server.tick();
+    {
+        var cqes: [constants.completion_batch_max]Cqe =
+            std.mem.zeroes([constants.completion_batch_max]Cqe);
+        _ = try server.io.wait_cqes(cqes[0..], 0);
+    }
+
+    var buf: [1280]u8 = undefined;
+    const n = try posix.recv(client_fd, &buf, 0);
+    try testing.expect(n > 0);
+
+    const response = try coapz.Packet.read(
+        testing.allocator,
+        buf[0..n],
+    );
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.acknowledgement, response.kind);
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqual(@as(u16, 0xABCD), response.msg_id);
+    try testing.expectEqualSlices(u8, &.{0x01}, response.token);
+    try testing.expectEqualSlices(u8, "data", response.payload);
+}
+
+test "null handler sends no response" {
+    const port: u16 = 19685;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, null_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x5678,
+        .token = &.{},
+        .options = &.{},
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    _ = try posix.send(client_fd, wire, 0);
+    try server.tick();
+
+    // No response expected. Non-blocking check.
+    var buf: [1280]u8 = undefined;
+    const result = posix.recv(
+        client_fd,
+        &buf,
+        posix.SOCK.NONBLOCK,
+    );
+    try testing.expectError(error.WouldBlock, result);
 }
