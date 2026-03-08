@@ -30,6 +30,8 @@ pub const Config = struct {
     /// Number of server threads. Each gets its own socket/ring/exchange pool.
     /// Kernel distributes packets via SO_REUSEPORT.
     thread_count: u16 = 1,
+    /// IPv4 address to bind. Use "127.0.0.1" for loopback only.
+    bind_address: []const u8 = "0.0.0.0",
 };
 
 allocator: std.mem.Allocator,
@@ -38,6 +40,7 @@ handler_fn: handler.HandlerFn,
 arena: std.heap.ArenaAllocator,
 config: Config,
 exchanges: Exchange,
+running: std.atomic.Value(bool),
 
 // Pre-allocated per-CQE response state.
 addrs_response: []linux.sockaddr,
@@ -107,6 +110,7 @@ pub fn init(
         .arena = std.heap.ArenaAllocator.init(allocator),
         .config = config,
         .exchanges = exchanges,
+        .running = std.atomic.Value(bool).init(true),
         .addrs_response = addrs_response,
         .msgs_response = msgs_response,
         .iovs_response = iovs_response,
@@ -130,7 +134,7 @@ pub fn deinit(server: *Server) void {
 /// Bind the socket, register buffers, and arm the multishot recv.
 /// After this returns the server is ready to accept packets.
 pub fn listen(server: *Server) !void {
-    try server.io.setup(server.config.port);
+    try server.io.setup(server.config.port, server.config.bind_address);
 
     server.msg_recv.name = &server.addr_recv;
     server.msg_recv.namelen = @sizeOf(linux.sockaddr);
@@ -138,6 +142,11 @@ pub fn listen(server: *Server) !void {
 
     try server.io.recv_multishot(&server.msg_recv);
     _ = try server.io.submit();
+}
+
+/// Signal the server and all worker threads to stop after the current tick.
+pub fn stop(server: *Server) void {
+    server.running.store(false, .release);
 }
 
 pub fn run(server: *Server) !void {
@@ -152,6 +161,7 @@ pub fn run(server: *Server) !void {
             server.allocator,
             server.config,
             server.handler_fn,
+            &server.running,
         });
     }
 
@@ -161,20 +171,23 @@ pub fn run(server: *Server) !void {
         if (server.config.thread_count > 1) "s" else "",
     });
 
-    while (true) {
+    while (server.running.load(.acquire)) {
         try server.tick();
     }
+
+    for (threads) |t| t.join();
 }
 
 fn run_worker(
     allocator: std.mem.Allocator,
     config: Config,
     handler_fn: handler.HandlerFn,
+    running: *std.atomic.Value(bool),
 ) void {
     var worker = Server.init(allocator, config, handler_fn) catch return;
     defer worker.deinit();
     worker.listen() catch return;
-    while (true) worker.tick() catch return;
+    while (running.load(.acquire)) worker.tick() catch return;
 }
 
 pub fn tick(server: *Server) !void {
@@ -183,11 +196,13 @@ pub fn tick(server: *Server) !void {
 
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
+    var recv_fail_count: u32 = 0;
     var processed: u32 = 0;
 
     for (cqes[0..count], 0..) |cqe, index| {
         if (Io.is_recv(&cqe) and !Io.is_success(&cqe)) {
             recv_failed = true;
+            recv_fail_count += 1;
             continue;
         }
         if (!Io.is_success(&cqe)) {
@@ -210,7 +225,7 @@ pub fn tick(server: *Server) !void {
     }
 
     if (recv_failed) {
-        log.warn("multishot recv failed, re-arming", .{});
+        log.warn("multishot recv failed ({d} in batch), re-arming", .{recv_fail_count});
         try server.io.recv_multishot(&server.msg_recv);
     }
 
@@ -330,7 +345,14 @@ fn handle_recv(
                 data_wire,
                 now,
             ) == null) {
-                log.warn("exchange pool full, cannot cache", .{});
+                // Try evicting expired entries before giving up.
+                const evicted = server.exchanges.evict_expired(now);
+                if (evicted > 0) {
+                    server.last_eviction_ns = now;
+                    _ = server.exchanges.insert(key, packet.msg_id, data_wire, now);
+                } else {
+                    log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
+                }
             }
         }
     } else if (is_con) {
@@ -353,12 +375,20 @@ fn handle_recv(
             packet.msg_id,
         );
         const now = std.time.nanoTimestamp();
-        _ = server.exchanges.insert(
+        if (server.exchanges.insert(
             key,
             packet.msg_id,
             data_wire,
             now,
-        );
+        ) == null) {
+            const evicted = server.exchanges.evict_expired(now);
+            if (evicted > 0) {
+                server.last_eviction_ns = now;
+                _ = server.exchanges.insert(key, packet.msg_id, data_wire, now);
+            } else {
+                log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
+            }
+        }
     }
 }
 
