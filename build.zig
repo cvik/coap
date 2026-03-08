@@ -44,6 +44,27 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(example_exe);
     }
 
+    // Benchmark client
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("coapz", coapz_dep.module("coapz"));
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    const bench_step = b.step("bench", "Run benchmark client");
+    bench_step.dependOn(&run_bench.step);
+
     // Tests
     const lib_tests = b.addTest(.{
         .root_module = lib_mod,
