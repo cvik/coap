@@ -33,6 +33,31 @@ pub fn main() !void {
     defer posix.close(fd);
     try posix.connect(fd, &dest.any, dest.getOsSockLen());
 
+    // Set receive timeout so we don't hang on lost packets.
+    const timeout = posix.timeval{ .sec = 0, .usec = 100_000 };
+    try posix.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&timeout),
+    );
+
+    // Quick connectivity check.
+    {
+        const probe = [_]u8{ 0x40, 0x00, 0x00, 0x00 }; // empty CON
+        _ = posix.send(fd, &probe, 0) catch {};
+        var tmp: [64]u8 = undefined;
+        _ = posix.recv(fd, &tmp, 0) catch |err| {
+            if (err == error.ConnectionRefused) {
+                std.debug.print(
+                    "error: no server on {s}:{d}\n",
+                    .{ config.host, config.port },
+                );
+                std.process.exit(1);
+            }
+        };
+    }
+
     // Build the request template.
     const payload = try allocator.alloc(u8, config.payload_size);
     defer allocator.free(payload);
@@ -87,6 +112,7 @@ const BenchResult = struct {
     received: u64,
     bytes_sent: u64,
     bytes_received: u64,
+    errors: u64,
     latency_min_ns: i128,
     latency_max_ns: i128,
     latency_sum_ns: i128,
@@ -102,6 +128,7 @@ fn run_bench(
         .received = 0,
         .bytes_sent = 0,
         .bytes_received = 0,
+        .errors = 0,
         .latency_min_ns = std.math.maxInt(i128),
         .latency_max_ns = 0,
         .latency_sum_ns = 0,
@@ -131,7 +158,10 @@ fn run_bench(
         result.sent += 1;
         result.bytes_sent += template.len;
 
-        const n = posix.recv(fd, &recv_buf, 0) catch {
+        const n = posix.recv(fd, &recv_buf, 0) catch |err| {
+            if (err == error.ConnectionRefused) {
+                result.errors += 1;
+            }
             remaining -= 1;
             msg_id +%= 1;
             continue;
