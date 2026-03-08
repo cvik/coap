@@ -9,7 +9,7 @@ High-performance CoAP server library for Zig, built on Linux io_uring.
 - .well-known/core resource discovery (RFC 6690)
 - Simple handler interface: `fn(Request) ?Response`
 - Context handlers and error-handling wrappers (`safeWrap`)
-- ~800K req/s single-threaded on loopback (scales with threads/core)
+- ~840K req/s single-threaded, ~2.8M req/s multi-threaded on loopback
 
 ## Quick Start
 
@@ -237,7 +237,7 @@ processed, but during bursts the pool must absorb all arrivals between
 processing cycles. Set this to at least 2x your expected concurrent clients'
 send window. Default: `512`.
 
-Hard ceiling: 1024 (kernel `UIO_MAXIOV` limit for `register_buffers`).
+Higher values require more kernel memory per io_uring instance.
 
 ### `buffer_size`
 
@@ -411,25 +411,29 @@ Log messages:
 
 ## Benchmarks
 
-Single-threaded echo server, loopback, minimal CoAP NON GET (6 bytes):
+Echo server on loopback, minimal CoAP NON GET (6 bytes):
 
-```
-zig build bench -Doptimize=ReleaseFast -- --count 1000000
-```
+**Single-threaded** (`--count 1000000 --warmup 10000 --window 256`):
 
 | Metric | Value |
 |--------|-------|
-| Throughput | ~800K req/s |
-| Avg latency | ~320µs |
-| p50 latency | ~285µs |
-| p99 latency | ~660µs |
-| p99.9 latency | ~1000µs |
+| Throughput | 841K req/s |
+| Avg latency | 304µs |
+| p50 / p99 / p99.9 | 291µs / 496µs / 874µs |
 | Packet loss | 0% |
 
-These numbers reflect single-threaded performance on loopback, where the
-kernel's UDP stack is the bottleneck. With `--threads N` on a multi-core
-machine with a real NIC (RSS distributing across queues), throughput scales
-with core count.
+**Multi-threaded** (`--count 1000000 --warmup 10000 --threads 20 --window 64`):
+
+| Metric | Value |
+|--------|-------|
+| Throughput | 2.79M req/s |
+| Avg latency | 292µs |
+| p50 / p99 / p99.9 | 286µs / 750µs / 1766µs |
+| Packet loss | 0% |
+
+Loopback numbers are bottlenecked by the kernel's UDP stack. With a real
+NIC and RSS distributing across queues, throughput scales further with
+core count.
 
 Benchmark options: `--count`, `--window`, `--payload`, `--con`,
 `--threads`, `--warmup`, `--no-server`, `--host`, `--port`.

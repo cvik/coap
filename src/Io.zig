@@ -70,7 +70,7 @@ pub fn deinit(io: *Io, allocator: std.mem.Allocator) void {
     }
 }
 
-/// Bind a UDP socket and register buffers with the kernel.
+/// Bind a UDP socket and provide buffers to the kernel pool.
 pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
     const address = try std.net.Address.parseIp(bind_address, port);
 
@@ -105,9 +105,12 @@ pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
             .len = io.buffer_size,
         };
     }
-    try io.ring.register_buffers(io.iovecs);
 
     // Provide initial buffer pool to the kernel.
+    // Note: register_buffers is intentionally not called — the server
+    // uses provided buffers (IOSQE_BUFFER_SELECT) not fixed buffer I/O,
+    // and register_buffers pins pages against RLIMIT_MEMLOCK which limits
+    // the number of io_uring instances that can run concurrently.
     _ = try io.ring.provide_buffers(
         @intFromEnum(UserData.provide_buffers),
         @ptrCast(io.buffers.ptr),
