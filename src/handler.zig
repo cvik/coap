@@ -18,7 +18,15 @@ pub const Response = struct {
     payload: []const u8 = &.{},
 };
 
-/// Handler function type.
-/// Return null to send no response (valid for NON requests).
-/// For CON requests, returning null still sends an empty ACK.
-pub const HandlerFn = *const fn (Request) ?Response;
+/// Type-erased handler function stored by the server.
+pub const HandlerFn = *const fn (?*anyopaque, Request) ?Response;
+
+/// Simple handler function type (no context).
+pub const SimpleHandlerFn = *const fn (Request) ?Response;
+
+/// Trampoline for simple handlers: recovers the original function pointer
+/// from the type-erased context and calls it.
+pub fn wrapSimple(ctx: ?*anyopaque, request: Request) ?Response {
+    const func: SimpleHandlerFn = @ptrCast(ctx.?);
+    return func(request);
+}

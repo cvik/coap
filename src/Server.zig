@@ -37,6 +37,7 @@ pub const Config = struct {
 allocator: std.mem.Allocator,
 io: Io,
 handler_fn: handler.HandlerFn,
+handler_context: ?*anyopaque,
 arena: std.heap.ArenaAllocator,
 config: Config,
 exchanges: Exchange,
@@ -60,10 +61,40 @@ msg_recv: linux.msghdr,
 last_eviction_ns: i128,
 tick_count: u64,
 
+/// Initialize with a simple handler (no context). Backward compatible.
 pub fn init(
     allocator: std.mem.Allocator,
     config: Config,
+    handler_fn: handler.SimpleHandlerFn,
+) !Server {
+    return init_raw(allocator, config, handler.wrapSimple, @ptrCast(@constCast(handler_fn)));
+}
+
+/// Initialize with a typed context handler.
+///
+/// The handler receives a typed pointer and a request:
+///   fn handle(ctx: *MyState, request: Request) ?Response
+pub fn initContext(
+    allocator: std.mem.Allocator,
+    config: Config,
+    comptime handler_fn: anytype,
+    context: anytype,
+) !Server {
+    const Context = @TypeOf(context);
+    const gen = struct {
+        fn call(ctx: ?*anyopaque, request: handler.Request) ?handler.Response {
+            const typed: Context = @ptrCast(@alignCast(ctx.?));
+            return handler_fn(typed, request);
+        }
+    };
+    return init_raw(allocator, config, gen.call, @ptrCast(@constCast(context)));
+}
+
+fn init_raw(
+    allocator: std.mem.Allocator,
+    config: Config,
     handler_fn: handler.HandlerFn,
+    handler_context: ?*anyopaque,
 ) !Server {
     std.debug.assert(config.buffer_count > 0);
     std.debug.assert(config.buffer_size >= 64);
@@ -115,6 +146,7 @@ pub fn init(
         .allocator = allocator,
         .io = io,
         .handler_fn = handler_fn,
+        .handler_context = handler_context,
         .arena = std.heap.ArenaAllocator.init(allocator),
         .config = config,
         .exchanges = exchanges,
@@ -172,6 +204,7 @@ pub fn run(server: *Server) !void {
             server.allocator,
             server.config,
             server.handler_fn,
+            server.handler_context,
             &server.running,
         });
     }
@@ -193,9 +226,10 @@ fn run_worker(
     allocator: std.mem.Allocator,
     config: Config,
     handler_fn: handler.HandlerFn,
+    handler_context: ?*anyopaque,
     running: *std.atomic.Value(bool),
 ) void {
-    var worker = Server.init(allocator, config, handler_fn) catch return;
+    var worker = init_raw(allocator, config, handler_fn, handler_context) catch return;
     defer worker.deinit();
     worker.listen() catch return;
     while (running.load(.acquire)) worker.tick() catch return;
@@ -347,7 +381,7 @@ fn handle_recv(
                 });
             }
         }
-        break :blk server.handler_fn(request);
+        break :blk server.handler_fn(server.handler_context, request);
     };
 
     if (maybe_response) |response| {
@@ -953,4 +987,42 @@ test "well_known_core null passes to handler" {
     const raw = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw);
     try testing.expectEqual(@as(u32, 1), handler_call_count);
+}
+
+const TestCtx = struct { call_count: u32 = 0 };
+
+fn ctx_handler(ctx: *TestCtx, request: handler.Request) ?handler.Response {
+    ctx.call_count += 1;
+    return .{ .payload = request.packet.payload };
+}
+
+test "initContext with typed handler" {
+    var ctx = TestCtx{};
+    var server = try Server.initContext(testing.allocator, .{
+        .port = 19692,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, ctx_handler, &ctx);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x4444,
+        .token = &.{0x01},
+        .options = &.{},
+        .payload = "ctx-test",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(19692);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    try testing.expectEqual(@as(u32, 1), ctx.call_count);
 }
