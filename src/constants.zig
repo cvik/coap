@@ -2,7 +2,9 @@
 /// RFC 7252 section 4.8.
 
 /// Default number of provided buffers for io_uring.
-pub const buffer_count_default: u16 = 128;
+/// Sized to absorb bursts between mid-batch SQE flushes (every 64 CQEs)
+/// with headroom for kernel-side queuing.
+pub const buffer_count_default: u16 = 256;
 
 /// Default buffer size in bytes (must hold a full CoAP UDP datagram).
 pub const buffer_size_default: u32 = 1280;
