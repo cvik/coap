@@ -34,8 +34,7 @@ pub fn init(
     buffer_count: u16,
     buffer_size: u32,
 ) !Io {
-    std.debug.assert(buffer_count > 0);
-    std.debug.assert(buffer_size > 0);
+    if (buffer_count == 0 or buffer_size == 0) return error.InvalidConfig;
 
     // Ring must accommodate send + release_buffer per recv, plus overhead.
     // Each received packet may generate up to 3 SQEs: release_buffer,
