@@ -50,8 +50,7 @@ config: Config,
 const empty_sentinel: u16 = 0xFFFF;
 
 pub fn init(allocator: std.mem.Allocator, config: Config) !Exchange {
-    std.debug.assert(config.exchange_count > 0);
-    std.debug.assert(config.response_size_max > 0);
+    if (config.exchange_count == 0 or config.response_size_max == 0) return error.InvalidConfig;
 
     const slots = try allocator.alloc(Slot, config.exchange_count);
     errdefer allocator.free(slots);

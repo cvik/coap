@@ -99,9 +99,9 @@ fn init_raw(
     handler_fn: handler.HandlerFn,
     handler_context: ?*anyopaque,
 ) !Server {
-    std.debug.assert(config.buffer_count > 0);
-    std.debug.assert(config.buffer_size >= 64);
-    std.debug.assert(config.port > 0);
+    if (config.buffer_count == 0 or
+        config.buffer_size < 64 or
+        config.port == 0) return error.InvalidConfig;
 
     var io = try Io.init(
         allocator,
@@ -219,9 +219,10 @@ pub fn run(server: *Server) !void {
         if (server.config.thread_count > 1) "s" else "",
     });
 
-    while (server.running.load(.acquire)) {
-        try server.tick();
-    }
+    server.tick_loop() catch |err| {
+        log.err("main thread exiting: {}", .{err});
+        return err;
+    };
 
     for (threads) |t| t.join();
 }
@@ -233,10 +234,65 @@ fn run_worker(
     handler_context: ?*anyopaque,
     running: *std.atomic.Value(bool),
 ) void {
-    var worker = init_raw(allocator, config, handler_fn, handler_context) catch return;
+    var worker = init_raw(allocator, config, handler_fn, handler_context) catch |err| {
+        log.err("worker init failed: {}", .{err});
+        return;
+    };
     defer worker.deinit();
-    worker.listen() catch return;
-    while (running.load(.acquire)) worker.tick() catch return;
+    worker.listen() catch |err| {
+        log.err("worker listen failed: {}", .{err});
+        return;
+    };
+    var consecutive_failures: u32 = 0;
+    while (running.load(.acquire)) {
+        worker.tick() catch |err| {
+            if (is_transient(err)) {
+                consecutive_failures += 1;
+                log.warn("worker tick transient error ({d}/3): {}", .{
+                    consecutive_failures,
+                    err,
+                });
+                if (consecutive_failures >= 3) {
+                    log.err("worker exiting: {}", .{err});
+                    return;
+                }
+                continue;
+            }
+            log.err("worker exiting: {}", .{err});
+            return;
+        };
+        consecutive_failures = 0;
+    }
+}
+
+fn is_transient(err: anyerror) bool {
+    return switch (err) {
+        error.SignalInterrupt,
+        error.SystemResources,
+        error.CompletionQueueOvercommitted,
+        error.SubmissionQueueFull,
+        => true,
+        else => false,
+    };
+}
+
+fn tick_loop(server: *Server) !void {
+    var consecutive_failures: u32 = 0;
+    while (server.running.load(.acquire)) {
+        server.tick() catch |err| {
+            if (is_transient(err)) {
+                consecutive_failures += 1;
+                log.warn("tick transient error ({d}/3): {}", .{
+                    consecutive_failures,
+                    err,
+                });
+                if (consecutive_failures >= 3) return err;
+                continue;
+            }
+            return err;
+        };
+        consecutive_failures = 0;
+    }
 }
 
 pub fn tick(server: *Server) !void {
@@ -1041,4 +1097,22 @@ test "initContext with typed handler" {
     defer testing.allocator.free(raw);
 
     try testing.expectEqual(@as(u32, 1), ctx.call_count);
+}
+
+test "init rejects invalid config" {
+    try testing.expectError(error.InvalidConfig, Server.init(
+        testing.allocator,
+        .{ .port = 19700, .buffer_count = 0, .buffer_size = 256 },
+        echo_handler,
+    ));
+    try testing.expectError(error.InvalidConfig, Server.init(
+        testing.allocator,
+        .{ .port = 19700, .buffer_count = 4, .buffer_size = 32 },
+        echo_handler,
+    ));
+    try testing.expectError(error.InvalidConfig, Server.init(
+        testing.allocator,
+        .{ .port = 0, .buffer_count = 4, .buffer_size = 256 },
+        echo_handler,
+    ));
 }
