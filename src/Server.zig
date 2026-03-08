@@ -50,7 +50,10 @@ pub const Config = struct {
     /// Load shedding: recover to normal when both pools drop below this %.
     load_shed_recover_pct: u8 = 50,
     /// Log warning when handler takes longer than this (ns). 0 = disabled.
-    handler_warn_ns: u64 = 10 * std.time.ns_per_ms,
+    /// When enabled, adds a nanoTimestamp() call per handler invocation.
+    handler_warn_ns: u64 = 0,
+    /// Maximum worker restart attempts before giving up.
+    max_worker_restarts: u16 = 5,
 };
 
 allocator: std.mem.Allocator,
@@ -248,21 +251,38 @@ pub fn stop(server: *Server) void {
     server.running.store(false, .release);
 }
 
+const WorkerState = struct {
+    thread: ?std.Thread,
+    exited: std.atomic.Value(bool),
+    restart_count: u16,
+    index: u16,
+};
+
 pub fn run(server: *Server) !void {
     try server.listen();
 
     const extra = server.config.thread_count -| 1;
-    const threads = try server.allocator.alloc(std.Thread, extra);
-    defer server.allocator.free(threads);
+    const workers = try server.allocator.alloc(WorkerState, extra);
+    defer server.allocator.free(workers);
 
-    for (threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, run_worker, .{
+    for (workers, 0..) |*w, i| {
+        w.* = .{
+            .thread = null,
+            .exited = std.atomic.Value(bool).init(false),
+            .restart_count = 0,
+            .index = @intCast(i),
+        };
+        w.thread = std.Thread.spawn(.{}, run_worker, .{
             server.allocator,
             server.config,
             server.handler_fn,
             server.handler_context,
             &server.running,
-        });
+            w,
+        }) catch |err| {
+            log.err("worker {d} spawn failed: {}", .{ i, err });
+            continue;
+        };
     }
 
     log.info("coapd listening on port {d} ({d} thread{s})", .{
@@ -271,12 +291,81 @@ pub fn run(server: *Server) !void {
         if (server.config.thread_count > 1) "s" else "",
     });
 
-    server.tick_loop() catch |err| {
-        log.err("main thread exiting: {}", .{err});
-        return err;
-    };
+    // Main tick loop with worker monitoring.
+    var consecutive_failures: u32 = 0;
+    while (server.running.load(.acquire)) {
+        server.tick() catch |err| {
+            if (is_transient(err)) {
+                consecutive_failures += 1;
+                log.warn("tick transient error ({d}/3): {}", .{
+                    consecutive_failures,
+                    err,
+                });
+                if (consecutive_failures >= 3) {
+                    log.err("main thread exiting: {}", .{err});
+                    break;
+                }
+                continue;
+            }
+            log.err("main thread exiting: {}", .{err});
+            break;
+        };
+        consecutive_failures = 0;
 
-    for (threads) |t| t.join();
+        // Monitor workers every 100 ticks.
+        if (server.tick_count % 100 == 0) {
+            server.monitor_workers(workers);
+        }
+    }
+
+    server.drain();
+    for (workers) |*w| {
+        if (w.thread) |t| {
+            t.join();
+            w.thread = null;
+        }
+    }
+}
+
+fn monitor_workers(
+    server: *Server,
+    workers: []WorkerState,
+) void {
+    for (workers) |*w| {
+        if (!w.exited.load(.acquire)) continue;
+        // Worker has exited — join it.
+        if (w.thread) |t| {
+            t.join();
+            w.thread = null;
+        }
+        if (w.restart_count >= server.config.max_worker_restarts) {
+            log.err("worker {d} exceeded max restarts ({d}), not restarting", .{
+                w.index,
+                server.config.max_worker_restarts,
+            });
+            continue;
+        }
+        // Respawn.
+        w.restart_count += 1;
+        w.exited.store(false, .release);
+        w.thread = std.Thread.spawn(.{}, run_worker, .{
+            server.allocator,
+            server.config,
+            server.handler_fn,
+            server.handler_context,
+            &server.running,
+            w,
+        }) catch |err| {
+            log.err("worker {d} respawn failed: {}", .{ w.index, err });
+            w.exited.store(true, .release);
+            continue;
+        };
+        log.info("worker {d} respawned (restart {d}/{d})", .{
+            w.index,
+            w.restart_count,
+            server.config.max_worker_restarts,
+        });
+    }
 }
 
 fn run_worker(
@@ -285,14 +374,34 @@ fn run_worker(
     handler_fn: handler.HandlerFn,
     handler_context: ?*anyopaque,
     running: *std.atomic.Value(bool),
+    state: *WorkerState,
 ) void {
+    defer state.exited.store(true, .release);
+
+    // Backoff on restart.
+    if (state.restart_count > 0) {
+        const backoff_ms: u64 = @min(
+            @as(u64, 100) << @intCast(@min(state.restart_count, 6)),
+            5000,
+        );
+        log.info("worker {d} restarting (attempt {d}, backoff {d}ms)", .{
+            state.index,
+            state.restart_count,
+            backoff_ms,
+        });
+        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+    }
+
     var worker = init_raw(allocator, config, handler_fn, handler_context) catch |err| {
-        log.err("worker init failed: {}", .{err});
+        log.err("worker {d} init failed: {}", .{ state.index, err });
         return;
     };
-    defer worker.deinit();
+    defer {
+        worker.drain();
+        worker.deinit();
+    }
     worker.listen() catch |err| {
-        log.err("worker listen failed: {}", .{err});
+        log.err("worker {d} listen failed: {}", .{ state.index, err });
         return;
     };
     var consecutive_failures: u32 = 0;
@@ -300,17 +409,18 @@ fn run_worker(
         worker.tick() catch |err| {
             if (is_transient(err)) {
                 consecutive_failures += 1;
-                log.warn("worker tick transient error ({d}/3): {}", .{
+                log.warn("worker {d} tick transient error ({d}/3): {}", .{
+                    state.index,
                     consecutive_failures,
                     err,
                 });
                 if (consecutive_failures >= 3) {
-                    log.err("worker exiting: {}", .{err});
+                    log.err("worker {d} exiting: {}", .{ state.index, err });
                     return;
                 }
                 continue;
             }
-            log.err("worker exiting: {}", .{err});
+            log.err("worker {d} exiting: {}", .{ state.index, err });
             return;
         };
         consecutive_failures = 0;
@@ -345,6 +455,13 @@ fn tick_loop(server: *Server) !void {
         };
         consecutive_failures = 0;
     }
+}
+
+/// Drain pending io_uring completions before shutdown.
+fn drain(server: *Server) void {
+    _ = server.io.submit() catch {};
+    var cqes: [constants.completion_batch_max]Cqe = std.mem.zeroes([constants.completion_batch_max]Cqe);
+    _ = server.io.wait_cqes(cqes[0..], 0) catch {};
 }
 
 pub fn tick(server: *Server) !void {
@@ -545,10 +662,10 @@ fn handle_recv(
                 });
             }
         }
-        const before = if (server.config.handler_warn_ns > 0) std.time.nanoTimestamp() else 0;
         const result = server.handler_fn(server.handler_context, request);
         if (server.config.handler_warn_ns > 0) {
-            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - before));
+            const after = std.time.nanoTimestamp();
+            const elapsed: u64 = @intCast(@max(0, after - server.tick_now_ns));
             if (elapsed > server.config.handler_warn_ns) {
                 log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
             }
