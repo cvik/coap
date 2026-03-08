@@ -5,8 +5,10 @@ High-performance CoAP server library for Zig, built on Linux io_uring.
 - Zero allocations in the hot path (arena resets per batch)
 - CON/ACK reliability with duplicate detection and RST handling
 - Multi-threaded via SO_REUSEPORT (no shared state between threads)
+- Per-IP rate limiting with token bucket and three-level load shedding
 - .well-known/core resource discovery (RFC 6690)
 - Simple handler interface: `fn(Request) ?Response`
+- Context handlers and error-handling wrappers (`safeWrap`)
 - ~800K req/s single-threaded on loopback (scales with threads/core)
 
 ## Quick Start
@@ -82,6 +84,53 @@ Common response codes: `.content` (2.05), `.created` (2.01), `.changed` (2.04),
 `.deleted` (2.02), `.bad_request` (4.00), `.not_found` (4.04),
 `.method_not_allowed` (4.05), `.internal_server_error` (5.00).
 
+### Context Handlers
+
+Use `Server.initContext` to pass state to the handler without globals:
+
+```zig
+const State = struct { counter: u64 = 0 };
+
+var state = State{};
+var server = try coapd.Server.initContext(allocator, .{}, handle, &state);
+
+fn handle(ctx: *State, request: coapd.Request) ?coapd.Response {
+    ctx.counter += 1;
+    return .{ .payload = request.packet.payload };
+}
+```
+
+The context pointer is type-erased internally and passed to the handler on
+every invocation.
+
+### Error Handling Wrappers
+
+`safeWrap` converts a handler that returns `!?Response` into a
+`SimpleHandlerFn`. Errors are logged and converted to 5.00 Internal Server
+Error:
+
+```zig
+fn handler(request: coapd.Request) !?coapd.Response {
+    const data = try fetchData(request.arena);
+    return .{ .payload = data };
+}
+
+var server = try coapd.Server.init(allocator, .{}, coapd.safeWrap(handler));
+```
+
+`safeWrapContext` does the same for context handlers:
+
+```zig
+fn handler(ctx: *State, request: coapd.Request) !?coapd.Response {
+    const data = try ctx.lookup(request.arena);
+    return .{ .payload = data };
+}
+
+var server = try coapd.Server.initContext(
+    allocator, .{}, coapd.safeWrapContext(*State, handler), &state,
+);
+```
+
 ### Message Types
 
 The server handles CoAP message types automatically:
@@ -96,10 +145,12 @@ The server handles CoAP message types automatically:
 
 ### Panic Behavior
 
-Handler functions must not panic. A panic in any handler will terminate the
-server thread (or the entire process if it is the main thread). If your
-handler calls code that may fail, use `catch` to convert errors into an
-appropriate CoAP error response instead of allowing unwinding.
+Handler functions must not panic. A panic in any handler terminates the
+entire process (Zig panics are not recoverable). Worker threads are
+automatically restarted up to `max_worker_restarts` times (default: 5),
+but this only covers normal thread exits (e.g. init failures, transient
+I/O errors), not panics. Use `catch` to convert errors into CoAP error
+responses, or use `safeWrap` for automatic error conversion.
 
 ### Routing
 
@@ -149,13 +200,22 @@ All fields have sensible defaults. Pass `.{}` for a standard server on port 5683
 
 ```zig
 var server = try coapd.Server.init(allocator, .{
-    .port = 5683,            // UDP listen port
-    .buffer_count = 512,     // io_uring provided buffers
-    .buffer_size = 1280,     // max UDP datagram size (bytes)
-    .exchange_count = 256,   // max concurrent CON exchanges
-    .well_known_core = null, // RFC 6690 discovery payload
-    .thread_count = 1,       // server threads (SO_REUSEPORT)
-    .bind_address = "0.0.0.0", // IPv4 bind address
+    .port = 5683,                     // UDP listen port
+    .bind_address = "0.0.0.0",        // IPv4 bind address
+    .buffer_count = 512,              // io_uring provided buffers
+    .buffer_size = 1280,              // max UDP datagram size (bytes)
+    .exchange_count = 256,            // max concurrent CON exchanges
+    .well_known_core = null,          // RFC 6690 discovery payload
+    .thread_count = 1,                // server threads (SO_REUSEPORT)
+    .max_arena_size = 256 * 1024,     // arena trim threshold (bytes)
+    .rate_limit_ip_count = 1024,      // max tracked IPs (0 = disabled)
+    .rate_limit_tokens_per_sec = 100, // tokens refilled per second
+    .rate_limit_burst = 200,          // max bucket capacity
+    .load_shed_throttle_pct = 75,     // % utilization to start throttling
+    .load_shed_critical_pct = 90,     // % utilization to start shedding
+    .load_shed_recover_pct = 50,      // % utilization to recover
+    .handler_warn_ns = 0,             // slow handler warning threshold (ns)
+    .max_worker_restarts = 5,         // max worker restart attempts
 }, handler);
 ```
 
@@ -235,6 +295,59 @@ the kernel serializes UDP processing so multi-threading adds overhead without
 throughput gain — benefits require a real NIC with RSS or CPU-intensive
 handlers.
 
+### `max_arena_size`
+
+Maximum arena size in bytes before trimming. The per-tick arena is trimmed
+back to this size after each batch of completions to prevent unbounded growth
+from handler allocations. Default: `256 * 1024` (256 KB).
+
+### `handler_warn_ns`
+
+Log a warning when a handler invocation takes longer than this threshold in
+nanoseconds. When enabled, adds a `nanoTimestamp()` call per handler
+invocation. Set to `0` to disable (default). Useful for detecting slow
+handlers in production.
+
+### `max_worker_restarts`
+
+Maximum number of times a crashed worker thread is automatically restarted.
+After this limit, the worker is not respawned and a log error is emitted.
+Default: `5`.
+
+## Rate Limiting
+
+coapd includes per-IP token bucket rate limiting, activated when the server
+enters the `throttled` load level (see [Load Shedding](#load-shedding)).
+
+Configuration:
+
+- `rate_limit_ip_count` — max tracked IPs. Set to `0` to disable rate
+  limiting entirely. Default: `1024`.
+- `rate_limit_tokens_per_sec` — token refill rate per IP. Default: `100`.
+- `rate_limit_burst` — maximum bucket capacity per IP. Default: `200`.
+
+When a client exceeds its rate limit:
+
+- **CON** messages receive a RST (from a pre-allocated buffer).
+- **NON** messages are silently dropped.
+
+## Load Shedding
+
+The server monitors buffer pool and exchange pool utilization and
+transitions between three load levels:
+
+| Level | Trigger | Behavior |
+|-------|---------|----------|
+| **normal** | utilization < `throttle_pct` | All requests processed normally |
+| **throttled** | any pool >= `throttle_pct` | Per-IP rate limiting applied |
+| **shedding** | any pool >= `critical_pct` | New packets dropped; CONs get RST |
+
+Recovery occurs when both pools drop below `load_shed_recover_pct`. The
+hysteresis gap between trigger and recovery thresholds prevents oscillation.
+
+During shedding, cached CON retransmissions are still served — only new
+requests are dropped.
+
 ## Server Lifecycle
 
 ```zig
@@ -271,10 +384,11 @@ pub const std_options: std.Options = .{
 ```
 
 Log messages:
-- **info**: server started (port, thread count)
-- **warn**: multishot recv re-armed, exchange pool full
-- **debug**: malformed packets, exchange eviction counts
-- **err**: buffer release failures
+- **info**: server started (port, thread count), worker start/stop
+- **warn**: multishot recv re-armed, exchange pool full, slow handler
+  (when `handler_warn_ns` enabled), rate-limited clients
+- **debug**: malformed packets, exchange eviction counts, load level changes
+- **err**: buffer release failures, worker crash/restart exhaustion
 
 ## Benchmarks
 
@@ -313,6 +427,7 @@ Benchmark options: `--count`, `--window`, `--payload`, `--con`,
 - [x] Pipelined benchmark client with embedded server
 - [x] Multi-threading with SO_REUSEPORT
 - [x] .well-known/core resource discovery (RFC 6690)
+- [x] Per-IP rate limiting and load shedding
 - [ ] Routing
 
 ## License
