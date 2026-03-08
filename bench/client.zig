@@ -288,7 +288,7 @@ fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
             std.heap.page_allocator,
             .{
                 .port = port,
-                .buffer_count = 256,
+                .buffer_count = 512,
                 .buffer_size = 1280,
                 .thread_count = thread_count,
             },
