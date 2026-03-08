@@ -206,6 +206,15 @@ fn handle_recv(
         return;
     };
 
+    // RST cancels the matching exchange.
+    if (packet.kind == .reset) {
+        const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
+        if (server.exchanges.find(key)) |slot_idx| {
+            server.exchanges.remove(slot_idx);
+        }
+        return;
+    }
+
     const is_con = packet.kind == .confirmable;
 
     // CON duplicate detection.
@@ -614,4 +623,64 @@ test "CON duplicate detection" {
     defer response.deinit(testing.allocator);
     try testing.expectEqual(.acknowledgement, response.kind);
     try testing.expectEqualSlices(u8, "test", response.payload);
+}
+
+test "RST cancels CON exchange" {
+    const port: u16 = 19688;
+
+    handler_call_count = 0;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+    }, counting_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    // Send CON, get ACK — handler called once.
+    const con_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0xBEEF,
+        .token = &.{0x01},
+        .options = &.{},
+        .payload = "rst-test",
+        .data_buf = &.{},
+    };
+    const con_wire = try con_packet.write(testing.allocator);
+    defer testing.allocator.free(con_wire);
+
+    const raw1 = try send_tick_recv(&server, client_fd, con_wire);
+    defer testing.allocator.free(raw1);
+    try testing.expectEqual(@as(u32, 1), handler_call_count);
+
+    // Send RST with same msg_id to cancel the exchange.
+    const rst_packet = coapz.Packet{
+        .kind = .reset,
+        .code = .empty,
+        .msg_id = 0xBEEF,
+        .token = &.{},
+        .options = &.{},
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const rst_wire = try rst_packet.write(testing.allocator);
+    defer testing.allocator.free(rst_wire);
+
+    _ = try posix.send(client_fd, rst_wire, 0);
+    try server.tick();
+
+    // Drain any send CQEs.
+    var cqes: [constants.completion_batch_max]Cqe =
+        std.mem.zeroes([constants.completion_batch_max]Cqe);
+    _ = try server.io.wait_cqes(cqes[0..], 0);
+
+    // Send same CON again — exchange was cleared, handler called again.
+    const raw2 = try send_tick_recv(&server, client_fd, con_wire);
+    defer testing.allocator.free(raw2);
+    try testing.expectEqual(@as(u32, 2), handler_call_count);
 }

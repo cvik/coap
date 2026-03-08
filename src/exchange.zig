@@ -222,7 +222,7 @@ pub fn evict_expired(exchange: *Exchange, now_ns: i128) u16 {
 }
 
 /// Remove a specific exchange and return its slot to the free list.
-fn remove(exchange: *Exchange, slot_idx: u16) void {
+pub fn remove(exchange: *Exchange, slot_idx: u16) void {
     const slot = &exchange.slots[slot_idx];
 
     // Remove from hash table.
@@ -400,4 +400,23 @@ test "evict expired" {
     // Old key gone, new key still present.
     try testing.expect(pool.find(k1) == null);
     try testing.expect(pool.find(k2) != null);
+}
+
+test "remove is public" {
+    var pool = try Exchange.init(testing.allocator, .{
+        .exchange_count = 8,
+        .response_size_max = 64,
+    });
+    defer pool.deinit(testing.allocator);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const key = Exchange.peer_key(addr, 0x0001);
+
+    const slot = pool.insert(key, 0x0001, "data", 0);
+    try testing.expect(slot != null);
+    try testing.expectEqual(@as(u16, 1), pool.count_active);
+
+    pool.remove(slot.?);
+    try testing.expectEqual(@as(u16, 0), pool.count_active);
+    try testing.expect(pool.find(key) == null);
 }
