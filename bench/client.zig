@@ -291,6 +291,7 @@ fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
                 .buffer_count = 512,
                 .buffer_size = 1280,
                 .thread_count = thread_count,
+                .rate_limit_ip_count = 0,
             },
             echo_handler,
         ) catch std.process.exit(1);
@@ -390,9 +391,11 @@ fn run_bench(
         const n = posix.recv(fd, &recv_buf, 0) catch |err| {
             if (err == error.WouldBlock) {
                 consecutive_timeouts += 1;
-                if (total_sent >= count and consecutive_timeouts >= 3) {
+                if (consecutive_timeouts >= 3 and in_flight > 0) {
+                    // Count in-flight packets as lost and clear window.
                     result.errors += @intCast(in_flight);
-                    break;
+                    in_flight = 0;
+                    if (total_sent >= count) break;
                 }
                 continue;
             }
@@ -404,7 +407,7 @@ fn run_bench(
         };
 
         consecutive_timeouts = 0;
-        in_flight -= 1;
+        in_flight -|= 1;
         result.received += 1;
         result.bytes_received += n;
 
