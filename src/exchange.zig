@@ -165,6 +165,7 @@ pub fn insert(
     const slot = &exchange.slots[slot_idx];
     exchange.free_head = slot.next_free;
     exchange.count_active += 1;
+    std.debug.assert(exchange.count_active <= exchange.config.exchange_count);
 
     // Populate slot.
     slot.* = .{
@@ -226,6 +227,7 @@ pub fn evict_expired(exchange: *Exchange, now_ns: i128) u16 {
 /// Remove a specific exchange and return its slot to the free list.
 pub fn remove(exchange: *Exchange, slot_idx: u16) void {
     const slot = &exchange.slots[slot_idx];
+    std.debug.assert(slot.state == .completed);
 
     // Remove from hash table.
     exchange.remove_from_table(slot.peer_key);
