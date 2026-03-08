@@ -1,5 +1,8 @@
 # Changelog
 
+## [0.2.1] - 2026-03-08
+- Fix bench hang, remove unnecessary register_buffers
+
 ## [0.2.0] - 2026-03-08
 - RST message handling
 - .well-known/core resource discovery (RFC 6690)
