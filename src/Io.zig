@@ -36,6 +36,9 @@ pub fn init(
     std.debug.assert(buffer_size > 0);
 
     // Ring must accommodate send + release_buffer per recv, plus overhead.
+    // Each received packet may generate up to 3 SQEs: release_buffer,
+    // send_msg response, and periodic provide_buffers. The 4x multiplier
+    // covers this worst case with headroom for the multishot recv SQE.
     const ring_entries: u16 = buffer_count *| 4;
     var ring = try linux.IoUring.init(ring_entries, 0);
     errdefer ring.deinit();
@@ -67,7 +70,13 @@ pub fn deinit(io: *Io, allocator: std.mem.Allocator) void {
 }
 
 /// Bind a UDP socket and register buffers with the kernel.
-pub fn setup(io: *Io, port: u16) !void {
+pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
+    const address = try std.net.Address.parseIp(bind_address, port);
+
+    // Only IPv4 is supported; IPv6 requires larger sockaddr buffers
+    // throughout the recv/send paths.
+    if (address.any.family != posix.AF.INET) return error.UnsupportedAddressFamily;
+
     const fd = try posix.socket(
         posix.AF.INET,
         posix.SOCK.DGRAM,
@@ -83,7 +92,6 @@ pub fn setup(io: *Io, port: u16) !void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
 
-    const address = try std.net.Address.parseIp("0.0.0.0", port);
     try posix.bind(fd, &address.any, address.getOsSockLen());
 
     for (io.iovecs, 0..) |*iov, i| {
@@ -220,9 +228,9 @@ test "SO_REUSEPORT allows two instances on same port" {
 
     var io1 = try Io.init(allocator, 4, 256);
     defer io1.deinit(allocator);
-    try io1.setup(port);
+    try io1.setup(port, "0.0.0.0");
 
     var io2 = try Io.init(allocator, 4, 256);
     defer io2.deinit(allocator);
-    try io2.setup(port);
+    try io2.setup(port, "0.0.0.0");
 }

@@ -94,6 +94,13 @@ The server handles CoAP message types automatically:
   `null`, no response is sent.
 - **RST** (reset) — cancels the matching exchange (removes cached response).
 
+### Panic Behavior
+
+Handler functions must not panic. A panic in any handler will terminate the
+server thread (or the entire process if it is the main thread). If your
+handler calls code that may fail, use `catch` to convert errors into an
+appropriate CoAP error response instead of allowing unwinding.
+
 ### Routing
 
 There is no built-in router. Inspect the request packet directly:
@@ -148,12 +155,18 @@ var server = try coapd.Server.init(allocator, .{
     .exchange_count = 256,   // max concurrent CON exchanges
     .well_known_core = null, // RFC 6690 discovery payload
     .thread_count = 1,       // server threads (SO_REUSEPORT)
+    .bind_address = "0.0.0.0", // IPv4 bind address
 }, handler);
 ```
 
 ### `port`
 
 UDP port to bind. Default: `5683` (CoAP standard port per RFC 7252).
+
+### `bind_address`
+
+IPv4 address to bind. Use `"127.0.0.1"` for loopback only, `"0.0.0.0"` for
+all interfaces. IPv6 is not yet supported. Default: `"0.0.0.0"`.
 
 ### `buffer_count`
 
@@ -229,7 +242,7 @@ handlers.
 var server = try coapd.Server.init(allocator, config, handler);
 defer server.deinit();
 
-// 2a. Run (blocking) — binds, spawns threads, loops forever.
+// 2a. Run (blocking) — binds, spawns threads, loops until stop().
 try server.run();
 
 // 2b. Or manual control:
@@ -237,6 +250,9 @@ try server.listen();       // bind socket, arm io_uring
 while (running) {
     try server.tick();     // process one batch of completions
 }
+
+// 3. Graceful shutdown — call from another thread or signal handler.
+server.stop();             // signals run() and all workers to exit
 ```
 
 The `tick()` method processes up to 256 completion events, calls the handler
