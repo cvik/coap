@@ -61,6 +61,9 @@ msg_recv: linux.msghdr,
 last_eviction_ns: i128,
 tick_count: u64,
 
+// Server-side message ID counter for NON responses.
+next_msg_id: u16,
+
 /// Initialize with a simple handler (no context). Backward compatible.
 pub fn init(
     allocator: std.mem.Allocator,
@@ -160,6 +163,7 @@ fn init_raw(
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
         .tick_count = 0,
+        .next_msg_id = 0,
     };
 }
 
@@ -396,7 +400,7 @@ fn handle_recv(
         const response_packet = coapz.Packet{
             .kind = response_kind,
             .code = response.code,
-            .msg_id = packet.msg_id,
+            .msg_id = if (is_con) packet.msg_id else server.nextMsgId(),
             .token = packet.token,
             .options = response.options,
             .payload = response.payload,
@@ -554,6 +558,12 @@ fn send_data(
     try server.io.send_msg(&server.msgs_response[index]);
 }
 
+fn nextMsgId(server: *Server) u16 {
+    const id = server.next_msg_id;
+    server.next_msg_id = id +% 1;
+    return id;
+}
+
 /// Check if the packet is a GET /.well-known/core request.
 fn is_well_known_core(packet: coapz.Packet) bool {
     if (packet.code != .get) return false;
@@ -686,7 +696,7 @@ test "round-trip: NON echo via UDP" {
 
     try testing.expectEqual(.non_confirmable, response.kind);
     try testing.expectEqual(.content, response.code);
-    try testing.expectEqual(@as(u16, 0x1234), response.msg_id);
+    try testing.expect(response.msg_id != 0x1234);
     try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB }, response.token);
     try testing.expectEqualSlices(u8, "hello", response.payload);
 }
