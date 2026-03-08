@@ -48,16 +48,20 @@ Echo server, loopback, minimal CoAP NON GET (6 bytes):
 
 ```
 zig build bench -Doptimize=ReleaseFast -- --count 1000000
-zig build bench -Doptimize=ReleaseFast -- --count 1000000 --threads 4
 ```
 
-| Metric | 1 thread | 4 threads |
-|--------|----------|-----------|
-| Throughput | ~794K req/s | ~871K req/s |
-| Avg latency | ~322µs | ~294µs |
-| p50 latency | ~282µs | ~279µs |
-| p99 latency | ~715µs | ~623µs |
-| p99.9 latency | ~1076µs | ~829µs |
-| Packet loss | 0% | 0% |
+| Metric | Value |
+|--------|-------|
+| Throughput | ~852K req/s |
+| Avg latency | ~300µs |
+| p50 latency | ~285µs |
+| p99 latency | ~715µs |
+| p99.9 latency | ~897µs |
+| Packet loss | 0% |
+
+Multi-threading (`--threads N`) spawns N server threads (SO_REUSEPORT) and N
+client threads. Scaling is limited on loopback since the kernel serializes
+UDP processing through the loopback device. Gains are expected with real NICs
+(RSS queue distribution) or CPU-intensive handlers.
 
 Benchmark options: `--count`, `--window`, `--payload`, `--con`, `--threads`, `--no-server`.

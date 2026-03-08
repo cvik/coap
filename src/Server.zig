@@ -183,6 +183,7 @@ pub fn tick(server: *Server) !void {
 
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
+    var processed: u32 = 0;
 
     for (cqes[0..count], 0..) |cqe, index| {
         if (Io.is_recv(&cqe) and !Io.is_success(&cqe)) {
@@ -199,6 +200,13 @@ pub fn tick(server: *Server) !void {
         server.handle_recv(&cqe, index) catch |err| {
             log.err("handle_recv: {}", .{err});
         };
+
+        // Flush SQEs periodically to return buffers to the kernel
+        // before the provided buffer pool is exhausted.
+        processed += 1;
+        if (processed % 64 == 0) {
+            _ = try server.io.submit();
+        }
     }
 
     if (recv_failed) {
@@ -230,13 +238,17 @@ fn handle_recv(
 
     const recv = try server.io.decode_recv(cqe);
 
-    defer server.io.release_buffer(recv.buffer_id) catch |err| {
-        log.err("release_buffer {d}: {}", .{ recv.buffer_id, err });
-    };
-
     const packet = coapz.Packet.read(arena, recv.payload) catch |err| {
+        server.io.release_buffer(recv.buffer_id) catch {};
         log.debug("malformed CoAP packet: {}", .{err});
         return;
+    };
+
+    // Release the recv buffer immediately — Packet.read copied all
+    // data into the arena, so the provided buffer can be returned to
+    // the kernel pool without waiting for response construction.
+    server.io.release_buffer(recv.buffer_id) catch |err| {
+        log.err("release_buffer {d}: {}", .{ recv.buffer_id, err });
     };
 
     // RST cancels the matching exchange.

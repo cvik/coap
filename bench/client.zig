@@ -2,6 +2,8 @@
 ///
 /// Sends CoAP requests using a pipelined sliding window and measures
 /// throughput and latency. Forks an embedded echo server by default.
+/// When --threads N is used, spawns N client threads (each with its own
+/// socket/source port) so SO_REUSEPORT distributes across server threads.
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -39,44 +41,6 @@ pub fn main() !void {
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
-    const dest = try std.net.Address.parseIp(config.host, config.port);
-    const fd = try posix.socket(
-        posix.AF.INET,
-        posix.SOCK.DGRAM,
-        0,
-    );
-    defer posix.close(fd);
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
-
-    // Tune socket buffers.
-    const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
-
-    // Receive timeout for draining at end of benchmark.
-    const timeout = posix.timeval{ .sec = 0, .usec = 100_000 };
-    try posix.setsockopt(
-        fd,
-        posix.SOL.SOCKET,
-        posix.SO.RCVTIMEO,
-        std.mem.asBytes(&timeout),
-    );
-
-    if (!config.embedded_server) {
-        const probe = [_]u8{ 0x40, 0x00, 0x00, 0x00 };
-        _ = posix.send(fd, &probe, 0) catch {};
-        var tmp: [64]u8 = undefined;
-        _ = posix.recv(fd, &tmp, 0) catch |err| {
-            if (err == error.ConnectionRefused) {
-                std.debug.print(
-                    "error: no server on {s}:{d}\n",
-                    .{ config.host, config.port },
-                );
-                std.process.exit(1);
-            }
-        };
-    }
-
     // Build the request template.
     const payload = try allocator.alloc(u8, config.payload_size);
     defer allocator.free(payload);
@@ -99,15 +63,35 @@ pub fn main() !void {
     const template_wire = try template.write(allocator);
     defer allocator.free(template_wire);
 
-    // Warmup.
+    // Connectivity probe (single socket).
+    if (!config.embedded_server) {
+        const probe_fd = try make_client_socket(config.host, config.port);
+        defer posix.close(probe_fd);
+        const probe = [_]u8{ 0x40, 0x00, 0x00, 0x00 };
+        _ = posix.send(probe_fd, &probe, 0) catch {};
+        var tmp: [64]u8 = undefined;
+        _ = posix.recv(probe_fd, &tmp, 0) catch |err| {
+            if (err == error.ConnectionRefused) {
+                std.debug.print(
+                    "error: no server on {s}:{d}\n",
+                    .{ config.host, config.port },
+                );
+                std.process.exit(1);
+            }
+        };
+    }
+
+    // Warmup (single socket).
     if (config.warmup_count > 0) {
         std.debug.print(
             "warming up ({d} requests)...\n",
             .{config.warmup_count},
         );
+        const warmup_fd = try make_client_socket(config.host, config.port);
+        defer posix.close(warmup_fd);
         _ = try run_bench(
             allocator,
-            fd,
+            warmup_fd,
             template_wire,
             config.warmup_count,
             config.window_size,
@@ -116,29 +100,180 @@ pub fn main() !void {
     }
 
     // Benchmark.
+    const n_clients = config.thread_count;
     std.debug.print(
-        "benchmarking {d} requests (payload={d}B, {s}, window={d})...\n",
+        "benchmarking {d} requests (payload={d}B, {s}, window={d}, {d} client{s})...\n",
         .{
             config.request_count,
             config.payload_size,
             if (config.use_confirmable) "CON" else "NON",
             config.window_size,
+            n_clients,
+            if (n_clients > 1) "s" else "",
         },
     );
 
+    const extra: u16 = n_clients -| 1;
+    const threads = try allocator.alloc(std.Thread, extra);
+    defer allocator.free(threads);
+
+    const per_thread = config.request_count / n_clients;
+    const remainder = config.request_count % n_clients;
+
+    const worker_results = try allocator.alloc(WorkerResult, n_clients);
+    defer {
+        for (worker_results) |*wr| {
+            if (wr.result) |*r| {
+                if (r.latencies.len > 0)
+                    allocator.free(r.latencies);
+            }
+        }
+        allocator.free(worker_results);
+    }
+
     const start = std.time.nanoTimestamp();
-    var result = try run_bench(
+
+    // Spawn extra client threads.
+    for (0..extra) |i| {
+        worker_results[i] = .{};
+        threads[i] = try std.Thread.spawn(.{}, client_worker, .{
+            allocator,
+            config,
+            template_wire,
+            per_thread,
+            &worker_results[i],
+        });
+    }
+
+    // Main thread runs its share (gets the remainder too).
+    const main_count = per_thread + remainder;
+    const main_fd = try make_client_socket(config.host, config.port);
+    defer posix.close(main_fd);
+
+    const main_result = try run_bench(
         allocator,
-        fd,
+        main_fd,
         template_wire,
-        config.request_count,
+        main_count,
         config.window_size,
         true,
     );
-    const elapsed_ns = std.time.nanoTimestamp() - start;
-    defer allocator.free(result.latencies);
+    worker_results[extra] = .{ .result = main_result };
 
-    report(config, &result, elapsed_ns);
+    // Join all threads.
+    for (threads) |t| {
+        t.join();
+    }
+
+    const elapsed_ns = std.time.nanoTimestamp() - start;
+
+    // Aggregate results.
+    var agg = BenchResult{
+        .sent = 0,
+        .received = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .errors = 0,
+        .latency_min_ns = std.math.maxInt(i128),
+        .latency_max_ns = 0,
+        .latency_sum_ns = 0,
+        .latencies = main_result.latencies,
+        .latency_count = main_result.latency_count,
+    };
+
+    // Merge latencies into a single sorted array for percentiles.
+    // Count total latencies first.
+    var total_latencies: u64 = 0;
+    for (worker_results) |wr| {
+        if (wr.result) |r| {
+            total_latencies += r.latency_count;
+        }
+    }
+
+    const merged_latencies = if (total_latencies > 0)
+        try allocator.alloc(i64, total_latencies)
+    else
+        @as([]i64, &.{});
+    defer if (total_latencies > 0) allocator.free(merged_latencies);
+
+    var merge_off: u64 = 0;
+    for (worker_results) |wr| {
+        if (wr.result) |r| {
+            agg.sent += r.sent;
+            agg.received += r.received;
+            agg.bytes_sent += r.bytes_sent;
+            agg.bytes_received += r.bytes_received;
+            agg.errors += r.errors;
+            agg.latency_sum_ns += r.latency_sum_ns;
+            if (r.received > 0 and r.latency_min_ns < agg.latency_min_ns)
+                agg.latency_min_ns = r.latency_min_ns;
+            if (r.latency_max_ns > agg.latency_max_ns)
+                agg.latency_max_ns = r.latency_max_ns;
+            if (r.latency_count > 0) {
+                @memcpy(
+                    merged_latencies[merge_off..][0..r.latency_count],
+                    r.latencies[0..r.latency_count],
+                );
+                merge_off += r.latency_count;
+            }
+        }
+    }
+
+    agg.latencies = merged_latencies;
+    agg.latency_count = @intCast(total_latencies);
+
+    report(config, &agg, elapsed_ns);
+}
+
+const WorkerResult = struct {
+    result: ?BenchResult = null,
+};
+
+fn client_worker(
+    allocator: std.mem.Allocator,
+    config: Config,
+    template_wire: []const u8,
+    count: u32,
+    out: *WorkerResult,
+) void {
+    const fd = make_client_socket(config.host, config.port) catch return;
+    defer posix.close(fd);
+
+    out.result = run_bench(
+        allocator,
+        fd,
+        template_wire,
+        count,
+        config.window_size,
+        true,
+    ) catch return;
+}
+
+fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
+    const dest = try std.net.Address.parseIp(host, port);
+    const fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM,
+        0,
+    );
+    errdefer posix.close(fd);
+    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+
+    // Tune socket buffers.
+    const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
+
+    // Receive timeout for draining at end of benchmark.
+    const timeout = posix.timeval{ .sec = 0, .usec = 100_000 };
+    try posix.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&timeout),
+    );
+
+    return fd;
 }
 
 fn echo_handler(request: coapd.Request) ?coapd.Response {
@@ -353,6 +488,7 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
         \\  percentiles: p50={d:.1}µs p99={d:.1}µs p99.9={d:.1}µs
         \\  bytes:      {d} sent, {d} received
         \\  window:     {d}
+        \\  threads:    {d} server, {d} client
         \\
     , .{
         config.host,
@@ -375,6 +511,8 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
         result.bytes_sent,
         result.bytes_received,
         config.window_size,
+        config.thread_count,
+        config.thread_count,
     });
 }
 
