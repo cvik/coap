@@ -24,6 +24,12 @@ pub const Config = struct {
     buffer_size: u32 = constants.buffer_size_default,
     /// Maximum concurrent CON exchanges for duplicate detection.
     exchange_count: u16 = 256,
+    /// Link-format payload for GET /.well-known/core (RFC 6690).
+    /// If null, requests pass through to the handler.
+    well_known_core: ?[]const u8 = null,
+    /// Number of server threads. Each gets its own socket/ring/exchange pool.
+    /// Kernel distributes packets via SO_REUSEPORT.
+    thread_count: u16 = 1,
 };
 
 allocator: std.mem.Allocator,
@@ -137,11 +143,38 @@ pub fn listen(server: *Server) !void {
 pub fn run(server: *Server) !void {
     try server.listen();
 
-    log.info("coapd listening on port {d}", .{server.config.port});
+    const extra = server.config.thread_count -| 1;
+    const threads = try server.allocator.alloc(std.Thread, extra);
+    defer server.allocator.free(threads);
+
+    for (threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, run_worker, .{
+            server.allocator,
+            server.config,
+            server.handler_fn,
+        });
+    }
+
+    log.info("coapd listening on port {d} ({d} thread{s})", .{
+        server.config.port,
+        server.config.thread_count,
+        if (server.config.thread_count > 1) "s" else "",
+    });
 
     while (true) {
         try server.tick();
     }
+}
+
+fn run_worker(
+    allocator: std.mem.Allocator,
+    config: Config,
+    handler_fn: handler.HandlerFn,
+) void {
+    var worker = Server.init(allocator, config, handler_fn) catch return;
+    defer worker.deinit();
+    worker.listen() catch return;
+    while (true) worker.tick() catch return;
 }
 
 pub fn tick(server: *Server) !void {
@@ -150,6 +183,7 @@ pub fn tick(server: *Server) !void {
 
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
+    var processed: u32 = 0;
 
     for (cqes[0..count], 0..) |cqe, index| {
         if (Io.is_recv(&cqe) and !Io.is_success(&cqe)) {
@@ -166,6 +200,13 @@ pub fn tick(server: *Server) !void {
         server.handle_recv(&cqe, index) catch |err| {
             log.err("handle_recv: {}", .{err});
         };
+
+        // Flush SQEs periodically to return buffers to the kernel
+        // before the provided buffer pool is exhausted.
+        processed += 1;
+        if (processed % 64 == 0) {
+            _ = try server.io.submit();
+        }
     }
 
     if (recv_failed) {
@@ -197,14 +238,27 @@ fn handle_recv(
 
     const recv = try server.io.decode_recv(cqe);
 
-    defer server.io.release_buffer(recv.buffer_id) catch |err| {
-        log.err("release_buffer {d}: {}", .{ recv.buffer_id, err });
-    };
-
     const packet = coapz.Packet.read(arena, recv.payload) catch |err| {
+        server.io.release_buffer(recv.buffer_id) catch {};
         log.debug("malformed CoAP packet: {}", .{err});
         return;
     };
+
+    // Release the recv buffer immediately — Packet.read copied all
+    // data into the arena, so the provided buffer can be returned to
+    // the kernel pool without waiting for response construction.
+    server.io.release_buffer(recv.buffer_id) catch |err| {
+        log.err("release_buffer {d}: {}", .{ recv.buffer_id, err });
+    };
+
+    // RST cancels the matching exchange.
+    if (packet.kind == .reset) {
+        const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
+        if (server.exchanges.find(key)) |slot_idx| {
+            server.exchanges.remove(slot_idx);
+        }
+        return;
+    }
 
     const is_con = packet.kind == .confirmable;
 
@@ -225,7 +279,24 @@ fn handle_recv(
         .arena = arena,
     };
 
-    const maybe_response = server.handler_fn(request);
+    const maybe_response = blk: {
+        if (server.config.well_known_core) |wkc| {
+            if (is_well_known_core(packet)) {
+                var cf_buf: [2]u8 = undefined;
+                const cf_opt = coapz.Option.content_format(
+                    .link_format,
+                    &cf_buf,
+                );
+                const opts = try arena.dupe(coapz.Option, &.{cf_opt});
+                break :blk @as(?handler.Response, .{
+                    .code = .content,
+                    .options = opts,
+                    .payload = wkc,
+                });
+            }
+        }
+        break :blk server.handler_fn(request);
+    };
 
     if (maybe_response) |response| {
         const response_kind: coapz.MessageKind = if (is_con)
@@ -328,6 +399,19 @@ fn send_data(
     };
 
     try server.io.send_msg(&server.msgs_response[index]);
+}
+
+/// Check if the packet is a GET /.well-known/core request.
+fn is_well_known_core(packet: coapz.Packet) bool {
+    if (packet.code != .get) return false;
+
+    var it = packet.find_options(.uri_path);
+    const seg1 = it.next() orelse return false;
+    if (!std.mem.eql(u8, seg1.value, ".well-known")) return false;
+    const seg2 = it.next() orelse return false;
+    if (!std.mem.eql(u8, seg2.value, "core")) return false;
+    // Must be exactly two segments.
+    return it.next() == null;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -614,4 +698,146 @@ test "CON duplicate detection" {
     defer response.deinit(testing.allocator);
     try testing.expectEqual(.acknowledgement, response.kind);
     try testing.expectEqualSlices(u8, "test", response.payload);
+}
+
+test "RST cancels CON exchange" {
+    const port: u16 = 19688;
+
+    handler_call_count = 0;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+    }, counting_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    // Send CON, get ACK — handler called once.
+    const con_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0xBEEF,
+        .token = &.{0x01},
+        .options = &.{},
+        .payload = "rst-test",
+        .data_buf = &.{},
+    };
+    const con_wire = try con_packet.write(testing.allocator);
+    defer testing.allocator.free(con_wire);
+
+    const raw1 = try send_tick_recv(&server, client_fd, con_wire);
+    defer testing.allocator.free(raw1);
+    try testing.expectEqual(@as(u32, 1), handler_call_count);
+
+    // Send RST with same msg_id to cancel the exchange.
+    const rst_packet = coapz.Packet{
+        .kind = .reset,
+        .code = .empty,
+        .msg_id = 0xBEEF,
+        .token = &.{},
+        .options = &.{},
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const rst_wire = try rst_packet.write(testing.allocator);
+    defer testing.allocator.free(rst_wire);
+
+    _ = try posix.send(client_fd, rst_wire, 0);
+    try server.tick();
+
+    // Drain any send CQEs.
+    var cqes: [constants.completion_batch_max]Cqe =
+        std.mem.zeroes([constants.completion_batch_max]Cqe);
+    _ = try server.io.wait_cqes(cqes[0..], 0);
+
+    // Send same CON again — exchange was cleared, handler called again.
+    const raw2 = try send_tick_recv(&server, client_fd, con_wire);
+    defer testing.allocator.free(raw2);
+    try testing.expectEqual(@as(u32, 2), handler_call_count);
+}
+
+test "GET /.well-known/core returns link format" {
+    const port: u16 = 19689;
+    const wkc_payload = "</sensors>;rt=\"temperature\"";
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .well_known_core = wkc_payload,
+    }, null_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x7777,
+        .token = &.{0x42},
+        .options = &.{
+            .{ .kind = .uri_path, .value = ".well-known" },
+            .{ .kind = .uri_path, .value = "core" },
+        },
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, wkc_payload, response.payload);
+
+    // Verify content-format option is present (value 40 = link_format).
+    var cf_it = response.find_options(.content_format);
+    const cf_opt = cf_it.next();
+    try testing.expect(cf_opt != null);
+}
+
+test "well_known_core null passes to handler" {
+    const port: u16 = 19690;
+
+    handler_call_count = 0;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, counting_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    // Send a /.well-known/core request — should pass to handler.
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x8888,
+        .token = &.{0x01},
+        .options = &.{
+            .{ .kind = .uri_path, .value = ".well-known" },
+            .{ .kind = .uri_path, .value = "core" },
+        },
+        .payload = &.{},
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+    try testing.expectEqual(@as(u32, 1), handler_call_count);
 }

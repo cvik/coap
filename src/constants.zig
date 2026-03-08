@@ -2,7 +2,10 @@
 /// RFC 7252 section 4.8.
 
 /// Default number of provided buffers for io_uring.
-pub const buffer_count_default: u16 = 128;
+/// Must exceed the max burst between tick() calls (client window size)
+/// plus headroom for packets arriving during CQE processing.
+/// 2x completion_batch_max handles a full burst with room to spare.
+pub const buffer_count_default: u16 = 512;
 
 /// Default buffer size in bytes (must hold a full CoAP UDP datagram).
 pub const buffer_size_default: u32 = 1280;

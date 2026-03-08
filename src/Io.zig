@@ -76,6 +76,7 @@ pub fn setup(io: *Io, port: u16) !void {
     io.fd_socket = fd;
 
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
 
     // Increase socket buffers for throughput.
     const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
@@ -207,4 +208,21 @@ pub fn is_recv(cqe: *const Cqe) bool {
 /// Check whether a CQE completed successfully.
 pub fn is_success(cqe: *const Cqe) bool {
     return cqe.err() == .SUCCESS;
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "SO_REUSEPORT allows two instances on same port" {
+    const port: u16 = 19691;
+    const allocator = testing.allocator;
+
+    var io1 = try Io.init(allocator, 4, 256);
+    defer io1.deinit(allocator);
+    try io1.setup(port);
+
+    var io2 = try Io.init(allocator, 4, 256);
+    defer io2.deinit(allocator);
+    try io2.setup(port);
 }

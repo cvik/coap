@@ -29,28 +29,39 @@ fn echo(request: coapd.Request) ?coapd.Response {
 - Zero runtime allocations in the hot path (arena resets per batch)
 - Simple handler interface: `fn(Request) ?Response`
 - CoAP packet encode/decode via [coapz](https://github.com/cvik/coapz)
+- CON/ACK reliability with duplicate detection and RST handling
+- Multi-threaded server via SO_REUSEPORT
+- .well-known/core resource discovery (RFC 6690)
 
 ## Roadmap
 
 - [x] CON/ACK reliability (duplicate detection, piggybacked ACK, response caching)
+- [x] RST message handling
 - [x] Pipelined benchmark client with embedded server
+- [x] Multi-threading with SO_REUSEPORT
+- [x] .well-known/core resource discovery (RFC 6690)
 - [ ] Routing
-- [ ] Multi-threading with SO_REUSEPORT
-- [ ] .well-known/core resource discovery
 
 ## Benchmarks
 
-Single-threaded echo server, loopback, minimal CoAP NON GET (6 bytes):
+Echo server, loopback, minimal CoAP NON GET (6 bytes):
 
 ```
-zig build bench -Doptimize=ReleaseFast -- --count 10000000
+zig build bench -Doptimize=ReleaseFast -- --count 1000000
 ```
 
 | Metric | Value |
 |--------|-------|
-| Throughput | ~870K req/s |
-| Avg latency | ~73µs (window=64) |
-| Min latency | ~8µs |
+| Throughput | ~852K req/s |
+| Avg latency | ~300µs |
+| p50 latency | ~285µs |
+| p99 latency | ~715µs |
+| p99.9 latency | ~897µs |
 | Packet loss | 0% |
 
-Benchmark options: `--count`, `--window`, `--payload`, `--con`, `--no-server`.
+Multi-threading (`--threads N`) spawns N server threads (SO_REUSEPORT) and N
+client threads. Scaling is limited on loopback since the kernel serializes
+UDP processing through the loopback device. Gains are expected with real NICs
+(RSS queue distribution) or CPU-intensive handlers.
+
+Benchmark options: `--count`, `--window`, `--payload`, `--con`, `--threads`, `--no-server`.
