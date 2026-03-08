@@ -4,6 +4,7 @@ pub const Config = Server.Config;
 pub const Request = @import("handler.zig").Request;
 pub const Response = @import("handler.zig").Response;
 pub const HandlerFn = @import("handler.zig").HandlerFn;
+pub const SimpleHandlerFn = @import("handler.zig").SimpleHandlerFn;
 pub const coap = @import("coapz");
 
 const constants = @import("constants.zig");
