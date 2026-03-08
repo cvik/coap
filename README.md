@@ -29,28 +29,35 @@ fn echo(request: coapd.Request) ?coapd.Response {
 - Zero runtime allocations in the hot path (arena resets per batch)
 - Simple handler interface: `fn(Request) ?Response`
 - CoAP packet encode/decode via [coapz](https://github.com/cvik/coapz)
+- CON/ACK reliability with duplicate detection and RST handling
+- Multi-threaded server via SO_REUSEPORT
+- .well-known/core resource discovery (RFC 6690)
 
 ## Roadmap
 
 - [x] CON/ACK reliability (duplicate detection, piggybacked ACK, response caching)
+- [x] RST message handling
 - [x] Pipelined benchmark client with embedded server
+- [x] Multi-threading with SO_REUSEPORT
+- [x] .well-known/core resource discovery (RFC 6690)
 - [ ] Routing
-- [ ] Multi-threading with SO_REUSEPORT
-- [ ] .well-known/core resource discovery
 
 ## Benchmarks
 
-Single-threaded echo server, loopback, minimal CoAP NON GET (6 bytes):
+Echo server, loopback, minimal CoAP NON GET (6 bytes):
 
 ```
-zig build bench -Doptimize=ReleaseFast -- --count 10000000
+zig build bench -Doptimize=ReleaseFast -- --count 1000000
+zig build bench -Doptimize=ReleaseFast -- --count 1000000 --threads 4
 ```
 
-| Metric | Value |
-|--------|-------|
-| Throughput | ~870K req/s |
-| Avg latency | ~73µs (window=64) |
-| Min latency | ~8µs |
-| Packet loss | 0% |
+| Metric | 1 thread | 4 threads |
+|--------|----------|-----------|
+| Throughput | ~794K req/s | ~871K req/s |
+| Avg latency | ~322µs | ~294µs |
+| p50 latency | ~282µs | ~279µs |
+| p99 latency | ~715µs | ~623µs |
+| p99.9 latency | ~1076µs | ~829µs |
+| Packet loss | 0% | 0% |
 
-Benchmark options: `--count`, `--window`, `--payload`, `--con`, `--no-server`.
+Benchmark options: `--count`, `--window`, `--payload`, `--con`, `--threads`, `--no-server`.
