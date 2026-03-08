@@ -158,6 +158,8 @@ pub fn insert(
         return null;
     }
 
+    std.debug.assert(exchange.find(key) == null);
+
     // Allocate from free list.
     const slot_idx = exchange.free_head;
     const slot = &exchange.slots[slot_idx];
@@ -256,31 +258,25 @@ fn remove_from_table(exchange: *Exchange, key: u64) void {
     }
 }
 
-/// After removing a table entry, rehash subsequent entries that may
-/// have been displaced by linear probing.
+/// After removing a table entry, shift back subsequent entries that
+/// were displaced by linear probing (backward-shift deletion).
 fn rehash_after_remove(exchange: *Exchange, removed_idx: u16) void {
+    var gap = removed_idx;
     var idx = (removed_idx + 1) & exchange.table_mask;
-
     while (exchange.table[idx] != empty_sentinel) {
         const slot_idx = exchange.table[idx];
         const desired: u16 = @intCast(
             @as(u32, @truncate(exchange.slots[slot_idx].peer_key)) &
                 exchange.table_mask,
         );
-
-        // If this entry is not in its ideal position and the removed
-        // slot is between ideal and current, move it.
-        if (wrapping_distance(desired, idx, exchange.table_mask) >
-            wrapping_distance(desired, removed_idx, exchange.table_mask))
+        // If moving this entry to the gap would place it on or closer
+        // to its desired position, shift it back.
+        if (wrapping_distance(desired, idx, exchange.table_mask) >=
+            wrapping_distance(desired, gap, exchange.table_mask))
         {
-            // This is not right — use the standard Robin Hood rehash.
-            // Simpler: remove and re-insert.
+            exchange.table[gap] = slot_idx;
             exchange.table[idx] = empty_sentinel;
-            var new_idx = desired;
-            while (exchange.table[new_idx] != empty_sentinel) {
-                new_idx = (new_idx + 1) & exchange.table_mask;
-            }
-            exchange.table[new_idx] = slot_idx;
+            gap = idx;
         }
         idx = (idx + 1) & exchange.table_mask;
     }
@@ -419,4 +415,77 @@ test "remove is public" {
     pool.remove(slot.?);
     try testing.expectEqual(@as(u16, 0), pool.count_active);
     try testing.expect(pool.find(key) == null);
+}
+
+test "rehash after remove does not orphan entries" {
+    var pool = try Exchange.init(testing.allocator, .{
+        .exchange_count = 4,
+        .response_size_max = 16,
+    });
+    defer pool.deinit(testing.allocator);
+
+    // Craft keys that map to specific desired indices.
+    // Lower 32 bits & 7 = desired index (table_mask=7 for exchange_count=4).
+    const key_a: u64 = 0x0001_0000_0000_0003; // desired=3
+    const key_b: u64 = 0x0002_0000_0000_0003; // desired=3
+    const key_c: u64 = 0x0003_0000_0000_0003; // desired=3
+    const key_d: u64 = 0x0004_0000_0000_0005; // desired=5
+
+    _ = pool.insert(key_a, 1, "a", 0);
+    _ = pool.insert(key_b, 2, "b", 0);
+    _ = pool.insert(key_c, 3, "c", 0);
+    _ = pool.insert(key_d, 4, "d", 0);
+
+    const slot_a = pool.find(key_a).?;
+    pool.remove(slot_a);
+
+    try testing.expect(pool.find(key_b) != null);
+    try testing.expect(pool.find(key_c) != null);
+    try testing.expect(pool.find(key_d) != null);
+}
+
+test "rehash after remove with simple chain" {
+    var pool = try Exchange.init(testing.allocator, .{
+        .exchange_count = 4,
+        .response_size_max = 16,
+    });
+    defer pool.deinit(testing.allocator);
+
+    const key_x: u64 = 0x0001_0000_0000_0002; // desired=2
+    const key_y: u64 = 0x0002_0000_0000_0002; // desired=2
+
+    _ = pool.insert(key_x, 1, "x", 0);
+    _ = pool.insert(key_y, 2, "y", 0);
+
+    const slot_x = pool.find(key_x).?;
+    pool.remove(slot_x);
+
+    try testing.expect(pool.find(key_y) != null);
+    try testing.expectEqualSlices(
+        u8,
+        "y",
+        pool.cached_response(pool.find(key_y).?),
+    );
+}
+
+test "rehash after remove wraps around table" {
+    var pool = try Exchange.init(testing.allocator, .{
+        .exchange_count = 4,
+        .response_size_max = 16,
+    });
+    defer pool.deinit(testing.allocator);
+
+    const key_e: u64 = 0x0001_0000_0000_0006; // desired=6
+    const key_f: u64 = 0x0002_0000_0000_0006; // desired=6
+    const key_g: u64 = 0x0003_0000_0000_0006; // desired=6
+
+    _ = pool.insert(key_e, 1, "e", 0);
+    _ = pool.insert(key_f, 2, "f", 0);
+    _ = pool.insert(key_g, 3, "g", 0);
+
+    const slot_e = pool.find(key_e).?;
+    pool.remove(slot_e);
+
+    try testing.expect(pool.find(key_f) != null);
+    try testing.expect(pool.find(key_g) != null);
 }
