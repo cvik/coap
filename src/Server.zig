@@ -10,6 +10,7 @@ const posix = std.posix;
 const coapz = @import("coapz");
 const Io = @import("Io.zig");
 const Exchange = @import("exchange.zig");
+const RateLimiter = @import("rate_limiter.zig");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
 const log = std.log.scoped(.coapd);
@@ -17,6 +18,8 @@ const log = std.log.scoped(.coapd);
 const Cqe = linux.io_uring_cqe;
 
 const Server = @This();
+
+pub const LoadLevel = enum { normal, throttled, shedding };
 
 pub const Config = struct {
     port: u16 = constants.port_default,
@@ -32,6 +35,25 @@ pub const Config = struct {
     thread_count: u16 = 1,
     /// IPv4 address to bind. Use "127.0.0.1" for loopback only.
     bind_address: []const u8 = "0.0.0.0",
+    /// Maximum arena size in bytes. Arena is trimmed after each tick.
+    max_arena_size: usize = 256 * 1024,
+    /// Per-IP rate limit: max tracked IPs. 0 = disabled.
+    rate_limit_ip_count: u16 = 1024,
+    /// Per-IP rate limit: tokens refilled per second.
+    rate_limit_tokens_per_sec: u16 = 100,
+    /// Per-IP rate limit: maximum burst (bucket capacity).
+    rate_limit_burst: u16 = 200,
+    /// Load shedding: enter throttled when any pool reaches this %.
+    load_shed_throttle_pct: u8 = 75,
+    /// Load shedding: enter shedding when any pool reaches this %.
+    load_shed_critical_pct: u8 = 90,
+    /// Load shedding: recover to normal when both pools drop below this %.
+    load_shed_recover_pct: u8 = 50,
+    /// Log warning when handler takes longer than this (ns). 0 = disabled.
+    /// When enabled, adds a nanoTimestamp() call per handler invocation.
+    handler_warn_ns: u64 = 0,
+    /// Maximum worker restart attempts before giving up.
+    max_worker_restarts: u16 = 5,
 };
 
 allocator: std.mem.Allocator,
@@ -63,6 +85,19 @@ tick_count: u64,
 
 // Server-side message ID counter for NON responses.
 next_msg_id: u16,
+
+// Arena management.
+force_free_all: bool,
+
+// Load shedding and rate limiting.
+load_level: LoadLevel,
+buffers_outstanding: u16,
+buffers_peak: u16,
+rate_limiter: ?RateLimiter,
+tick_now_ns: i128,
+
+/// Pre-allocated RST buffers for rate-limited/shed CON packets.
+rate_limit_rst: []u8,
 
 /// Initialize with a simple handler (no context). Backward compatible.
 pub fn init(
@@ -145,6 +180,19 @@ fn init_raw(
     const emergency_ack = try allocator.alloc(u8, batch * 4);
     errdefer allocator.free(emergency_ack);
 
+    const rate_limit_rst = try allocator.alloc(u8, batch * 4);
+    errdefer allocator.free(rate_limit_rst);
+
+    var rate_limiter: ?RateLimiter = null;
+    if (config.rate_limit_ip_count > 0) {
+        rate_limiter = try RateLimiter.init(allocator, .{
+            .ip_count = config.rate_limit_ip_count,
+            .tokens_per_sec = config.rate_limit_tokens_per_sec,
+            .burst = config.rate_limit_burst,
+        });
+    }
+    errdefer if (rate_limiter) |*rl| rl.deinit(allocator);
+
     return .{
         .allocator = allocator,
         .io = io,
@@ -163,7 +211,14 @@ fn init_raw(
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
         .tick_count = 0,
-        .next_msg_id = 0,
+        .next_msg_id = std.crypto.random.int(u16),
+        .force_free_all = false,
+        .load_level = .normal,
+        .buffers_outstanding = 0,
+        .buffers_peak = 0,
+        .rate_limiter = rate_limiter,
+        .tick_now_ns = 0,
+        .rate_limit_rst = rate_limit_rst,
     };
 }
 
@@ -176,6 +231,8 @@ pub fn deinit(server: *Server) void {
     server.allocator.free(server.iovs_response);
     server.allocator.free(server.buffer_response);
     server.allocator.free(server.emergency_ack);
+    server.allocator.free(server.rate_limit_rst);
+    if (server.rate_limiter) |*rl| rl.deinit(server.allocator);
 }
 
 /// Bind the socket, register buffers, and arm the multishot recv.
@@ -196,21 +253,38 @@ pub fn stop(server: *Server) void {
     server.running.store(false, .release);
 }
 
+const WorkerState = struct {
+    thread: ?std.Thread,
+    exited: std.atomic.Value(bool),
+    restart_count: u16,
+    index: u16,
+};
+
 pub fn run(server: *Server) !void {
     try server.listen();
 
     const extra = server.config.thread_count -| 1;
-    const threads = try server.allocator.alloc(std.Thread, extra);
-    defer server.allocator.free(threads);
+    const workers = try server.allocator.alloc(WorkerState, extra);
+    defer server.allocator.free(workers);
 
-    for (threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, run_worker, .{
+    for (workers, 0..) |*w, i| {
+        w.* = .{
+            .thread = null,
+            .exited = std.atomic.Value(bool).init(false),
+            .restart_count = 0,
+            .index = @intCast(i),
+        };
+        w.thread = std.Thread.spawn(.{}, run_worker, .{
             server.allocator,
             server.config,
             server.handler_fn,
             server.handler_context,
             &server.running,
-        });
+            w,
+        }) catch |err| {
+            log.err("worker {d} spawn failed: {}", .{ i, err });
+            continue;
+        };
     }
 
     log.info("coapd listening on port {d} ({d} thread{s})", .{
@@ -219,12 +293,81 @@ pub fn run(server: *Server) !void {
         if (server.config.thread_count > 1) "s" else "",
     });
 
-    server.tick_loop() catch |err| {
-        log.err("main thread exiting: {}", .{err});
-        return err;
-    };
+    // Main tick loop with worker monitoring.
+    var consecutive_failures: u32 = 0;
+    while (server.running.load(.acquire)) {
+        server.tick() catch |err| {
+            if (is_transient(err)) {
+                consecutive_failures += 1;
+                log.warn("tick transient error ({d}/3): {}", .{
+                    consecutive_failures,
+                    err,
+                });
+                if (consecutive_failures >= 3) {
+                    log.err("main thread exiting: {}", .{err});
+                    break;
+                }
+                continue;
+            }
+            log.err("main thread exiting: {}", .{err});
+            break;
+        };
+        consecutive_failures = 0;
 
-    for (threads) |t| t.join();
+        // Monitor workers every 100 ticks.
+        if (server.tick_count % 100 == 0) {
+            server.monitor_workers(workers);
+        }
+    }
+
+    server.drain();
+    for (workers) |*w| {
+        if (w.thread) |t| {
+            t.join();
+            w.thread = null;
+        }
+    }
+}
+
+fn monitor_workers(
+    server: *Server,
+    workers: []WorkerState,
+) void {
+    for (workers) |*w| {
+        if (!w.exited.load(.acquire)) continue;
+        // Worker has exited — join it.
+        if (w.thread) |t| {
+            t.join();
+            w.thread = null;
+        }
+        if (w.restart_count >= server.config.max_worker_restarts) {
+            log.err("worker {d} exceeded max restarts ({d}), not restarting", .{
+                w.index,
+                server.config.max_worker_restarts,
+            });
+            continue;
+        }
+        // Respawn.
+        w.restart_count += 1;
+        w.exited.store(false, .release);
+        w.thread = std.Thread.spawn(.{}, run_worker, .{
+            server.allocator,
+            server.config,
+            server.handler_fn,
+            server.handler_context,
+            &server.running,
+            w,
+        }) catch |err| {
+            log.err("worker {d} respawn failed: {}", .{ w.index, err });
+            w.exited.store(true, .release);
+            continue;
+        };
+        log.info("worker {d} respawned (restart {d}/{d})", .{
+            w.index,
+            w.restart_count,
+            server.config.max_worker_restarts,
+        });
+    }
 }
 
 fn run_worker(
@@ -233,14 +376,34 @@ fn run_worker(
     handler_fn: handler.HandlerFn,
     handler_context: ?*anyopaque,
     running: *std.atomic.Value(bool),
+    state: *WorkerState,
 ) void {
+    defer state.exited.store(true, .release);
+
+    // Backoff on restart.
+    if (state.restart_count > 0) {
+        const backoff_ms: u64 = @min(
+            @as(u64, 100) << @intCast(@min(state.restart_count, 6)),
+            5000,
+        );
+        log.info("worker {d} restarting (attempt {d}, backoff {d}ms)", .{
+            state.index,
+            state.restart_count,
+            backoff_ms,
+        });
+        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+    }
+
     var worker = init_raw(allocator, config, handler_fn, handler_context) catch |err| {
-        log.err("worker init failed: {}", .{err});
+        log.err("worker {d} init failed: {}", .{ state.index, err });
         return;
     };
-    defer worker.deinit();
+    defer {
+        worker.drain();
+        worker.deinit();
+    }
     worker.listen() catch |err| {
-        log.err("worker listen failed: {}", .{err});
+        log.err("worker {d} listen failed: {}", .{ state.index, err });
         return;
     };
     var consecutive_failures: u32 = 0;
@@ -248,17 +411,18 @@ fn run_worker(
         worker.tick() catch |err| {
             if (is_transient(err)) {
                 consecutive_failures += 1;
-                log.warn("worker tick transient error ({d}/3): {}", .{
+                log.warn("worker {d} tick transient error ({d}/3): {}", .{
+                    state.index,
                     consecutive_failures,
                     err,
                 });
                 if (consecutive_failures >= 3) {
-                    log.err("worker exiting: {}", .{err});
+                    log.err("worker {d} exiting: {}", .{ state.index, err });
                     return;
                 }
                 continue;
             }
-            log.err("worker exiting: {}", .{err});
+            log.err("worker {d} exiting: {}", .{ state.index, err });
             return;
         };
         consecutive_failures = 0;
@@ -276,28 +440,18 @@ fn is_transient(err: anyerror) bool {
     };
 }
 
-fn tick_loop(server: *Server) !void {
-    var consecutive_failures: u32 = 0;
-    while (server.running.load(.acquire)) {
-        server.tick() catch |err| {
-            if (is_transient(err)) {
-                consecutive_failures += 1;
-                log.warn("tick transient error ({d}/3): {}", .{
-                    consecutive_failures,
-                    err,
-                });
-                if (consecutive_failures >= 3) return err;
-                continue;
-            }
-            return err;
-        };
-        consecutive_failures = 0;
-    }
+/// Drain pending io_uring completions before shutdown.
+fn drain(server: *Server) void {
+    _ = server.io.submit() catch {};
+    var cqes: [constants.completion_batch_max]Cqe = std.mem.zeroes([constants.completion_batch_max]Cqe);
+    _ = server.io.wait_cqes(cqes[0..], 0) catch {};
 }
 
 pub fn tick(server: *Server) !void {
     const batch_max = constants.completion_batch_max;
     var cqes: [batch_max]Cqe = std.mem.zeroes([batch_max]Cqe);
+
+    server.tick_now_ns = std.time.nanoTimestamp();
 
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
@@ -338,23 +492,33 @@ pub fn tick(server: *Server) !void {
     }
 
     // Periodic exchange eviction (~every 10 seconds).
-    const now = std.time.nanoTimestamp();
     const eviction_interval_ns: i128 = 10 * std.time.ns_per_s;
-    if (now - server.last_eviction_ns > eviction_interval_ns) {
-        const evicted = server.exchanges.evict_expired(now);
+    if (server.tick_now_ns - server.last_eviction_ns > eviction_interval_ns) {
+        const evicted = server.exchanges.evict_expired(server.tick_now_ns);
         if (evicted > 0) {
             log.debug("evicted {d} expired exchanges", .{evicted});
         }
-        server.last_eviction_ns = now;
+        server.last_eviction_ns = server.tick_now_ns;
     }
+
+    // Compute load level based on buffer/exchange pool utilization.
+    server.update_load_level();
 
     _ = try server.io.submit();
 
     server.tick_count += 1;
-    if (server.tick_count % 1000 == 0) {
+
+    // Adaptive arena reset: free_all after busy ticks or periodically,
+    // otherwise retain with size limit to cap memory growth.
+    const busy_threshold: u32 = @min(constants.completion_batch_max, server.config.buffer_count) / 2;
+    if (server.force_free_all or server.tick_count % 100 == 0) {
         _ = server.arena.reset(.free_all);
+        server.force_free_all = false;
     } else {
-        _ = server.arena.reset(.retain_capacity);
+        _ = server.arena.reset(.{ .retain_with_limit = server.config.max_arena_size });
+    }
+    if (processed > busy_threshold) {
+        server.force_free_all = true;
     }
 }
 
@@ -366,6 +530,8 @@ fn handle_recv(
     const arena = server.arena.allocator();
 
     const recv = try server.io.decode_recv(cqe);
+    server.buffers_outstanding +|= 1;
+    server.buffers_peak = @max(server.buffers_peak, server.buffers_outstanding);
 
     // Save raw header bytes before buffer release for emergency ACK.
     var raw_header: [4]u8 = .{ 0, 0, 0, 0 };
@@ -373,8 +539,45 @@ fn handle_recv(
         @memcpy(&raw_header, recv.payload[0..4]);
     }
 
+    // Load shedding: drop new packets when critically loaded.
+    if (server.load_level == .shedding) {
+        // Always serve cached CON retransmits.
+        if (recv.payload.len >= 4) {
+            const msg_id = std.mem.readInt(u16, raw_header[2..4], .big);
+            const key = Exchange.peer_key(recv.peer_address, msg_id);
+            if (server.exchanges.find(key)) |slot_idx| {
+                const cached = server.exchanges.cached_response(slot_idx);
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                server.send_data(cached, recv.peer_address, index) catch {};
+                return;
+            }
+        }
+        // CON: send RST. NON: drop silently.
+        const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
+        release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
+        if (is_con_raw) server.send_rst(&raw_header, recv.peer_address, index);
+        return;
+    }
+
+    // Rate limiting in throttled mode.
+    if (server.load_level == .throttled) {
+        if (server.rate_limiter) |*rl| {
+            const ip = recv.peer_address.in.sa.addr;
+            if (!rl.allow(ip, server.tick_now_ns)) {
+                const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                if (is_con_raw) server.send_rst(&raw_header, recv.peer_address, index);
+                return;
+            }
+        }
+    }
+
     const packet = coapz.Packet.read(arena, recv.payload) catch |err| {
-        server.io.release_buffer(recv.buffer_id) catch {};
+        release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
         switch (err) {
             error.OutOfMemory => {
                 log.warn("OOM parsing packet, sending emergency ACK", .{});
@@ -388,9 +591,8 @@ fn handle_recv(
     // Release the recv buffer immediately — Packet.read copied all
     // data into the arena, so the provided buffer can be returned to
     // the kernel pool without waiting for response construction.
-    server.io.release_buffer(recv.buffer_id) catch |err| {
-        log.err("release_buffer {d}: {}", .{ recv.buffer_id, err });
-    };
+    release_buffer_robust(&server.io, recv.buffer_id);
+    server.buffers_outstanding -|= 1;
 
     // RST cancels the matching exchange.
     if (packet.kind == .reset) {
@@ -444,7 +646,15 @@ fn handle_recv(
                 });
             }
         }
-        break :blk server.handler_fn(server.handler_context, request);
+        const result = server.handler_fn(server.handler_context, request);
+        if (server.config.handler_warn_ns > 0) {
+            const after = std.time.nanoTimestamp();
+            const elapsed: u64 = @intCast(@max(0, after - server.tick_now_ns));
+            if (elapsed > server.config.handler_warn_ns) {
+                log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
+            }
+        }
+        break :blk result;
     };
 
     if (maybe_response) |response| {
@@ -481,18 +691,17 @@ fn handle_recv(
                 recv.peer_address,
                 packet.msg_id,
             );
-            const now = std.time.nanoTimestamp();
             if (server.exchanges.insert(
                 key,
                 packet.msg_id,
                 data_wire,
-                now,
+                server.tick_now_ns,
             ) == null) {
                 // Try evicting expired entries before giving up.
-                const evicted = server.exchanges.evict_expired(now);
+                const evicted = server.exchanges.evict_expired(server.tick_now_ns);
                 if (evicted > 0) {
-                    server.last_eviction_ns = now;
-                    _ = server.exchanges.insert(key, packet.msg_id, data_wire, now);
+                    server.last_eviction_ns = server.tick_now_ns;
+                    _ = server.exchanges.insert(key, packet.msg_id, data_wire, server.tick_now_ns);
                 } else {
                     log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
                 }
@@ -526,17 +735,16 @@ fn handle_recv(
             recv.peer_address,
             packet.msg_id,
         );
-        const now = std.time.nanoTimestamp();
         if (server.exchanges.insert(
             key,
             packet.msg_id,
             data_wire,
-            now,
+            server.tick_now_ns,
         ) == null) {
-            const evicted = server.exchanges.evict_expired(now);
+            const evicted = server.exchanges.evict_expired(server.tick_now_ns);
             if (evicted > 0) {
-                server.last_eviction_ns = now;
-                _ = server.exchanges.insert(key, packet.msg_id, data_wire, now);
+                server.last_eviction_ns = server.tick_now_ns;
+                _ = server.exchanges.insert(key, packet.msg_id, data_wire, server.tick_now_ns);
             } else {
                 log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
             }
@@ -570,6 +778,73 @@ fn send_emergency_ack(
 
     const ack_data = server.emergency_ack[slot..][0..4];
     server.send_data(ack_data, peer_address, index) catch {};
+}
+
+/// Send a pre-allocated RST for rate-limited/shed CON packets.
+fn send_rst(
+    server: *Server,
+    raw_header: []const u8,
+    peer_address: std.net.Address,
+    index: usize,
+) void {
+    if (raw_header.len < 4) return;
+
+    const slot = index * 4;
+    if (slot + 4 > server.rate_limit_rst.len) return;
+
+    // Build RST: version=1, type=RST(3), tkl=0, code=0.00, same msg_id
+    server.rate_limit_rst[slot + 0] = 0x70; // ver=1, type=RST(11), tkl=0
+    server.rate_limit_rst[slot + 1] = 0x00;
+    server.rate_limit_rst[slot + 2] = raw_header[2];
+    server.rate_limit_rst[slot + 3] = raw_header[3];
+
+    const rst_data = server.rate_limit_rst[slot..][0..4];
+    server.send_data(rst_data, peer_address, index) catch {};
+}
+
+/// Recompute load level based on pool utilization.
+fn update_load_level(server: *Server) void {
+    const buf_pct: u16 = if (server.config.buffer_count > 0)
+        (server.buffers_peak *| 100) / server.config.buffer_count
+    else
+        0;
+    server.buffers_peak = 0;
+    const exch_pct: u16 = if (server.config.exchange_count > 0)
+        (@as(u16, server.exchanges.count_active) *| 100) / server.config.exchange_count
+    else
+        0;
+
+    const max_pct: u16 = @max(buf_pct, exch_pct);
+
+    switch (server.load_level) {
+        .normal => {
+            if (max_pct >= server.config.load_shed_critical_pct) {
+                server.load_level = .shedding;
+                log.warn("load shedding: critical ({d}%)", .{max_pct});
+            } else if (max_pct >= server.config.load_shed_throttle_pct) {
+                server.load_level = .throttled;
+                log.info("load shedding: throttled ({d}%)", .{max_pct});
+            }
+        },
+        .throttled => {
+            if (max_pct >= server.config.load_shed_critical_pct) {
+                server.load_level = .shedding;
+                log.warn("load shedding: critical ({d}%)", .{max_pct});
+            } else if (max_pct < server.config.load_shed_recover_pct) {
+                server.load_level = .normal;
+                log.info("load shedding: recovered", .{});
+            }
+        },
+        .shedding => {
+            if (max_pct < server.config.load_shed_recover_pct) {
+                server.load_level = .normal;
+                log.info("load shedding: recovered", .{});
+            } else if (max_pct < server.config.load_shed_throttle_pct) {
+                server.load_level = .throttled;
+                log.info("load shedding: eased to throttled ({d}%)", .{max_pct});
+            }
+        },
+    }
 }
 
 /// Encode and queue a UDP response to the peer.
@@ -614,6 +889,16 @@ fn send_data(
     try server.io.send_msg(&server.msgs_response[index]);
 }
 
+/// Release a buffer back to the kernel, flushing the SQ on failure and retrying once.
+fn release_buffer_robust(io: *Io, buffer_id: u16) void {
+    io.release_buffer(buffer_id) catch {
+        _ = io.submit() catch {};
+        io.release_buffer(buffer_id) catch |err| {
+            log.err("buffer {d} lost: {}", .{ buffer_id, err });
+        };
+    };
+}
+
 fn nextMsgId(server: *Server) u16 {
     const id = server.next_msg_id;
     server.next_msg_id = id +% 1;
@@ -645,10 +930,10 @@ fn null_handler(_: handler.Request) ?handler.Response {
     return null;
 }
 
-var handler_call_count: u32 = 0;
+var handler_call_count = std.atomic.Value(u32).init(0);
 
 fn counting_handler(request: handler.Request) ?handler.Response {
-    handler_call_count += 1;
+    _ = handler_call_count.fetchAdd(1, .monotonic);
     return .{ .payload = request.packet.payload };
 }
 
@@ -874,7 +1159,7 @@ test "NON null handler sends no response" {
 test "CON duplicate detection" {
     const port: u16 = 19687;
 
-    handler_call_count = 0;
+    handler_call_count.store(0, .monotonic);
     var server = try Server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 8,
@@ -902,13 +1187,13 @@ test "CON duplicate detection" {
     // First request — handler should be called.
     const raw1 = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw1);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 
     // Second request (same msg_id) — handler should NOT be called.
     // The cached response should be retransmitted.
     const raw2 = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw2);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 
     // Both responses should be identical.
     try testing.expectEqualSlices(u8, raw1, raw2);
@@ -922,7 +1207,7 @@ test "CON duplicate detection" {
 test "RST cancels CON exchange" {
     const port: u16 = 19688;
 
-    handler_call_count = 0;
+    handler_call_count.store(0, .monotonic);
     var server = try Server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 8,
@@ -950,7 +1235,7 @@ test "RST cancels CON exchange" {
 
     const raw1 = try send_tick_recv(&server, client_fd, con_wire);
     defer testing.allocator.free(raw1);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 
     // Send RST with same msg_id to cancel the exchange.
     const rst_packet = coapz.Packet{
@@ -976,7 +1261,7 @@ test "RST cancels CON exchange" {
     // Send same CON again — exchange was cleared, handler called again.
     const raw2 = try send_tick_recv(&server, client_fd, con_wire);
     defer testing.allocator.free(raw2);
-    try testing.expectEqual(@as(u32, 2), handler_call_count);
+    try testing.expectEqual(@as(u32, 2), handler_call_count.load(.monotonic));
 }
 
 test "GET /.well-known/core returns link format" {
@@ -1028,7 +1313,7 @@ test "GET /.well-known/core returns link format" {
 test "well_known_core null passes to handler" {
     const port: u16 = 19690;
 
-    handler_call_count = 0;
+    handler_call_count.store(0, .monotonic);
     var server = try Server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 8,
@@ -1058,7 +1343,7 @@ test "well_known_core null passes to handler" {
 
     const raw = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 }
 
 const TestCtx = struct { call_count: u32 = 0 };
