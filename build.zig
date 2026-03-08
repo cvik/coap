@@ -51,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_mod.addImport("coapz", coapz_dep.module("coapz"));
+    bench_mod.addImport("coapd", lib_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",

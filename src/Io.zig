@@ -35,7 +35,9 @@ pub fn init(
     std.debug.assert(buffer_count > 0);
     std.debug.assert(buffer_size > 0);
 
-    var ring = try linux.IoUring.init(buffer_count, 0);
+    // Ring must accommodate send + release_buffer per recv, plus overhead.
+    const ring_entries: u16 = buffer_count *| 4;
+    var ring = try linux.IoUring.init(ring_entries, 0);
     errdefer ring.deinit();
 
     const total = @as(usize, buffer_count) * buffer_size;
@@ -74,6 +76,11 @@ pub fn setup(io: *Io, port: u16) !void {
     io.fd_socket = fd;
 
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+
+    // Increase socket buffers for throughput.
+    const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
 
     const address = try std.net.Address.parseIp("0.0.0.0", port);
     try posix.bind(fd, &address.any, address.getOsSockLen());

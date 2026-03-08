@@ -121,7 +121,9 @@ pub fn deinit(server: *Server) void {
     server.allocator.free(server.buffer_response);
 }
 
-pub fn run(server: *Server) !void {
+/// Bind the socket, register buffers, and arm the multishot recv.
+/// After this returns the server is ready to accept packets.
+pub fn listen(server: *Server) !void {
     try server.io.setup(server.config.port);
 
     server.msg_recv.name = &server.addr_recv;
@@ -130,6 +132,10 @@ pub fn run(server: *Server) !void {
 
     try server.io.recv_multishot(&server.msg_recv);
     _ = try server.io.submit();
+}
+
+pub fn run(server: *Server) !void {
+    try server.listen();
 
     log.info("coapd listening on port {d}", .{server.config.port});
 
@@ -138,7 +144,7 @@ pub fn run(server: *Server) !void {
     }
 }
 
-fn tick(server: *Server) !void {
+pub fn tick(server: *Server) !void {
     const batch_max = constants.completion_batch_max;
     var cqes: [batch_max]Cqe = std.mem.zeroes([batch_max]Cqe);
 
@@ -345,12 +351,7 @@ fn counting_handler(request: handler.Request) ?handler.Response {
 
 /// Helper: setup server io and multishot recv (for tests).
 fn setup_for_test(server: *Server) !void {
-    try server.io.setup(server.config.port);
-    server.msg_recv.name = &server.addr_recv;
-    server.msg_recv.namelen = @sizeOf(linux.sockaddr);
-    server.msg_recv.controllen = 0;
-    try server.io.recv_multishot(&server.msg_recv);
-    _ = try server.io.submit();
+    try server.listen();
 }
 
 /// Helper: create a UDP client socket with a receive timeout.
