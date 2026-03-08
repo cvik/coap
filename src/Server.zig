@@ -163,7 +163,7 @@ fn init_raw(
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
         .tick_count = 0,
-        .next_msg_id = 0,
+        .next_msg_id = std.crypto.random.int(u16),
     };
 }
 
@@ -374,7 +374,7 @@ fn handle_recv(
     }
 
     const packet = coapz.Packet.read(arena, recv.payload) catch |err| {
-        server.io.release_buffer(recv.buffer_id) catch {};
+        release_buffer_robust(&server.io, recv.buffer_id);
         switch (err) {
             error.OutOfMemory => {
                 log.warn("OOM parsing packet, sending emergency ACK", .{});
@@ -388,9 +388,7 @@ fn handle_recv(
     // Release the recv buffer immediately — Packet.read copied all
     // data into the arena, so the provided buffer can be returned to
     // the kernel pool without waiting for response construction.
-    server.io.release_buffer(recv.buffer_id) catch |err| {
-        log.err("release_buffer {d}: {}", .{ recv.buffer_id, err });
-    };
+    release_buffer_robust(&server.io, recv.buffer_id);
 
     // RST cancels the matching exchange.
     if (packet.kind == .reset) {
@@ -614,6 +612,16 @@ fn send_data(
     try server.io.send_msg(&server.msgs_response[index]);
 }
 
+/// Release a buffer back to the kernel, flushing the SQ on failure and retrying once.
+fn release_buffer_robust(io: *Io, buffer_id: u16) void {
+    io.release_buffer(buffer_id) catch {
+        _ = io.submit() catch {};
+        io.release_buffer(buffer_id) catch |err| {
+            log.err("buffer {d} lost: {}", .{ buffer_id, err });
+        };
+    };
+}
+
 fn nextMsgId(server: *Server) u16 {
     const id = server.next_msg_id;
     server.next_msg_id = id +% 1;
@@ -645,10 +653,10 @@ fn null_handler(_: handler.Request) ?handler.Response {
     return null;
 }
 
-var handler_call_count: u32 = 0;
+var handler_call_count = std.atomic.Value(u32).init(0);
 
 fn counting_handler(request: handler.Request) ?handler.Response {
-    handler_call_count += 1;
+    _ = handler_call_count.fetchAdd(1, .monotonic);
     return .{ .payload = request.packet.payload };
 }
 
@@ -874,7 +882,7 @@ test "NON null handler sends no response" {
 test "CON duplicate detection" {
     const port: u16 = 19687;
 
-    handler_call_count = 0;
+    handler_call_count.store(0, .monotonic);
     var server = try Server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 8,
@@ -902,13 +910,13 @@ test "CON duplicate detection" {
     // First request — handler should be called.
     const raw1 = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw1);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 
     // Second request (same msg_id) — handler should NOT be called.
     // The cached response should be retransmitted.
     const raw2 = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw2);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 
     // Both responses should be identical.
     try testing.expectEqualSlices(u8, raw1, raw2);
@@ -922,7 +930,7 @@ test "CON duplicate detection" {
 test "RST cancels CON exchange" {
     const port: u16 = 19688;
 
-    handler_call_count = 0;
+    handler_call_count.store(0, .monotonic);
     var server = try Server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 8,
@@ -950,7 +958,7 @@ test "RST cancels CON exchange" {
 
     const raw1 = try send_tick_recv(&server, client_fd, con_wire);
     defer testing.allocator.free(raw1);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 
     // Send RST with same msg_id to cancel the exchange.
     const rst_packet = coapz.Packet{
@@ -976,7 +984,7 @@ test "RST cancels CON exchange" {
     // Send same CON again — exchange was cleared, handler called again.
     const raw2 = try send_tick_recv(&server, client_fd, con_wire);
     defer testing.allocator.free(raw2);
-    try testing.expectEqual(@as(u32, 2), handler_call_count);
+    try testing.expectEqual(@as(u32, 2), handler_call_count.load(.monotonic));
 }
 
 test "GET /.well-known/core returns link format" {
@@ -1028,7 +1036,7 @@ test "GET /.well-known/core returns link format" {
 test "well_known_core null passes to handler" {
     const port: u16 = 19690;
 
-    handler_call_count = 0;
+    handler_call_count.store(0, .monotonic);
     var server = try Server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 8,
@@ -1058,7 +1066,7 @@ test "well_known_core null passes to handler" {
 
     const raw = try send_tick_recv(&server, client_fd, wire);
     defer testing.allocator.free(raw);
-    try testing.expectEqual(@as(u32, 1), handler_call_count);
+    try testing.expectEqual(@as(u32, 1), handler_call_count.load(.monotonic));
 }
 
 const TestCtx = struct { call_count: u32 = 0 };
