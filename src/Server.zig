@@ -49,6 +49,8 @@ pub const Config = struct {
     load_shed_critical_pct: u8 = 90,
     /// Load shedding: recover to normal when both pools drop below this %.
     load_shed_recover_pct: u8 = 50,
+    /// Log warning when handler takes longer than this (ns). 0 = disabled.
+    handler_warn_ns: u64 = 10 * std.time.ns_per_ms,
 };
 
 allocator: std.mem.Allocator,
@@ -543,7 +545,15 @@ fn handle_recv(
                 });
             }
         }
-        break :blk server.handler_fn(server.handler_context, request);
+        const before = if (server.config.handler_warn_ns > 0) std.time.nanoTimestamp() else 0;
+        const result = server.handler_fn(server.handler_context, request);
+        if (server.config.handler_warn_ns > 0) {
+            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - before));
+            if (elapsed > server.config.handler_warn_ns) {
+                log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
+            }
+        }
+        break :blk result;
     };
 
     if (maybe_response) |response| {
