@@ -213,7 +213,10 @@ pub fn tick(server: *Server) !void {
         }
 
         server.handle_recv(&cqe, index) catch |err| {
-            log.err("handle_recv: {}", .{err});
+            switch (err) {
+                error.PayloadOutOfBounds => log.debug("handle_recv: {}", .{err}),
+                else => log.err("handle_recv: {}", .{err}),
+            }
         };
 
         // Flush SQEs periodically to return buffers to the kernel
@@ -399,6 +402,9 @@ fn send_data(
     peer_address: std.net.Address,
     index: usize,
 ) !void {
+    const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
+    std.debug.assert(index < batch);
+
     if (data.len > server.config.buffer_size) {
         log.err("response too large: {d} > {d}", .{
             data.len,

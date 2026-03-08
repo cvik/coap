@@ -8,6 +8,8 @@ const posix = std.posix;
 const Cqe = linux.io_uring_cqe;
 const constants = @import("constants.zig");
 
+const log = std.log.scoped(.io);
+
 const Io = @This();
 
 /// Missing from zig std linux definitions.
@@ -89,8 +91,12 @@ pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
 
     // Increase socket buffers for throughput.
     const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch |err| {
+        log.debug("SO_SNDBUF: {}", .{err});
+    };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch |err| {
+        log.debug("SO_RCVBUF: {}", .{err});
+    };
 
     try posix.bind(fd, &address.any, address.getOsSockLen());
 
@@ -158,6 +164,7 @@ pub fn submit(io: *Io) !u32 {
 
 /// Return a provided buffer to the kernel pool.
 pub fn release_buffer(io: *Io, buffer_id: u16) !void {
+    std.debug.assert(buffer_id < io.buffer_count);
     const offset = @as(usize, buffer_id) * io.buffer_size;
     _ = try io.ring.provide_buffers(
         @intFromEnum(UserData.provide_buffers),
