@@ -16,5 +16,7 @@
         "examples",
         "bench",
         "README.md",
+        "CHANGELOG.md",
+        "LICENSE",
     },
 }
