@@ -32,6 +32,8 @@ pub const Config = struct {
     thread_count: u16 = 1,
     /// IPv4 address to bind. Use "127.0.0.1" for loopback only.
     bind_address: []const u8 = "0.0.0.0",
+    /// Maximum arena size in bytes. Arena is trimmed after each tick.
+    max_arena_size: usize = 256 * 1024,
 };
 
 allocator: std.mem.Allocator,
@@ -63,6 +65,9 @@ tick_count: u64,
 
 // Server-side message ID counter for NON responses.
 next_msg_id: u16,
+
+// Arena management.
+force_free_all: bool,
 
 /// Initialize with a simple handler (no context). Backward compatible.
 pub fn init(
@@ -164,6 +169,7 @@ fn init_raw(
         .last_eviction_ns = 0,
         .tick_count = 0,
         .next_msg_id = std.crypto.random.int(u16),
+        .force_free_all = false,
     };
 }
 
@@ -351,10 +357,18 @@ pub fn tick(server: *Server) !void {
     _ = try server.io.submit();
 
     server.tick_count += 1;
-    if (server.tick_count % 1000 == 0) {
+
+    // Adaptive arena reset: free_all after busy ticks or periodically,
+    // otherwise retain with size limit to cap memory growth.
+    const busy_threshold: u32 = @min(constants.completion_batch_max, server.config.buffer_count) / 2;
+    if (server.force_free_all or server.tick_count % 100 == 0) {
         _ = server.arena.reset(.free_all);
+        server.force_free_all = false;
     } else {
-        _ = server.arena.reset(.retain_capacity);
+        _ = server.arena.reset(.{ .retain_with_limit = server.config.max_arena_size });
+    }
+    if (processed > busy_threshold) {
+        server.force_free_all = true;
     }
 }
 
