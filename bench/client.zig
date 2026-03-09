@@ -277,7 +277,7 @@ fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
 }
 
 fn echo_handler(request: coapd.Request) ?coapd.Response {
-    return .{ .payload = request.packet.payload };
+    return coapd.Response.ok(request.payload());
 }
 
 fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
