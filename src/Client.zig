@@ -471,7 +471,8 @@ pub fn cast(
         .data_buf = &.{},
     };
 
-    const wire = try packet.writeBuf(client.recv_buf);
+    var buf: [constants.buffer_size_default]u8 = undefined;
+    const wire = try packet.writeBuf(&buf);
     try client.sendDirect(wire);
 }
 
@@ -601,7 +602,8 @@ pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !
 /// Send a pre-built CoAP packet without protocol automation.
 /// No retransmission, no token generation — the caller controls everything.
 pub fn sendRaw(client: *Client, packet: coapz.Packet) !void {
-    const wire = try packet.writeBuf(client.recv_buf);
+    var buf: [constants.buffer_size_default]u8 = undefined;
+    const wire = try packet.writeBuf(&buf);
     try client.sendDirect(wire);
 }
 
