@@ -57,6 +57,7 @@ pub const Config = struct {
     well_known_core: ?[]const u8 = null,
     /// Number of server threads. Each gets its own socket/ring/exchange pool.
     /// Kernel distributes packets via SO_REUSEPORT.
+    /// When > 1, the handler context pointer is shared — see `initContext`.
     thread_count: u16 = 1,
     /// IPv4 address to bind. Use "127.0.0.1" for loopback only.
     bind_address: []const u8 = "0.0.0.0",
@@ -108,7 +109,7 @@ addr_recv: linux.sockaddr,
 msg_recv: linux.msghdr,
 
 // Eviction timer.
-last_eviction_ns: i128,
+last_eviction_ns: i64,
 tick_count: u64,
 
 // Server-side message ID counter for NON responses.
@@ -122,7 +123,7 @@ load_level: LoadLevel,
 buffers_outstanding: u16,
 buffers_peak: u16,
 rate_limiter: ?RateLimiter,
-tick_now_ns: i128,
+tick_now_ns: i64,
 
 /// Pre-allocated RST buffers for rate-limited/shed CON packets.
 rate_limit_rst: []u8,
@@ -142,9 +143,13 @@ pub fn init(
 /// Initialize with a typed context handler. The context pointer is
 /// type-erased internally and passed to the handler on every invocation.
 ///
+/// **Thread safety:** When `Config.thread_count > 1`, the context pointer
+/// is shared across worker threads. Mutations must use `@atomicRmw`,
+/// mutexes, or thread-local state to avoid data races.
+///
 /// ```zig
 /// fn handle(ctx: *State, req: Request) ?Response {
-///     ctx.counter += 1;
+///     _ = @atomicRmw(u64, &ctx.counter, .Add, 1, .monotonic);
 ///     return Response.ok(req.payload());
 /// }
 /// var server = try Server.initContext(allocator, .{}, handle, &state);
@@ -529,7 +534,7 @@ pub fn tick(server: *Server) !void {
     const batch_max = constants.completion_batch_max;
     var cqes: [batch_max]Cqe = std.mem.zeroes([batch_max]Cqe);
 
-    server.tick_now_ns = std.time.nanoTimestamp();
+    server.tick_now_ns = @intCast(std.time.nanoTimestamp());
 
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
@@ -570,7 +575,7 @@ pub fn tick(server: *Server) !void {
     }
 
     // Periodic exchange eviction (~every 10 seconds).
-    const eviction_interval_ns: i128 = 10 * std.time.ns_per_s;
+    const eviction_interval_ns: i64 = 10 * std.time.ns_per_s;
     if (server.tick_now_ns - server.last_eviction_ns > eviction_interval_ns) {
         const evicted = server.exchanges.evict_expired(server.tick_now_ns);
         if (evicted > 0) {
@@ -615,6 +620,13 @@ fn handle_recv(
     var raw_header: [4]u8 = .{ 0, 0, 0, 0 };
     if (recv.payload.len >= 4) {
         @memcpy(&raw_header, recv.payload[0..4]);
+    }
+
+    // Drop non-CoAP-v1 packets early.
+    if (recv.payload.len >= 1 and (recv.payload[0] >> 6) != 1) {
+        release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
+        return;
     }
 
     // Load shedding: drop new packets when critically loaded.
@@ -724,10 +736,11 @@ fn handle_recv(
                 });
             }
         }
+        const before = if (server.config.handler_warn_ns > 0) std.time.nanoTimestamp() else 0;
         const result = server.handler_fn(server.handler_context, request);
         if (server.config.handler_warn_ns > 0) {
             const after = std.time.nanoTimestamp();
-            const elapsed: u64 = @intCast(@max(0, after - server.tick_now_ns));
+            const elapsed: u64 = @intCast(@max(0, after - before));
             if (elapsed > server.config.handler_warn_ns) {
                 log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
             }
@@ -950,7 +963,7 @@ fn send_data(
     index: usize,
 ) !void {
     const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
-    std.debug.assert(index < batch);
+    if (index >= batch) return error.InvalidIndex;
 
     if (data.len > server.config.buffer_size) {
         log.err("response too large: {d} > {d}", .{

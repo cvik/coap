@@ -148,13 +148,14 @@ var state = State{};
 var server = try coapd.Server.initContext(allocator, .{}, handle, &state);
 
 fn handle(ctx: *State, request: coapd.Request) ?coapd.Response {
-    ctx.counter += 1;
+    _ = @atomicRmw(u64, &ctx.counter, .Add, 1, .monotonic);
     return coapd.Response.ok(request.payload());
 }
 ```
 
 The context pointer is type-erased internally and passed to the handler on
-every invocation.
+every invocation. When `thread_count > 1`, the context is shared across worker
+threads — use atomic operations, mutexes, or thread-local state.
 
 ### Error Handling Wrappers
 
