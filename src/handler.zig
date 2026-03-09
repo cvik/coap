@@ -10,6 +10,36 @@ pub const Request = struct {
     peer_address: std.net.Address,
     /// Arena allocator that resets after the handler returns.
     arena: std.mem.Allocator,
+
+    /// Request method (GET, POST, PUT, DELETE, …).
+    pub inline fn method(self: Request) coapz.Code {
+        return self.packet.code;
+    }
+
+    /// Request payload bytes.
+    pub inline fn payload(self: Request) []const u8 {
+        return self.packet.payload;
+    }
+
+    /// Iterator over URI-Path option segments.
+    pub inline fn pathSegments(self: Request) coapz.OptionIterator {
+        return self.packet.find_options(.uri_path);
+    }
+
+    /// Iterator over URI-Query option values.
+    pub inline fn querySegments(self: Request) coapz.OptionIterator {
+        return self.packet.find_options(.uri_query);
+    }
+
+    /// Iterator over options of a given kind.
+    pub inline fn findOptions(self: Request, kind: coapz.OptionKind) coapz.OptionIterator {
+        return self.packet.find_options(kind);
+    }
+
+    /// First option of a given kind, or null.
+    pub inline fn findOption(self: Request, kind: coapz.OptionKind) ?coapz.Option {
+        return self.packet.find_option(kind);
+    }
 };
 
 /// CoAP response returned by a handler.
@@ -111,4 +141,48 @@ test "safeWrap passes through null" {
     };
     const resp = wrapped(request);
     try testing.expect(resp == null);
+}
+
+fn testRequest(code: coapz.Code, options: []const coapz.Option, body: []const u8) !Request {
+    const pkt = coapz.Packet{
+        .kind = .confirmable,
+        .code = code,
+        .msg_id = 1,
+        .token = &.{},
+        .options = options,
+        .payload = body,
+        .data_buf = &.{},
+    };
+    var buf: [256]u8 = undefined;
+    const wire = try pkt.writeBuf(&buf);
+    const parsed = try coapz.Packet.read(testing.allocator, wire);
+    return .{
+        .packet = parsed,
+        .peer_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        .arena = testing.allocator,
+    };
+}
+
+test "Request.method returns packet code" {
+    const req = try testRequest(.get, &.{}, &.{});
+    defer req.packet.deinit(testing.allocator);
+    try testing.expectEqual(coapz.Code.get, req.method());
+}
+
+test "Request.payload returns packet payload" {
+    const req = try testRequest(.post, &.{}, "body");
+    defer req.packet.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, "body", req.payload());
+}
+
+test "Request.pathSegments iterates uri_path options" {
+    const req = try testRequest(.get, &.{
+        .{ .kind = .uri_path, .value = "hello" },
+        .{ .kind = .uri_path, .value = "world" },
+    }, &.{});
+    defer req.packet.deinit(testing.allocator);
+    var it = req.pathSegments();
+    try testing.expectEqualSlices(u8, "hello", it.next().?.value);
+    try testing.expectEqualSlices(u8, "world", it.next().?.value);
+    try testing.expect(it.next() == null);
 }
