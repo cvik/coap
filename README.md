@@ -311,6 +311,16 @@ try stream.cancel();
 
 CON notifications are automatically ACKed.
 
+For zero-allocation notification processing, use `nextBuf` with a caller-provided buffer:
+
+```zig
+var buf: [1500]u8 = undefined;
+while (try stream.nextBuf(&buf)) |notification| {
+    // notification.payload and options live in buf — no deinit needed
+    std.debug.print("update: {s}\n", .{notification.payload});
+}
+```
+
 ### upload — RFC 7959 Block1
 
 Upload large payloads using Block1 segmentation:
