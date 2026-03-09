@@ -1,11 +1,28 @@
 /// CoAP client on a connected UDP socket.
 ///
 /// One client per peer — connects to a single server via `connect()`'d UDP.
-/// Supports NON fire-and-forget (cast), CON request/response with
-/// retransmission (call), raw send/recv, RFC 7641 observe, RFC 7959 Block1
-/// upload, and transparent Block2 reassembly inside call().
+/// Supports NON fire-and-forget (`cast`), CON request/response with
+/// retransmission (`call`, `get`, `post`, `put`, `delete`), raw send/recv,
+/// RFC 7641 observe, RFC 7959 Block1 upload, and transparent Block2
+/// reassembly.
 ///
 /// Single-threaded, tick-driven. Not thread-safe.
+///
+/// **Memory:** `init()` pre-allocates send/recv buffers and in-flight slot
+/// tables. These are owned by the client and freed in `deinit()`.
+/// Response data from `call`/`get`/etc. is allocated by the caller-provided
+/// allocator and must be freed via `Result.deinit()`.
+///
+/// ## Example
+///
+/// ```zig
+/// var client = try Client.init(allocator, .{ .host = "10.0.0.1" });
+/// defer client.deinit();
+///
+/// const result = try client.get(allocator, "/sensor/temperature");
+/// defer result.deinit(allocator);
+/// std.debug.print("{s}\n", .{result.payload});
+/// ```
 const std = @import("std");
 const posix = std.posix;
 const coapz = @import("coapz");
@@ -14,24 +31,48 @@ const log = std.log.scoped(.coapd_client);
 
 const Client = @This();
 
+/// Client configuration. All fields have sensible defaults.
 pub const Config = struct {
+    /// Server IPv4 address. Default: `"127.0.0.1"`.
     host: []const u8 = "127.0.0.1",
+    /// Server UDP port. Default: 5683 (CoAP standard).
     port: u16 = constants.port_default,
+    /// Maximum concurrent CON requests in flight. Default: 32.
     max_in_flight: u16 = 32,
+    /// Maximum CoAP datagram size in bytes. Default: 1280.
     buffer_size: u32 = constants.buffer_size_default,
+    /// Token length in bytes (1–8). Default: 2.
     token_len: u3 = 2,
-    /// Block size exponent: block_size = 2^(szx+4). Default 6 = 1024 bytes.
+    /// Block size exponent for Block1/Block2: `block_size = 2^(szx+4)`.
+    /// Default: 6 (1024 bytes).
     default_szx: u3 = 6,
 };
 
+/// Response from a CON request (`call`, `get`, `post`, `put`, `delete`, `upload`).
+///
+/// **Lifetime:** The result owns the parsed packet and (for Block2 reassembly)
+/// a separate payload allocation. The caller must call `deinit()` with the
+/// same allocator passed to the originating call.
+///
+/// ```zig
+/// const result = try client.get(allocator, "/path");
+/// defer result.deinit(allocator);
+/// // use result.code, result.payload, result.options
+/// ```
 pub const Result = struct {
+    /// Response code (e.g. `.content`, `.not_found`).
     code: coapz.Code,
+    /// Response options. Backed by `packet`; valid until `deinit()`.
     options: []const coapz.Option,
+    /// Response body. Backed by `packet` or by a separate allocation
+    /// when Block2 reassembly occurred. Valid until `deinit()`.
     payload: []const u8,
+    /// The full parsed response packet, for advanced inspection.
     packet: coapz.Packet,
-    /// Internal: payload is a standalone allocation (Block2 reassembly).
     _owns_payload: bool = false,
 
+    /// Free all memory associated with this result. Must be called with
+    /// the same allocator that was passed to `call`/`get`/`post`/etc.
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         if (self._owns_payload) {
             allocator.free(@constCast(self.payload));
@@ -79,10 +120,30 @@ const ObserveSub = struct {
     pending: [max_pending_notifications]PendingNotification,
 };
 
+/// Handle for an active RFC 7641 observe subscription.
+///
+/// Returned by `Client.observe()`. Call `next()` or `nextBuf()` in a loop
+/// to receive notifications, and `cancel()` to unsubscribe.
+///
+/// **Lifetime:** The stream borrows the `Client` and must not outlive it.
+/// CON notifications are automatically ACKed.
+///
+/// ```zig
+/// var stream = try client.observe(&.{
+///     .{ .kind = .uri_path, .value = "temperature" },
+/// });
+/// while (try stream.next(allocator)) |notif| {
+///     defer notif.deinit(allocator);
+///     std.debug.print("{s}\n", .{notif.payload});
+/// }
+/// try stream.cancel();
+/// ```
 pub const ObserveStream = struct {
     client: *Client,
     sub_idx: u8,
 
+    /// A single observe notification. Caller must call `deinit()` with
+    /// the same allocator passed to `next()`.
     pub const Notification = struct {
         code: coapz.Code,
         options: []const coapz.Option,
@@ -94,14 +155,19 @@ pub const ObserveStream = struct {
         }
     };
 
-    /// Like `Notification` but backed by a caller-provided buffer (no heap allocation).
+    /// A notification parsed into a caller-provided buffer. No heap
+    /// allocation; data is valid only until the next `nextBuf()` call.
     pub const BufNotification = struct {
         code: coapz.Code,
         options: []const coapz.Option,
         payload: []const u8,
     };
 
-    /// Wait for the next observe notification. Returns null if cancelled.
+    /// Block until the next observe notification arrives.
+    /// Returns `null` if the subscription was cancelled.
+    ///
+    /// **Lifetime:** The returned `Notification` owns its packet data.
+    /// Caller must call `notification.deinit(allocator)` when done.
     pub fn next(self: *ObserveStream, allocator: std.mem.Allocator) !?Notification {
         const sub = &self.client.observes[self.sub_idx];
         if (!sub.active) return null;
@@ -137,9 +203,12 @@ pub const ObserveStream = struct {
 
     pub const Error = error{BufferTooSmall};
 
-    /// Wait for the next notification, parsing into `buf` instead of allocating.
-    /// Returns null if cancelled. Returns error.BufferTooSmall if the packet
-    /// doesn't fit in the provided buffer.
+    /// Like `next()`, but parses the notification into a caller-provided
+    /// buffer instead of heap-allocating. Returns `null` if cancelled,
+    /// `error.BufferTooSmall` if the packet doesn't fit in `buf`.
+    ///
+    /// **Lifetime:** The returned `BufNotification` fields point into `buf`
+    /// and are valid until the next `nextBuf()` call or until `buf` is reused.
     pub fn nextBuf(self: *ObserveStream, buf: []u8) !?BufNotification {
         const sub = &self.client.observes[self.sub_idx];
         if (!sub.active) return null;
@@ -176,7 +245,8 @@ pub const ObserveStream = struct {
         }
     }
 
-    /// Cancel the observe subscription by sending deregister.
+    /// Cancel the observe subscription by sending a deregister GET
+    /// (Observe=1). Drains any buffered pending notifications.
     pub fn cancel(self: *ObserveStream) !void {
         const sub = &self.client.observes[self.sub_idx];
         if (!sub.active) return;
@@ -242,6 +312,14 @@ rng: std.Random.DefaultPrng,
 
 const empty_sentinel: u16 = 0xFFFF;
 
+/// Create a client and connect to the server at `config.host:config.port`.
+///
+/// Pre-allocates `max_in_flight * buffer_size` bytes for the send buffer,
+/// `buffer_size` for the recv buffer, plus slot tracking tables. All owned
+/// by the client and freed in `deinit()`.
+///
+/// Returns `error.InvalidConfig` if `max_in_flight` is 0 or `buffer_size` < 64.
+/// Returns `error.UnsupportedAddressFamily` for non-IPv4 addresses.
 pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     if (config.max_in_flight == 0) return error.InvalidConfig;
     if (config.buffer_size < 64) return error.InvalidConfig;
@@ -334,6 +412,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     };
 }
 
+/// Release all client-owned memory and close the socket.
+/// Outstanding `Result` values must be deinited separately by the caller.
 pub fn deinit(client: *Client) void {
     for (&client.observes) |*obs| {
         if (obs.active) {
@@ -351,6 +431,14 @@ pub fn deinit(client: *Client) void {
 
 // ─── cast (NON fire-and-forget) ──────────────────────────────────
 
+/// Send a NON (non-confirmable) request. Fire-and-forget — no response
+/// is expected and the call does not block. No memory is allocated.
+///
+/// ```zig
+/// try client.cast(.post, &.{
+///     .{ .kind = .uri_path, .value = "log" },
+/// }, "event happened");
+/// ```
 pub fn cast(
     client: *Client,
     code: coapz.Code,
@@ -377,6 +465,21 @@ pub fn cast(
 
 // ─── call (CON with retransmission + Block2 reassembly) ──────────
 
+/// Send a CON (confirmable) request and block until a response arrives.
+///
+/// Automatically retransmits per RFC 7252 §4.2 (up to 4 retries, ~93s).
+/// Transparently reassembles Block2 multi-block responses.
+///
+/// `allocator` is used to parse the response packet (and to accumulate
+/// Block2 payload when reassembly is needed). The caller owns the
+/// returned `Result` and must call `result.deinit(allocator)`.
+///
+/// For simple path-based requests, prefer `get()`, `post()`, `put()`,
+/// `delete()` which build URI-Path options automatically.
+///
+/// Returns `error.Timeout` after max retransmissions.
+/// Returns `error.Reset` if the server sends RST.
+/// Returns `error.TooManyInFlight` if `max_in_flight` slots are exhausted.
 pub fn call(
     client: *Client,
     allocator: std.mem.Allocator,
@@ -451,25 +554,31 @@ fn pathToOptions(path: []const u8, buf: *[max_path_segments]coapz.Option) []cons
     return buf[0..count];
 }
 
-/// CON GET by path. Returns the response.
+/// CON GET by URI path. Splits `path` into URI-Path options and
+/// calls `call()`. Caller must call `result.deinit(allocator)`.
+///
+/// ```zig
+/// const result = try client.get(allocator, "/sensor/temperature");
+/// defer result.deinit(allocator);
+/// ```
 pub fn get(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
     var buf: [max_path_segments]coapz.Option = undefined;
     return client.call(allocator, .get, pathToOptions(path, &buf), &.{});
 }
 
-/// CON POST by path with payload. Returns the response.
+/// CON POST by URI path with payload. Caller must call `result.deinit(allocator)`.
 pub fn post(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
     var buf: [max_path_segments]coapz.Option = undefined;
     return client.call(allocator, .post, pathToOptions(path, &buf), payload);
 }
 
-/// CON PUT by path with payload. Returns the response.
+/// CON PUT by URI path with payload. Caller must call `result.deinit(allocator)`.
 pub fn put(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
     var buf: [max_path_segments]coapz.Option = undefined;
     return client.call(allocator, .put, pathToOptions(path, &buf), payload);
 }
 
-/// CON DELETE by path. Returns the response.
+/// CON DELETE by URI path. Caller must call `result.deinit(allocator)`.
 pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
     var buf: [max_path_segments]coapz.Option = undefined;
     return client.call(allocator, .delete, pathToOptions(path, &buf), &.{});
@@ -477,12 +586,17 @@ pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !
 
 // ─── sendRaw / recvRaw ───────────────────────────────────────────
 
+/// Send a pre-built CoAP packet without protocol automation.
+/// No retransmission, no token generation — the caller controls everything.
 pub fn sendRaw(client: *Client, packet: coapz.Packet) !void {
     var buf: [constants.buffer_size_default]u8 = undefined;
     const wire = try packet.writeBuf(&buf);
     try client.sendDirect(wire);
 }
 
+/// Receive a single raw CoAP packet, blocking up to `timeout_ms`.
+/// Returns `null` on timeout. Caller owns the packet and must call
+/// `packet.deinit(allocator)`.
 pub fn recvRaw(
     client: *Client,
     allocator: std.mem.Allocator,
@@ -506,6 +620,16 @@ pub fn recvRaw(
 
 // ─── observe (RFC 7641) ──────────────────────────────────────────
 
+/// Subscribe to a resource for observe notifications (RFC 7641).
+///
+/// Sends a CON GET with Observe=0 and blocks until the initial ACK
+/// confirms the subscription. Returns an `ObserveStream` for receiving
+/// subsequent notifications.
+///
+/// The Observe option is prepended automatically; pass only URI-Path
+/// and other options. Maximum 8 concurrent observe subscriptions.
+///
+/// Returns `error.TooManyObserves` if 8 subscriptions are already active.
 pub fn observe(
     client: *Client,
     options: []const coapz.Option,
@@ -588,6 +712,21 @@ pub fn observe(
 
 // ─── upload (RFC 7959 Block1) ────────────────────────────────────
 
+/// Upload a large payload using RFC 7959 Block1 segmented transfer.
+///
+/// Splits `payload` into blocks of `config.default_szx` size and sends
+/// each as a separate CON request. Honors the server's preferred block
+/// size if it responds with a smaller SZX value.
+///
+/// Returns the server's response to the final block. Caller must call
+/// `result.deinit(allocator)`.
+///
+/// ```zig
+/// const result = try client.upload(allocator, .put, &.{
+///     .{ .kind = .uri_path, .value = "firmware" },
+/// }, large_payload);
+/// defer result.deinit(allocator);
+/// ```
 pub fn upload(
     client: *Client,
     allocator: std.mem.Allocator,

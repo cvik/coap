@@ -3,30 +3,56 @@ const coapz = @import("coapz");
 const log = std.log.scoped(.coapd);
 
 /// Incoming CoAP request passed to the handler function.
+///
+/// All data (packet, options, payload) is backed by the per-request arena
+/// and is only valid for the duration of the handler invocation. Do not
+/// store references to request data beyond the handler return.
+///
+/// ## Example
+///
+/// ```zig
+/// fn handler(req: coapd.Request) ?coapd.Response {
+///     if (req.method() != .get) return coapd.Response.methodNotAllowed();
+///
+///     var it = req.pathSegments();
+///     const resource = it.next() orelse return coapd.Response.notFound();
+///
+///     if (std.mem.eql(u8, resource.value, "temperature")) {
+///         return coapd.Response.ok("22.5");
+///     }
+///     return coapd.Response.notFound();
+/// }
+/// ```
 pub const Request = struct {
-    /// Parsed CoAP packet. Valid only for the handler invocation.
+    /// Parsed CoAP packet. Use the convenience accessors below for common
+    /// fields; access `packet` directly for advanced use (token, message
+    /// kind, raw option iteration).
     packet: coapz.Packet,
     /// Source address of the peer.
     peer_address: std.net.Address,
-    /// Arena allocator that resets after the handler returns.
+    /// Per-request arena allocator. Resets after the handler returns.
+    /// Use for temporary allocations needed during response construction
+    /// (e.g. duping option slices via `Response.content()`).
     arena: std.mem.Allocator,
 
-    /// Request method (GET, POST, PUT, DELETE, …).
+    /// Request method (`.get`, `.post`, `.put`, `.delete`, …).
     pub inline fn method(self: Request) coapz.Code {
         return self.packet.code;
     }
 
-    /// Request payload bytes.
+    /// Request payload bytes. Empty slice if no payload.
     pub inline fn payload(self: Request) []const u8 {
         return self.packet.payload;
     }
 
-    /// Iterator over URI-Path option segments.
+    /// Iterator over URI-Path segments. Each call to `next()` returns
+    /// one path component (e.g. `/a/b` yields `"a"` then `"b"`).
     pub inline fn pathSegments(self: Request) coapz.OptionIterator {
         return self.packet.find_options(.uri_path);
     }
 
-    /// Iterator over URI-Query option values.
+    /// Iterator over URI-Query values. Each query parameter is a
+    /// separate option (e.g. `?a=1&b=2` yields `"a=1"` then `"b=2"`).
     pub inline fn querySegments(self: Request) coapz.OptionIterator {
         return self.packet.find_options(.uri_query);
     }
@@ -43,9 +69,33 @@ pub const Request = struct {
 };
 
 /// CoAP response returned by a handler.
+///
+/// Return a `Response` to send a reply, or `null` for no response (NON
+/// requests) or an empty ACK (CON requests).
+///
+/// **Lifetime:** `payload` and `options` must remain valid until the
+/// handler returns. Point them at request data, string literals, or
+/// arena-allocated slices — the server copies the encoded response
+/// before the arena resets.
+///
+/// ## Examples
+///
+/// ```zig
+/// // Simple payload response.
+/// return Response.ok("hello");
+///
+/// // JSON with Content-Format header.
+/// return Response.content(request.arena, .json, "{\"temp\": 22.5}");
+///
+/// // Struct literal for full control.
+/// return .{ .code = .content, .options = opts, .payload = data };
+/// ```
 pub const Response = struct {
+    /// Response code. Defaults to 2.05 Content.
     code: coapz.Code = .content,
+    /// CoAP options to include in the response (e.g. Content-Format).
     options: []const coapz.Option = &.{},
+    /// Response body. Empty by default.
     payload: []const u8 = &.{},
 
     /// 2.05 Content with payload.
@@ -53,8 +103,9 @@ pub const Response = struct {
         return .{ .payload = body };
     }
 
-    /// 2.05 Content with content-format option and payload.
-    /// Allocates the options slice from the arena.
+    /// 2.05 Content with a Content-Format option and payload.
+    /// Allocates the options slice from `arena`. On allocation failure,
+    /// returns 5.00 Internal Server Error.
     pub fn content(arena: std.mem.Allocator, fmt: coapz.ContentFormat, body: []const u8) Response {
         var cf_buf: [2]u8 = undefined;
         const cf_opt = coapz.Option.content_format(fmt, &cf_buf);
@@ -108,7 +159,7 @@ pub const Response = struct {
         return .{ .code = .forbidden };
     }
 
-    /// Response with an arbitrary code.
+    /// Response with an arbitrary code and no payload.
     pub inline fn withCode(code: coapz.Code) Response {
         return .{ .code = code };
     }
@@ -127,8 +178,17 @@ pub fn wrapSimple(ctx: ?*anyopaque, request: Request) ?Response {
     return func(request);
 }
 
-/// Wrap a handler that returns `!?Response` into a `SimpleHandlerFn`.
-/// Errors are logged and converted to 5.00 Internal Server Error.
+/// Wrap a fallible handler (`!?Response`) into a `SimpleHandlerFn`.
+/// Errors are logged via `std.log` and converted to 5.00 Internal Server Error.
+///
+/// ```zig
+/// fn handler(req: Request) !?Response {
+///     const data = try expensive_lookup(req.arena);
+///     return Response.ok(data);
+/// }
+///
+/// var server = try Server.init(allocator, .{}, safeWrap(handler));
+/// ```
 pub fn safeWrap(comptime func: fn (Request) anyerror!?Response) SimpleHandlerFn {
     return struct {
         fn call(request: Request) ?Response {
@@ -140,8 +200,19 @@ pub fn safeWrap(comptime func: fn (Request) anyerror!?Response) SimpleHandlerFn 
     }.call;
 }
 
-/// Wrap a typed-context handler that returns `!?Response`.
-/// Errors are logged and converted to 5.00 Internal Server Error.
+/// Wrap a fallible context handler (`!?Response`) so errors are caught.
+/// Errors are logged via `std.log` and converted to 5.00 Internal Server Error.
+///
+/// ```zig
+/// fn handler(ctx: *State, req: Request) !?Response {
+///     const data = try ctx.lookup(req.arena);
+///     return Response.ok(data);
+/// }
+///
+/// var server = try Server.initContext(
+///     allocator, .{}, safeWrapContext(*State, handler), &state,
+/// );
+/// ```
 pub fn safeWrapContext(comptime Context: type, comptime func: fn (Context, Request) anyerror!?Response) fn (Context, Request) ?Response {
     return struct {
         fn call(ctx: Context, request: Request) ?Response {
