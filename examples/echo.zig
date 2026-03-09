@@ -13,5 +13,5 @@ pub fn main() !void {
 }
 
 fn echo(request: coapd.Request) ?coapd.Response {
-    return .{ .payload = request.packet.payload };
+    return coapd.Response.ok(request.payload());
 }
