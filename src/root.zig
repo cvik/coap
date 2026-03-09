@@ -1,21 +1,64 @@
-/// coapd — High-performance CoAP server and client on io_uring.
-///
-/// ## Quick start (server)
-///
-/// ```zig
-/// var server = try coapd.Server.init(allocator, .{}, handler);
-/// defer server.deinit();
-/// try server.run();
-/// ```
-///
-/// ## Quick start (client)
-///
-/// ```zig
-/// var client = try coapd.Client.init(allocator, .{ .host = "127.0.0.1" });
-/// defer client.deinit();
-/// const result = try client.get(allocator, "/temperature");
-/// defer result.deinit(allocator);
-/// ```
+//! # coapd
+//!
+//! High-performance CoAP server and client library for Zig, built on
+//! Linux io_uring.
+//!
+//! ## Features
+//!
+//! **Server:** zero-allocation hot path, CON/ACK reliability with duplicate
+//! detection, multi-threaded via SO_REUSEPORT, per-IP rate limiting with
+//! three-level load shedding, .well-known/core discovery (RFC 6690).
+//!
+//! **Client:** CON request/response with retransmission (RFC 7252 §4.2),
+//! NON fire-and-forget, transparent Block2 reassembly, Block1 segmented
+//! upload (RFC 7959), observe subscriptions (RFC 7641).
+//!
+//! ## Quick start — server
+//!
+//! ```zig
+//! const coapd = @import("coapd");
+//!
+//! fn echo(req: coapd.Request) ?coapd.Response {
+//!     return coapd.Response.ok(req.payload());
+//! }
+//!
+//! pub fn main() !void {
+//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     var server = try coapd.Server.init(gpa.allocator(), .{}, echo);
+//!     defer server.deinit();
+//!     try server.run();
+//! }
+//! ```
+//!
+//! ## Quick start — client
+//!
+//! ```zig
+//! const coapd = @import("coapd");
+//!
+//! pub fn main() !void {
+//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     const allocator = gpa.allocator();
+//!
+//!     var client = try coapd.Client.init(allocator, .{
+//!         .host = "127.0.0.1",
+//!     });
+//!     defer client.deinit();
+//!
+//!     const result = try client.get(allocator, "/temperature");
+//!     defer result.deinit(allocator);
+//!     std.debug.print("{s}\n", .{result.payload});
+//! }
+//! ```
+//!
+//! ## Memory model
+//!
+//! Both server and client pre-allocate all internal buffers at init.
+//! The server handler receives a per-request arena that resets after
+//! each tick — no per-request heap allocations occur in the hot path.
+//!
+//! Client methods like `get()` and `call()` take a separate allocator
+//! for the response; the caller owns the `Result` and frees it via
+//! `result.deinit(allocator)`.
 
 /// CoAP server. See `Server.Config` for configuration options.
 pub const Server = @import("Server.zig");
