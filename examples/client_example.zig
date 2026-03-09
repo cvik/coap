@@ -1,6 +1,5 @@
 const std = @import("std");
 const coapd = @import("coapd");
-const coapz = @import("coapz");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -17,10 +16,8 @@ pub fn main() !void {
     try client.cast(.get, &.{}, "ping");
     std.debug.print("cast: sent NON GET\n", .{});
 
-    // Blocking CON request/response.
-    const result = try client.call(allocator, .get, &.{
-        .{ .kind = .uri_path, .value = "hello" },
-    }, "world");
+    // Blocking CON request/response using path convenience.
+    const result = try client.get(allocator, "/hello");
     defer result.deinit(allocator);
 
     std.debug.print("call: code={}, payload={s}\n", .{

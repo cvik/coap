@@ -10,6 +10,12 @@ pub const safeWrap = @import("handler.zig").safeWrap;
 pub const safeWrapContext = @import("handler.zig").safeWrapContext;
 pub const coap = @import("coapz");
 
+// Re-export common coapz types so users don't need to import coapz directly.
+pub const Code = coap.Code;
+pub const Option = coap.Option;
+pub const OptionKind = coap.OptionKind;
+pub const ContentFormat = coap.ContentFormat;
+
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
 const Io = @import("Io.zig");

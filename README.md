@@ -39,7 +39,7 @@ pub fn main() !void {
 }
 
 fn echo(request: coapd.Request) ?coapd.Response {
-    return .{ .payload = request.packet.payload };
+    return coapd.Response.ok(request.payload());
 }
 ```
 
@@ -64,9 +64,7 @@ pub fn main() !void {
     try client.cast(.get, &.{}, "ping");
 
     // Blocking CON request/response with retransmission.
-    const result = try client.call(allocator, .get, &.{
-        .{ .kind = .uri_path, .value = "temperature" },
-    }, &.{});
+    const result = try client.get(allocator, "/temperature");
     defer result.deinit(allocator);
 
     std.debug.print("response: {s}\n", .{result.payload});
@@ -101,12 +99,14 @@ fn(coapd.Request) ?coapd.Response
 
 ### Request
 
-The request provides:
+The request provides convenience accessors and the underlying packet:
 
-- `packet` — parsed CoAP packet (`coapd.coap.Packet`), valid only during the
-  handler call. Access method via `packet.code` (`.get`, `.post`, `.put`,
-  `.delete`), URI via `packet.find_options(.uri_path)`, payload via
-  `packet.payload`, and token via `packet.token`.
+- `method()` — request method (`.get`, `.post`, `.put`, `.delete`, …).
+- `payload()` — request payload bytes.
+- `pathSegments()` — iterator over URI-Path option segments.
+- `querySegments()` — iterator over URI-Query option values.
+- `findOptions(kind)` / `findOption(kind)` — option lookup by kind.
+- `packet` — the full parsed CoAP packet (`coapd.coap.Packet`) for advanced use.
 - `peer_address` — source address of the client (`std.net.Address`).
 - `arena` — per-request arena allocator. Resets after the handler returns.
   Use it for any allocations needed during response construction.
@@ -115,17 +115,27 @@ The request provides:
 
 Return a `coapd.Response` to send a reply, or `null` for no response.
 
+Convenience constructors for common responses:
+
 ```zig
-const Response = struct {
-    code: coapd.coap.Code = .content,      // response code
-    options: []const coapd.coap.Option = &.{},  // CoAP options
-    payload: []const u8 = &.{},            // response body
-};
+Response.ok("hello")                         // 2.05 Content with payload
+Response.content(arena, .json, "{}")         // 2.05 with Content-Format option
+Response.created()                           // 2.01 Created
+Response.deleted()                           // 2.02 Deleted
+Response.changed()                           // 2.04 Changed
+Response.notFound()                          // 4.04 Not Found
+Response.badRequest()                        // 4.00 Bad Request
+Response.methodNotAllowed()                  // 4.05 Method Not Allowed
+Response.unauthorized()                      // 4.01 Unauthorized
+Response.forbidden()                         // 4.03 Forbidden
+Response.withCode(.gateway_timeout)          // arbitrary code
 ```
 
-Common response codes: `.content` (2.05), `.created` (2.01), `.changed` (2.04),
-`.deleted` (2.02), `.bad_request` (4.00), `.not_found` (4.04),
-`.method_not_allowed` (4.05), `.internal_server_error` (5.00).
+Or construct directly:
+
+```zig
+return .{ .code = .content, .options = opts, .payload = data };
+```
 
 ### Context Handlers
 
@@ -139,7 +149,7 @@ var server = try coapd.Server.initContext(allocator, .{}, handle, &state);
 
 fn handle(ctx: *State, request: coapd.Request) ?coapd.Response {
     ctx.counter += 1;
-    return .{ .payload = request.packet.payload };
+    return coapd.Response.ok(request.payload());
 }
 ```
 
@@ -197,43 +207,41 @@ responses, or use `safeWrap` for automatic error conversion.
 
 ### Routing
 
-There is no built-in router. Inspect the request packet directly:
+There is no built-in router. Use the request accessors to route:
 
 ```zig
 fn handler(request: coapd.Request) ?coapd.Response {
-    const pkt = request.packet;
+    var it = request.pathSegments();
+    const seg1 = it.next() orelse return coapd.Response.notFound();
 
-    // Match on method + URI path.
-    var it = pkt.find_options(.uri_path);
-    const seg1 = it.next() orelse return .{ .code = .not_found };
-
-    if (pkt.code == .get and std.mem.eql(u8, seg1.value, "temperature")) {
-        return .{ .payload = "22.5" };
+    if (request.method() == .get and std.mem.eql(u8, seg1.value, "temperature")) {
+        return coapd.Response.ok("22.5");
     }
 
-    return .{ .code = .not_found };
+    return coapd.Response.notFound();
 }
 ```
 
 ### Response Options
 
-Use the arena allocator to build response options:
+Use `Response.content()` to set Content-Format automatically:
 
 ```zig
 fn handler(request: coapd.Request) ?coapd.Response {
-    const coap = coapd.coap;
+    return coapd.Response.content(request.arena, .json, "{\"temp\": 22.5}");
+}
+```
 
-    // Set Content-Format to application/json (50).
+For custom options, use the arena allocator directly:
+
+```zig
+fn handler(request: coapd.Request) ?coapd.Response {
     var cf_buf: [2]u8 = undefined;
-    const cf = coap.Option.content_format(.json, &cf_buf);
-    const opts = request.arena.dupe(coap.Option, &.{cf}) catch
-        return .{ .code = .internal_server_error };
+    const cf = coapd.Option.content_format(.json, &cf_buf);
+    const opts = request.arena.dupe(coapd.Option, &.{cf}) catch
+        return coapd.Response.withCode(.internal_server_error);
 
-    return .{
-        .code = .content,
-        .options = opts,
-        .payload = "{\"temp\": 22.5}",
-    };
+    return .{ .code = .content, .options = opts, .payload = "{\"temp\": 22.5}" };
 }
 ```
 
@@ -255,6 +263,22 @@ var client = try coapd.Client.init(allocator, .{
 defer client.deinit();
 ```
 
+### get / post / put / delete — path convenience
+
+CON request/response by path string with automatic retransmission:
+
+```zig
+const result = try client.get(allocator, "/sensor/temperature");
+defer result.deinit(allocator);
+// result.code, result.payload, result.options
+
+const r2 = try client.post(allocator, "/log", "event happened");
+defer r2.deinit(allocator);
+```
+
+Returns `error.Timeout` after max retransmissions, `error.Reset` if the
+server sends RST. Transparently reassembles Block2 multi-block responses.
+
 ### cast — NON fire-and-forget
 
 Sends a NON request with no response expected:
@@ -267,20 +291,15 @@ try client.cast(.post, &.{
 
 ### call — CON request/response
 
-Sends a CON request with automatic retransmission per RFC 7252 §4.2.
-Blocks until a response arrives or the request times out (~93s).
-Transparently reassembles Block2 multi-block responses.
+Lower-level CON method accepting raw options. Use `get`/`post`/`put`/`delete`
+for simpler path-based requests.
 
 ```zig
 const result = try client.call(allocator, .get, &.{
     .{ .kind = .uri_path, .value = "sensor" },
 }, &.{});
 defer result.deinit(allocator);
-// result.code, result.payload, result.options
 ```
-
-Returns `error.Timeout` after max retransmissions, `error.Reset` if the
-server sends RST.
 
 ### sendRaw / recvRaw — low-level
 
