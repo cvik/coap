@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // Examples
-    const example_names = [_][]const u8{"echo"};
+    const example_names = [_][]const u8{ "echo", "client_example" };
     for (example_names) |name| {
         const example_mod = b.createModule(.{
             .root_source_file = b.path(

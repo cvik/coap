@@ -1,5 +1,6 @@
-/// coapd — High-performance CoAP server on io_uring.
+/// coapd — High-performance CoAP server and client on io_uring.
 pub const Server = @import("Server.zig");
+pub const Client = @import("Client.zig");
 pub const Config = Server.Config;
 pub const Request = @import("handler.zig").Request;
 pub const Response = @import("handler.zig").Response;
@@ -20,6 +21,7 @@ test {
     _ = constants;
     _ = Io;
     _ = Server;
+    _ = Client;
     _ = Exchange;
     _ = RateLimiter;
 }
