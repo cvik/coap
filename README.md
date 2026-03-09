@@ -1,7 +1,8 @@
 # coapd
 
-High-performance CoAP server library for Zig, built on Linux io_uring.
+High-performance CoAP server and client library for Zig, built on Linux io_uring.
 
+**Server:**
 - Zero allocations in the hot path (arena resets per batch)
 - CON/ACK reliability with duplicate detection and RST handling
 - Multi-threaded via SO_REUSEPORT (no shared state between threads)
@@ -11,7 +12,17 @@ High-performance CoAP server library for Zig, built on Linux io_uring.
 - Context handlers and error-handling wrappers (`safeWrap`)
 - ~840K req/s single-threaded, ~2.8M req/s multi-threaded on loopback
 
+**Client:**
+- CON request/response with retransmission (RFC 7252 §4.2)
+- NON fire-and-forget requests
+- Transparent Block2 response reassembly
+- Block1 segmented upload (RFC 7959)
+- Observe subscriptions (RFC 7641)
+- Pre-allocated in-flight tracking, zero hot-path allocations
+
 ## Quick Start
+
+### Server
 
 ```zig
 const std = @import("std");
@@ -31,6 +42,38 @@ fn echo(request: coapd.Request) ?coapd.Response {
     return .{ .payload = request.packet.payload };
 }
 ```
+
+### Client
+
+```zig
+const std = @import("std");
+const coapd = @import("coapd");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = try coapd.Client.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 5683,
+    });
+    defer client.deinit();
+
+    // Fire-and-forget NON request.
+    try client.cast(.get, &.{}, "ping");
+
+    // Blocking CON request/response with retransmission.
+    const result = try client.call(allocator, .get, &.{
+        .{ .kind = .uri_path, .value = "temperature" },
+    }, &.{});
+    defer result.deinit(allocator);
+
+    std.debug.print("response: {s}\n", .{result.payload});
+}
+```
+
+## Installation
 
 Add to your `build.zig.zon`:
 
@@ -194,7 +237,95 @@ fn handler(request: coapd.Request) ?coapd.Response {
 }
 ```
 
-## Configuration
+## Client API
+
+A `Client` connects to a single server via a connected UDP socket. Create
+multiple instances for multiple servers.
+
+### init / deinit
+
+```zig
+var client = try coapd.Client.init(allocator, .{
+    .host = "127.0.0.1",
+    .port = 5683,
+    .max_in_flight = 32,       // max concurrent CON requests
+    .token_len = 2,            // token length in bytes (1-8)
+    .default_szx = 6,          // block size exponent (6 = 1024 bytes)
+});
+defer client.deinit();
+```
+
+### cast — NON fire-and-forget
+
+Sends a NON request with no response expected:
+
+```zig
+try client.cast(.post, &.{
+    .{ .kind = .uri_path, .value = "log" },
+}, "event happened");
+```
+
+### call — CON request/response
+
+Sends a CON request with automatic retransmission per RFC 7252 §4.2.
+Blocks until a response arrives or the request times out (~93s).
+Transparently reassembles Block2 multi-block responses.
+
+```zig
+const result = try client.call(allocator, .get, &.{
+    .{ .kind = .uri_path, .value = "sensor" },
+}, &.{});
+defer result.deinit(allocator);
+// result.code, result.payload, result.options
+```
+
+Returns `error.Timeout` after max retransmissions, `error.Reset` if the
+server sends RST.
+
+### sendRaw / recvRaw — low-level
+
+Send and receive raw CoAP packets without protocol automation:
+
+```zig
+try client.sendRaw(packet);
+const response = try client.recvRaw(allocator, 2000) orelse return; // 2s timeout
+defer response.deinit(allocator);
+```
+
+### observe — RFC 7641
+
+Subscribe to resource notifications:
+
+```zig
+var stream = try client.observe(&.{
+    .{ .kind = .uri_path, .value = "temperature" },
+});
+
+while (try stream.next(allocator)) |notification| {
+    defer notification.deinit(allocator);
+    std.debug.print("update: {s}\n", .{notification.payload});
+}
+
+try stream.cancel();
+```
+
+CON notifications are automatically ACKed.
+
+### upload — RFC 7959 Block1
+
+Upload large payloads using Block1 segmentation:
+
+```zig
+const result = try client.upload(allocator, .put, &.{
+    .{ .kind = .uri_path, .value = "firmware" },
+}, large_payload);
+defer result.deinit(allocator);
+```
+
+The server's preferred block size is honored if it responds with a
+smaller SZX value.
+
+## Server Configuration
 
 All fields have sensible defaults. Pass `.{}` for a standard server on port 5683.
 
@@ -451,6 +582,7 @@ Benchmark options: `--count`, `--window`, `--payload`, `--con`,
 - [x] Multi-threading with SO_REUSEPORT
 - [x] .well-known/core resource discovery (RFC 6690)
 - [x] Per-IP rate limiting and load shedding
+- [x] Client library (cast, call, observe, block transfer)
 - [ ] Routing
 
 ## License
