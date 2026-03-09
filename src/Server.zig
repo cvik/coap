@@ -1,9 +1,26 @@
 /// CoAP server built on io_uring.
 ///
-/// All memory is pre-allocated at init. Handlers receive a per-request
+/// All memory is pre-allocated at `init`. Handlers receive a per-request
 /// arena allocator that resets after each batch of completions.
 /// CON messages are deduplicated and their responses are cached for
 /// retransmission per RFC 7252 §4.
+///
+/// **Memory:** `init` pre-allocates all buffers (response slots, emergency
+/// ACKs, rate-limiter state, exchange pool). No allocations occur during
+/// request handling — the per-request arena is reset (not freed) after
+/// each tick. Call `deinit()` to release everything.
+///
+/// ## Example
+///
+/// ```zig
+/// fn handler(req: coapd.Request) ?coapd.Response {
+///     return coapd.Response.ok(req.payload());
+/// }
+///
+/// var server = try coapd.Server.init(allocator, .{}, handler);
+/// defer server.deinit();
+/// try server.run();
+/// ```
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -19,7 +36,15 @@ const Cqe = linux.io_uring_cqe;
 
 const Server = @This();
 
-pub const LoadLevel = enum { normal, throttled, shedding };
+/// Current server load level, determined by buffer and exchange pool utilization.
+pub const LoadLevel = enum {
+    /// All requests processed normally.
+    normal,
+    /// Per-IP rate limiting active. CON packets over limit get RST, NON dropped.
+    throttled,
+    /// New packets dropped. Only cached CON retransmissions are served.
+    shedding,
+};
 
 pub const Config = struct {
     port: u16 = constants.port_default,
@@ -102,7 +127,10 @@ tick_now_ns: i128,
 /// Pre-allocated RST buffers for rate-limited/shed CON packets.
 rate_limit_rst: []u8,
 
-/// Initialize with a simple handler (no context). Backward compatible.
+/// Initialize with a simple handler (no context).
+///
+/// Pre-allocates all buffers. Returns `error.InvalidConfig` if
+/// `buffer_count` is 0, `buffer_size` < 64, or `port` is 0.
 pub fn init(
     allocator: std.mem.Allocator,
     config: Config,
@@ -111,10 +139,16 @@ pub fn init(
     return init_raw(allocator, config, handler.wrapSimple, @ptrCast(@constCast(handler_fn)));
 }
 
-/// Initialize with a typed context handler.
+/// Initialize with a typed context handler. The context pointer is
+/// type-erased internally and passed to the handler on every invocation.
 ///
-/// The handler receives a typed pointer and a request:
-///   fn handle(ctx: *MyState, request: Request) ?Response
+/// ```zig
+/// fn handle(ctx: *State, req: Request) ?Response {
+///     ctx.counter += 1;
+///     return Response.ok(req.payload());
+/// }
+/// var server = try Server.initContext(allocator, .{}, handle, &state);
+/// ```
 pub fn initContext(
     allocator: std.mem.Allocator,
     config: Config,
@@ -229,6 +263,8 @@ fn init_raw(
     };
 }
 
+/// Release all server-owned memory (arena, exchange pool, io_uring,
+/// response buffers, rate limiter) and close the socket.
 pub fn deinit(server: *Server) void {
     server.arena.deinit();
     server.exchanges.deinit(server.allocator);
@@ -256,6 +292,7 @@ pub fn listen(server: *Server) !void {
 }
 
 /// Signal the server and all worker threads to stop after the current tick.
+/// Thread-safe — safe to call from a signal handler or another thread.
 pub fn stop(server: *Server) void {
     server.running.store(false, .release);
 }
@@ -267,6 +304,10 @@ const WorkerState = struct {
     index: u16,
 };
 
+/// Blocking main loop: binds the socket, spawns worker threads (if
+/// `thread_count > 1`), and processes packets until `stop()` is called.
+/// Worker threads that crash are automatically restarted up to
+/// `max_worker_restarts` times.
 pub fn run(server: *Server) !void {
     try server.listen();
 
@@ -476,6 +517,14 @@ fn drain(server: *Server) void {
     _ = server.io.wait_cqes(cqes[0..], 0) catch {};
 }
 
+/// Process one batch of io_uring completions (up to 256 packets).
+///
+/// For each received packet: parses, calls the handler, sends the
+/// response, and manages CON deduplication. Also performs periodic
+/// exchange eviction, load level updates, and arena resets.
+///
+/// Use `listen()` + `tick()` in a loop when you need control over the
+/// event loop (e.g. for graceful shutdown or integration with other I/O).
 pub fn tick(server: *Server) !void {
     const batch_max = constants.completion_batch_max;
     var cqes: [batch_max]Cqe = std.mem.zeroes([batch_max]Cqe);
