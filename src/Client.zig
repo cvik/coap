@@ -70,6 +70,7 @@ pub const Result = struct {
     /// The full parsed response packet, for advanced inspection.
     packet: coapz.Packet,
     _owns_payload: bool = false,
+    _owns_options: bool = false,
 
     /// Free all memory associated with this result. Must be called with
     /// the same allocator that was passed to `call`/`get`/`post`/etc.
@@ -77,7 +78,11 @@ pub const Result = struct {
         if (self._owns_payload) {
             allocator.free(@constCast(self.payload));
         }
-        self.packet.deinit(allocator);
+        if (self._owns_options) {
+            allocator.free(@constCast(self.options));
+        } else {
+            self.packet.deinit(allocator);
+        }
     }
 };
 
@@ -166,6 +171,9 @@ pub const ObserveStream = struct {
     /// Block until the next observe notification arrives.
     /// Returns `null` if the subscription was cancelled.
     ///
+    /// **Blocking:** Blocks indefinitely until a notification arrives or
+    /// cancelled via `cancel()`. Use a dedicated thread if needed.
+    ///
     /// **Lifetime:** The returned `Notification` owns its packet data.
     /// Caller must call `notification.deinit(allocator)` when done.
     pub fn next(self: *ObserveStream, allocator: std.mem.Allocator) !?Notification {
@@ -206,6 +214,11 @@ pub const ObserveStream = struct {
     /// Like `next()`, but parses the notification into a caller-provided
     /// buffer instead of heap-allocating. Returns `null` if cancelled,
     /// `error.BufferTooSmall` if the packet doesn't fit in `buf`.
+    ///
+    /// **Blocking:** This call blocks indefinitely until a notification
+    /// arrives or the subscription is cancelled via `cancel()`. For
+    /// non-blocking use, call from a dedicated thread and use `cancel()`
+    /// from another thread to unblock.
     ///
     /// **Lifetime:** The returned `BufNotification` fields point into `buf`
     /// and are valid until the next `nextBuf()` call or until `buf` is reused.
@@ -407,7 +420,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         .count_active = 0,
         .observes = observes,
         .next_msg_id_val = initial_msg_id,
-        .next_token_val = 0,
+        .next_token_val = std.crypto.random.int(u64),
         .rng = rng,
     };
 }
@@ -458,8 +471,7 @@ pub fn cast(
         .data_buf = &.{},
     };
 
-    var buf: [constants.buffer_size_default]u8 = undefined;
-    const wire = try packet.writeBuf(&buf);
+    const wire = try packet.writeBuf(client.recv_buf);
     try client.sendDirect(wire);
 }
 
@@ -589,8 +601,7 @@ pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !
 /// Send a pre-built CoAP packet without protocol automation.
 /// No retransmission, no token generation — the caller controls everything.
 pub fn sendRaw(client: *Client, packet: coapz.Packet) !void {
-    var buf: [constants.buffer_size_default]u8 = undefined;
-    const wire = try packet.writeBuf(&buf);
+    const wire = try packet.writeBuf(client.recv_buf);
     try client.sendDirect(wire);
 }
 
@@ -776,6 +787,10 @@ pub fn upload(
         var resp_blk_it = result.packet.find_options(.block1);
         if (resp_blk_it.next()) |resp_blk_opt| {
             if (resp_blk_opt.as_block()) |resp_blk| {
+                if (resp_code != .@"continue") {
+                    result.deinit(allocator);
+                    return error.UploadRejected;
+                }
                 if (resp_blk.szx < szx) {
                     szx = resp_blk.szx;
                     block_size = @as(usize, 1) << (@as(u4, szx) + 4);
@@ -965,20 +980,29 @@ fn waitForResponse(
 
         if (doing_block2) {
             try assembled_payload.appendSlice(allocator, response.payload);
+
+            const final_code = response.code;
+            const final_options = try allocator.dupe(coapz.Option, response.options);
             response.deinit(allocator);
 
             const full_payload = try allocator.alloc(u8, assembled_payload.items.len);
             @memcpy(full_payload, assembled_payload.items);
 
-            const final = coapz.Packet.read(allocator, data) catch
-                return error.InvalidPacket;
-
             return .{
-                .code = final.code,
-                .options = final.options,
+                .code = final_code,
+                .options = final_options,
                 .payload = full_payload,
-                .packet = final,
+                .packet = .{
+                    .kind = .acknowledgement,
+                    .code = final_code,
+                    .msg_id = 0,
+                    .token = &.{},
+                    .options = final_options,
+                    .payload = full_payload,
+                    .data_buf = &.{},
+                },
                 ._owns_payload = true,
+                ._owns_options = true,
             };
         }
 
@@ -1099,11 +1123,12 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             if (obs.pending_count < max_pending_notifications) {
                 const copy = try client.allocator.alloc(u8, data.len);
                 @memcpy(copy, data);
+                const msg_kind: u2 = @intCast((data[0] >> 4) & 0x03);
                 obs.pending[obs.pending_count] = .{
                     .data = copy,
                     .len = @intCast(data.len),
                     .msg_id = @as(u16, data[2]) << 8 | data[3],
-                    .is_con = false,
+                    .is_con = msg_kind == 0,
                 };
                 obs.pending_count += 1;
             }
