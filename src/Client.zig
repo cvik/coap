@@ -95,6 +95,13 @@ pub const ObserveStream = struct {
         }
     };
 
+    /// Like `Notification` but backed by a caller-provided buffer (no heap allocation).
+    pub const BufNotification = struct {
+        code: coapz.Code,
+        options: []const coapz.Option,
+        payload: []const u8,
+    };
+
     /// Wait for the next observe notification. Returns null if cancelled.
     pub fn next(self: *ObserveStream, allocator: std.mem.Allocator) !?Notification {
         const sub = &self.client.observes[self.sub_idx];
@@ -121,6 +128,45 @@ pub const ObserveStream = struct {
                     .options = packet.options,
                     .payload = packet.payload,
                     .packet = packet,
+                };
+            }
+
+            const got_data = try self.client.tickOnce();
+            if (!got_data and !sub.active) return null;
+        }
+    }
+
+    /// Wait for the next notification, parsing into `buf` instead of allocating.
+    /// Returns null if cancelled. Returns error.OutOfMemory if the packet
+    /// doesn't fit in the provided buffer.
+    pub fn nextBuf(self: *ObserveStream, buf: []u8) !?BufNotification {
+        const sub = &self.client.observes[self.sub_idx];
+        if (!sub.active) return null;
+
+        while (true) {
+            if (sub.pending_count > 0) {
+                const pending = &sub.pending[0];
+                var fba = std.heap.FixedBufferAllocator.init(buf);
+                const packet = coapz.Packet.read(fba.allocator(), pending.data[0..pending.len]) catch |err| {
+                    if (err == error.OutOfMemory) {
+                        return error.OutOfMemory;
+                    }
+                    self.client.allocator.free(pending.data);
+                    shiftPending(sub);
+                    continue;
+                };
+
+                if (pending.is_con) {
+                    self.client.sendAck(pending.msg_id, packet.token) catch {};
+                }
+
+                self.client.allocator.free(pending.data);
+                shiftPending(sub);
+
+                return .{
+                    .code = packet.code,
+                    .options = packet.options,
+                    .payload = packet.payload,
                 };
             }
 
