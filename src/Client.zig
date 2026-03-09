@@ -431,6 +431,51 @@ pub fn call(
     return client.waitForResponse(allocator, slot_idx, code, options);
 }
 
+// ─── Path convenience methods ────────────────────────────────────
+
+const max_path_segments = 16;
+
+/// Split a URI path string into uri_path options.
+/// Strips leading '/' and splits on '/'. Empty segments are skipped.
+fn pathToOptions(path: []const u8, buf: *[max_path_segments]coapz.Option) []const coapz.Option {
+    const trimmed = if (path.len > 0 and path[0] == '/') path[1..] else path;
+    if (trimmed.len == 0) return buf[0..0];
+
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, trimmed, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (count >= max_path_segments) break;
+        buf[count] = .{ .kind = .uri_path, .value = seg };
+        count += 1;
+    }
+    return buf[0..count];
+}
+
+/// CON GET by path. Returns the response.
+pub fn get(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    return client.call(allocator, .get, pathToOptions(path, &buf), &.{});
+}
+
+/// CON POST by path with payload. Returns the response.
+pub fn post(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    return client.call(allocator, .post, pathToOptions(path, &buf), payload);
+}
+
+/// CON PUT by path with payload. Returns the response.
+pub fn put(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    return client.call(allocator, .put, pathToOptions(path, &buf), payload);
+}
+
+/// CON DELETE by path. Returns the response.
+pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    return client.call(allocator, .delete, pathToOptions(path, &buf), &.{});
+}
+
 // ─── sendRaw / recvRaw ───────────────────────────────────────────
 
 pub fn sendRaw(client: *Client, packet: coapz.Packet) !void {
@@ -1217,4 +1262,52 @@ test "recvRaw returns null on timeout" {
 
     const result = try client.recvRaw(testing.allocator, 50);
     try testing.expect(result == null);
+}
+
+test "pathToOptions splits path" {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    const opts = pathToOptions("/hello/world", &buf);
+    try testing.expectEqual(@as(usize, 2), opts.len);
+    try testing.expectEqualSlices(u8, "hello", opts[0].value);
+    try testing.expectEqualSlices(u8, "world", opts[1].value);
+}
+
+test "pathToOptions handles no leading slash" {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    const opts = pathToOptions("a/b/c", &buf);
+    try testing.expectEqual(@as(usize, 3), opts.len);
+    try testing.expectEqualSlices(u8, "a", opts[0].value);
+    try testing.expectEqualSlices(u8, "c", opts[2].value);
+}
+
+test "pathToOptions handles empty path" {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    const opts = pathToOptions("", &buf);
+    try testing.expectEqual(@as(usize, 0), opts.len);
+}
+
+test "pathToOptions handles root path" {
+    var buf: [max_path_segments]coapz.Option = undefined;
+    const opts = pathToOptions("/", &buf);
+    try testing.expectEqual(@as(usize, 0), opts.len);
+}
+
+test "get convenience calls call with path options" {
+    const port: u16 = 29704;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    const result = try client.get(testing.allocator, "/hello");
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(coapz.Code.content, result.code);
 }
