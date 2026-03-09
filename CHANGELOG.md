@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3] - 2026-03-09
+- Request convenience accessors: method(), payload(), pathSegments(), querySegments(), findOptions()
+- Response convenience constructors: ok(), content(), notFound(), badRequest(), etc
+- Client path convenience methods: get(), post(), put(), delete()
+- Re-export Code, Option, OptionKind, ContentFormat at root
+- Hide Result.owns_payload implementation detail
+
 ## [0.2.2] - 2026-03-09
 - CoAP client library: cast, call, sendRaw/recvRaw, observe, upload
 - Block2 transparent reassembly, Block1 segmented upload
