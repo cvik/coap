@@ -29,12 +29,11 @@ pub const Result = struct {
     options: []const coapz.Option,
     payload: []const u8,
     packet: coapz.Packet,
-    /// When true, payload is a standalone allocation (Block2 reassembly)
-    /// that must be freed separately from the packet.
-    owns_payload: bool = false,
+    /// Internal: payload is a standalone allocation (Block2 reassembly).
+    _owns_payload: bool = false,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
-        if (self.owns_payload) {
+        if (self._owns_payload) {
             allocator.free(@constCast(self.payload));
         }
         self.packet.deinit(allocator);
@@ -840,7 +839,7 @@ fn waitForResponse(
                 .options = final.options,
                 .payload = full_payload,
                 .packet = final,
-                .owns_payload = true,
+                ._owns_payload = true,
             };
         }
 
