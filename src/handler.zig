@@ -47,6 +47,71 @@ pub const Response = struct {
     code: coapz.Code = .content,
     options: []const coapz.Option = &.{},
     payload: []const u8 = &.{},
+
+    /// 2.05 Content with payload.
+    pub inline fn ok(body: []const u8) Response {
+        return .{ .payload = body };
+    }
+
+    /// 2.05 Content with content-format option and payload.
+    /// Allocates the options slice from the arena.
+    pub fn content(arena: std.mem.Allocator, fmt: coapz.ContentFormat, body: []const u8) Response {
+        var cf_buf: [2]u8 = undefined;
+        const cf_opt = coapz.Option.content_format(fmt, &cf_buf);
+        const opts = arena.dupe(coapz.Option, &.{cf_opt}) catch
+            return .{ .code = .internal_server_error };
+        return .{ .options = opts, .payload = body };
+    }
+
+    /// 2.01 Created.
+    pub inline fn created() Response {
+        return .{ .code = .created };
+    }
+
+    /// 2.03 Valid.
+    pub inline fn valid() Response {
+        return .{ .code = .valid };
+    }
+
+    /// 2.02 Deleted.
+    pub inline fn deleted() Response {
+        return .{ .code = .deleted };
+    }
+
+    /// 2.04 Changed.
+    pub inline fn changed() Response {
+        return .{ .code = .changed };
+    }
+
+    /// 4.04 Not Found.
+    pub inline fn notFound() Response {
+        return .{ .code = .not_found };
+    }
+
+    /// 4.00 Bad Request.
+    pub inline fn badRequest() Response {
+        return .{ .code = .bad_request };
+    }
+
+    /// 4.05 Method Not Allowed.
+    pub inline fn methodNotAllowed() Response {
+        return .{ .code = .method_not_allowed };
+    }
+
+    /// 4.01 Unauthorized.
+    pub inline fn unauthorized() Response {
+        return .{ .code = .unauthorized };
+    }
+
+    /// 4.03 Forbidden.
+    pub inline fn forbidden() Response {
+        return .{ .code = .forbidden };
+    }
+
+    /// Response with an arbitrary code.
+    pub inline fn withCode(code: coapz.Code) Response {
+        return .{ .code = code };
+    }
 };
 
 /// Type-erased handler function stored by the server.
@@ -185,4 +250,31 @@ test "Request.pathSegments iterates uri_path options" {
     try testing.expectEqualSlices(u8, "hello", it.next().?.value);
     try testing.expectEqualSlices(u8, "world", it.next().?.value);
     try testing.expect(it.next() == null);
+}
+
+test "Response.ok sets content code and payload" {
+    const r = Response.ok("hello");
+    try testing.expectEqual(coapz.Code.content, r.code);
+    try testing.expectEqualSlices(u8, "hello", r.payload);
+}
+
+test "Response.notFound sets 4.04" {
+    try testing.expectEqual(coapz.Code.not_found, Response.notFound().code);
+}
+
+test "Response.badRequest sets 4.00" {
+    try testing.expectEqual(coapz.Code.bad_request, Response.badRequest().code);
+}
+
+test "Response.content sets content-format option" {
+    const r = Response.content(testing.allocator, .json, "{}");
+    defer testing.allocator.free(r.options);
+    try testing.expectEqual(coapz.Code.content, r.code);
+    try testing.expectEqualSlices(u8, "{}", r.payload);
+    try testing.expectEqual(@as(usize, 1), r.options.len);
+    try testing.expectEqual(coapz.OptionKind.content_format, r.options[0].kind);
+}
+
+test "Response.withCode sets arbitrary code" {
+    try testing.expectEqual(coapz.Code.gateway_timeout, Response.withCode(.gateway_timeout).code);
 }
