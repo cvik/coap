@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] - 2026-03-09
+- CoAP client library: cast, call, sendRaw/recvRaw, observe, upload
+- Block2 transparent reassembly, Block1 segmented upload
+- RFC 7641 observe with ObserveStream
+- Zero-alloc ObserveStream.nextBuf with caller-provided buffer
+
 ## [0.2.1] - 2026-03-08
 - Fix bench hang, remove unnecessary register_buffers
 
