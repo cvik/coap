@@ -166,7 +166,7 @@ pub fn submit(io: *Io) !u32 {
 
 /// Return a provided buffer to the kernel pool.
 pub fn release_buffer(io: *Io, buffer_id: u16) !void {
-    std.debug.assert(buffer_id < io.buffer_count);
+    if (buffer_id >= io.buffer_count) return error.InvalidBufferId;
     const offset = @as(usize, buffer_id) * io.buffer_size;
     _ = try io.ring.provide_buffers(
         @intFromEnum(UserData.provide_buffers),
