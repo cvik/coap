@@ -1,4 +1,4 @@
-//! # coapd
+//! # coap
 //!
 //! High-performance CoAP server and client library for Zig, built on
 //! Linux io_uring.
@@ -16,15 +16,15 @@
 //! ## Quick start — server
 //!
 //! ```zig
-//! const coapd = @import("coapd");
+//! const coap = @import("coap");
 //!
-//! fn echo(req: coapd.Request) ?coapd.Response {
-//!     return coapd.Response.ok(req.payload());
+//! fn echo(req: coap.Request) ?coap.Response {
+//!     return coap.Response.ok(req.payload());
 //! }
 //!
 //! pub fn main() !void {
 //!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//!     var server = try coapd.Server.init(gpa.allocator(), .{}, echo);
+//!     var server = try coap.Server.init(gpa.allocator(), .{}, echo);
 //!     defer server.deinit();
 //!     try server.run();
 //! }
@@ -33,13 +33,13 @@
 //! ## Quick start — client
 //!
 //! ```zig
-//! const coapd = @import("coapd");
+//! const coap = @import("coap");
 //!
 //! pub fn main() !void {
 //!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 //!     const allocator = gpa.allocator();
 //!
-//!     var client = try coapd.Client.init(allocator, .{
+//!     var client = try coap.Client.init(allocator, .{
 //!         .host = "127.0.0.1",
 //!     });
 //!     defer client.deinit();

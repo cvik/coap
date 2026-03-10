@@ -13,11 +13,11 @@
 /// ## Example
 ///
 /// ```zig
-/// fn handler(req: coapd.Request) ?coapd.Response {
-///     return coapd.Response.ok(req.payload());
+/// fn handler(req: coap.Request) ?coap.Response {
+///     return coap.Response.ok(req.payload());
 /// }
 ///
-/// var server = try coapd.Server.init(allocator, .{}, handler);
+/// var server = try coap.Server.init(allocator, .{}, handler);
 /// defer server.deinit();
 /// try server.run();
 /// ```
@@ -30,7 +30,7 @@ const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
-const log = std.log.scoped(.coapd);
+const log = std.log.scoped(.coap);
 
 const Cqe = linux.io_uring_cqe;
 
@@ -344,7 +344,7 @@ pub fn run(server: *Server) !void {
         };
     }
 
-    log.info("coapd listening on port {d} ({d} thread{s})", .{
+    log.info("coap listening on port {d} ({d} thread{s})", .{
         server.config.port,
         server.config.thread_count,
         if (server.config.thread_count > 1) "s" else "",

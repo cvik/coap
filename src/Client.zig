@@ -27,7 +27,7 @@ const std = @import("std");
 const posix = std.posix;
 const coapz = @import("coapz");
 const constants = @import("constants.zig");
-const log = std.log.scoped(.coapd_client);
+const log = std.log.scoped(.coap_client);
 
 const Client = @This();
 
@@ -1272,11 +1272,11 @@ fn randomizedTimeout(client: *Client, base_ms: u32) u64 {
 
 const testing = std.testing;
 const linux = std.os.linux;
-const coapd_server = @import("Server.zig");
-const coapd_handler = @import("handler.zig");
+const coap_server = @import("Server.zig");
+const coap_handler = @import("handler.zig");
 
 const ServerRunner = struct {
-    server: *coapd_server,
+    server: *coap_server,
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *@This()) void {
@@ -1301,8 +1301,8 @@ const ServerRunner = struct {
     }
 };
 
-fn startTestServer(port: u16, handler_fn: anytype) !coapd_server {
-    var server = try coapd_server.init(testing.allocator, .{
+fn startTestServer(port: u16, handler_fn: anytype) !coap_server {
+    var server = try coap_server.init(testing.allocator, .{
         .port = port,
         .buffer_count = 16,
         .buffer_size = 1280,
@@ -1313,11 +1313,11 @@ fn startTestServer(port: u16, handler_fn: anytype) !coapd_server {
     return server;
 }
 
-fn echoHandler(request: coapd_handler.Request) ?coapd_handler.Response {
+fn echoHandler(request: coap_handler.Request) ?coap_handler.Response {
     return .{ .payload = request.packet.payload };
 }
 
-fn nullHandler(_: coapd_handler.Request) ?coapd_handler.Response {
+fn nullHandler(_: coap_handler.Request) ?coap_handler.Response {
     return null;
 }
 

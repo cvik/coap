@@ -1,8 +1,8 @@
 .{
-    .name = .coapd,
+    .name = .coap,
     .version = "0.2.4",
     .minimum_zig_version = "0.15.1",
-    .fingerprint = 0x57006075d3104028,
+    .fingerprint = 0x67bf20367bf50f8b,
     .dependencies = .{
         .coapz = .{
             .url = "git+https://github.com/cvik/coapz#v0.2.1",
