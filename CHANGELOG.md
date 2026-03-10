@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.4] - 2026-03-10
+- Server: measure handler duration per-invocation instead of per-tick
+- Server: validate CoAP version before processing (drop non-v1 packets)
+- Server: convert hot-path debug.assert to error returns (exchange.insert, send_data, Io.release_buffer)
+- Server: downsize i128 timestamps to i64 (less cache pressure)
+- Server: document thread-safety for context handlers
+- Client: fix Block2 reassembly for blockwise observe notifications
+- Client: send observe CON re-registrations on notification timeout
+- Client: validate Block1 response option presence before upload continue
+- Client: use random token for observe re-registration
+- Client: use stack buffers for cast/sendRaw
+- Comprehensive doc comments and autodoc
+
 ## [0.2.3] - 2026-03-09
 - Request convenience accessors: method(), payload(), pathSegments(), querySegments(), findOptions()
 - Response convenience constructors: ok(), content(), notFound(), badRequest(), etc
