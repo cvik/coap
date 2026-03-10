@@ -20,13 +20,13 @@ const State = enum(u8) { free, active };
 const Slot = struct {
     ip_addr: u32,
     tokens: u16,
-    last_refill_ns: i128,
+    last_refill_ns: i64,
     state: State,
     next_free: u16,
 };
 
 const empty_sentinel: u16 = 0xFFFF;
-const ns_per_sec: i128 = std.time.ns_per_s;
+const ns_per_sec: i64 = std.time.ns_per_s;
 
 slots: []Slot,
 table: []u16,
@@ -86,7 +86,7 @@ pub fn deinit(self: *RateLimiter, allocator: std.mem.Allocator) void {
 
 /// Check if a packet from `ip_addr` is allowed. Deducts one token.
 /// Returns true if allowed, false if rate-limited.
-pub fn allow(self: *RateLimiter, ip_addr: u32, now_ns: i128) bool {
+pub fn allow(self: *RateLimiter, ip_addr: u32, now_ns: i64) bool {
     const key = hash_ip(ip_addr);
 
     // Look up existing entry.
@@ -156,10 +156,10 @@ fn find_slot(self: *const RateLimiter, key: u64, ip_addr: u32) ?u16 {
     return null;
 }
 
-fn refill(self: *const RateLimiter, slot: *Slot, now_ns: i128) void {
+fn refill(self: *const RateLimiter, slot: *Slot, now_ns: i64) void {
     const elapsed = now_ns - slot.last_refill_ns;
     if (elapsed <= 0) return;
-    const new_tokens: i128 = @divFloor(elapsed * self.config.tokens_per_sec, ns_per_sec);
+    const new_tokens: i64 = @divFloor(elapsed * self.config.tokens_per_sec, ns_per_sec);
     if (new_tokens > 0) {
         const capped: u16 = @intCast(@min(
             @as(u64, self.config.burst) - slot.tokens,
@@ -170,7 +170,7 @@ fn refill(self: *const RateLimiter, slot: *Slot, now_ns: i128) void {
     }
 }
 
-fn allocate_slot(self: *RateLimiter, key: u64, ip_addr: u32, now_ns: i128) ?u16 {
+fn allocate_slot(self: *RateLimiter, key: u64, ip_addr: u32, now_ns: i64) ?u16 {
     var slot_idx: u16 = undefined;
 
     if (self.free_head != empty_sentinel) {
@@ -219,7 +219,7 @@ fn evict(self: *RateLimiter) ?u16 {
 
     // Second pass: evict oldest (smallest last_refill_ns).
     var oldest_idx: ?u16 = null;
-    var oldest_ns: i128 = std.math.maxInt(i128);
+    var oldest_ns: i64 = std.math.maxInt(i64);
     for (self.slots, 0..) |*slot, si| {
         if (slot.state == .active and slot.last_refill_ns < oldest_ns) {
             oldest_ns = slot.last_refill_ns;
@@ -297,7 +297,7 @@ test "allow basic" {
     defer rl.deinit(testing.allocator);
 
     const ip: u32 = 0x7F000001; // 127.0.0.1
-    const now: i128 = 1_000_000_000; // 1 second
+    const now: i64 = 1_000_000_000; // 1 second
 
     // First 5 requests should succeed (burst=5).
     for (0..5) |_| {
@@ -316,7 +316,7 @@ test "token refill over time" {
     defer rl.deinit(testing.allocator);
 
     const ip: u32 = 0x7F000001;
-    var now: i128 = 1_000_000_000;
+    var now: i64 = 1_000_000_000;
 
     // Exhaust tokens.
     for (0..5) |_| {
@@ -342,7 +342,7 @@ test "multiple IPs independent" {
 
     const ip1: u32 = 0x01020304;
     const ip2: u32 = 0x05060708;
-    const now: i128 = 1_000_000_000;
+    const now: i64 = 1_000_000_000;
 
     // Each IP gets its own bucket.
     try testing.expect(rl.allow(ip1, now));
@@ -362,7 +362,7 @@ test "eviction on table full" {
     });
     defer rl.deinit(testing.allocator);
 
-    const now: i128 = 1_000_000_000;
+    const now: i64 = 1_000_000_000;
 
     // Fill the table with 2 IPs.
     try testing.expect(rl.allow(0x01020301, now));
@@ -381,7 +381,7 @@ test "reset clears all state" {
     defer rl.deinit(testing.allocator);
 
     const ip: u32 = 0x7F000001;
-    const now: i128 = 1_000_000_000;
+    const now: i64 = 1_000_000_000;
 
     try testing.expect(rl.allow(ip, now));
     try testing.expect(rl.allow(ip, now));

@@ -27,7 +27,7 @@ pub const Slot = struct {
     message_id: u16,
     response_length: u16,
     /// Monotonic timestamp (ns) when exchange was completed.
-    completed_at_ns: i128,
+    completed_at_ns: i64,
     /// Index of next free slot (when state == .free).
     next_free: u16,
 };
@@ -148,7 +148,7 @@ pub fn insert(
     key: u64,
     message_id: u16,
     response_data: []const u8,
-    now_ns: i128,
+    now_ns: i64,
 ) ?u16 {
     if (exchange.free_head == empty_sentinel) {
         return null;
@@ -157,13 +157,14 @@ pub fn insert(
         return null;
     }
 
-    std.debug.assert(exchange.find(key) == null);
+    if (exchange.find(key) != null) return null;
 
     // Allocate from free list.
     const slot_idx = exchange.free_head;
     const slot = &exchange.slots[slot_idx];
     exchange.free_head = slot.next_free;
     exchange.count_active += 1;
+    // Invariant: free_head == empty_sentinel guards over-allocation above.
     std.debug.assert(exchange.count_active <= exchange.config.exchange_count);
 
     // Populate slot.
@@ -205,8 +206,8 @@ pub fn cached_response(exchange: *const Exchange, slot_idx: u16) []const u8 {
 
 /// Evict exchanges that have expired past the exchange lifetime.
 /// Returns the number of evicted exchanges.
-pub fn evict_expired(exchange: *Exchange, now_ns: i128) u16 {
-    const lifetime_ns: i128 = @as(i128, constants.exchange_lifetime_ms) *
+pub fn evict_expired(exchange: *Exchange, now_ns: i64) u16 {
+    const lifetime_ns: i64 = @as(i64, constants.exchange_lifetime_ms) *
         std.time.ns_per_ms;
     var evicted: u16 = 0;
 
@@ -382,7 +383,7 @@ test "evict expired" {
     // Insert at time 0.
     _ = pool.insert(k1, 1, "old", 0);
     // Insert at a recent time.
-    const recent: i128 = @as(i128, constants.exchange_lifetime_ms) *
+    const recent: i64 = @as(i64, constants.exchange_lifetime_ms) *
         std.time.ns_per_ms;
     _ = pool.insert(k2, 2, "new", recent);
 
