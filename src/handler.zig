@@ -1,6 +1,6 @@
 const std = @import("std");
 const coapz = @import("coapz");
-const log = std.log.scoped(.coapd);
+const log = std.log.scoped(.coap);
 
 /// Incoming CoAP request passed to the handler function.
 ///
@@ -11,16 +11,16 @@ const log = std.log.scoped(.coapd);
 /// ## Example
 ///
 /// ```zig
-/// fn handler(req: coapd.Request) ?coapd.Response {
-///     if (req.method() != .get) return coapd.Response.methodNotAllowed();
+/// fn handler(req: coap.Request) ?coap.Response {
+///     if (req.method() != .get) return coap.Response.methodNotAllowed();
 ///
 ///     var it = req.pathSegments();
-///     const resource = it.next() orelse return coapd.Response.notFound();
+///     const resource = it.next() orelse return coap.Response.notFound();
 ///
 ///     if (std.mem.eql(u8, resource.value, "temperature")) {
-///         return coapd.Response.ok("22.5");
+///         return coap.Response.ok("22.5");
 ///     }
-///     return coapd.Response.notFound();
+///     return coap.Response.notFound();
 /// }
 /// ```
 pub const Request = struct {

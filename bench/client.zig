@@ -1,4 +1,4 @@
-/// coapd benchmark client.
+/// coap benchmark client.
 ///
 /// Sends CoAP requests using a pipelined sliding window and measures
 /// throughput and latency. Forks an embedded echo server by default.
@@ -8,7 +8,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const coapz = @import("coapz");
-const coapd = @import("coapd");
+const coap = @import("coap");
 
 const Config = struct {
     host: []const u8 = "127.0.0.1",
@@ -276,15 +276,15 @@ fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
     return fd;
 }
 
-fn echo_handler(request: coapd.Request) ?coapd.Response {
-    return coapd.Response.ok(request.payload());
+fn echo_handler(request: coap.Request) ?coap.Response {
+    return coap.Response.ok(request.payload());
 }
 
 fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // Child process: run the echo server.
-        var server = coapd.Server.init(
+        var server = coap.Server.init(
             std.heap.page_allocator,
             .{
                 .port = port,
@@ -482,7 +482,7 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
 
     std.debug.print(
         \\
-        \\── coapd benchmark results ──
+        \\── coap benchmark results ──
         \\  target:     {s}:{d}
         \\  requests:   {d} sent, {d} received ({d:.1}% loss)
         \\  throughput: {d:.0} req/s

@@ -1,12 +1,12 @@
 const std = @import("std");
-const coapd = @import("coapd");
+const coap = @import("coap");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var client = try coapd.Client.init(allocator, .{
+    var client = try coap.Client.init(allocator, .{
         .host = "127.0.0.1",
         .port = 5683,
     });

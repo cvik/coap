@@ -1,4 +1,4 @@
-# coapd
+# coap
 
 High-performance CoAP server and client library for Zig, built on Linux io_uring.
 
@@ -26,20 +26,20 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 
 ```zig
 const std = @import("std");
-const coapd = @import("coapd");
+const coap = @import("coap");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var server = try coapd.Server.init(gpa.allocator(), .{}, echo);
+    var server = try coap.Server.init(gpa.allocator(), .{}, echo);
     defer server.deinit();
 
     try server.run();
 }
 
-fn echo(request: coapd.Request) ?coapd.Response {
-    return coapd.Response.ok(request.payload());
+fn echo(request: coap.Request) ?coap.Response {
+    return coap.Response.ok(request.payload());
 }
 ```
 
@@ -47,14 +47,14 @@ fn echo(request: coapd.Request) ?coapd.Response {
 
 ```zig
 const std = @import("std");
-const coapd = @import("coapd");
+const coap = @import("coap");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var client = try coapd.Client.init(allocator, .{
+    var client = try coap.Client.init(allocator, .{
         .host = "127.0.0.1",
         .port = 5683,
     });
@@ -76,8 +76,8 @@ pub fn main() !void {
 Add to your `build.zig.zon`:
 
 ```zig
-.coapd = .{
-    .url = "git+https://github.com/cvik/coapd#v0.2.0",
+.coap = .{
+    .url = "git+https://github.com/cvik/coap#v0.2.0",
     .hash = "...",  // zig build will tell you the expected hash
 },
 ```
@@ -85,8 +85,8 @@ Add to your `build.zig.zon`:
 Then in `build.zig`:
 
 ```zig
-const coapd_dep = b.dependency("coapd", .{ .target = target, .optimize = optimize });
-exe.root_module.addImport("coapd", coapd_dep.module("coapd"));
+const coap_dep = b.dependency("coap", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("coap", coap_dep.module("coap"));
 ```
 
 ## Handler Interface
@@ -94,7 +94,7 @@ exe.root_module.addImport("coapd", coapd_dep.module("coapd"));
 The handler is a function pointer with the signature:
 
 ```zig
-fn(coapd.Request) ?coapd.Response
+fn(coap.Request) ?coap.Response
 ```
 
 ### Request
@@ -106,14 +106,14 @@ The request provides convenience accessors and the underlying packet:
 - `pathSegments()` — iterator over URI-Path option segments.
 - `querySegments()` — iterator over URI-Query option values.
 - `findOptions(kind)` / `findOption(kind)` — option lookup by kind.
-- `packet` — the full parsed CoAP packet (`coapd.coap.Packet`) for advanced use.
+- `packet` — the full parsed CoAP packet (`coap.coap.Packet`) for advanced use.
 - `peer_address` — source address of the client (`std.net.Address`).
 - `arena` — per-request arena allocator. Resets after the handler returns.
   Use it for any allocations needed during response construction.
 
 ### Response
 
-Return a `coapd.Response` to send a reply, or `null` for no response.
+Return a `coap.Response` to send a reply, or `null` for no response.
 
 Convenience constructors for common responses:
 
@@ -145,11 +145,11 @@ Use `Server.initContext` to pass state to the handler without globals:
 const State = struct { counter: u64 = 0 };
 
 var state = State{};
-var server = try coapd.Server.initContext(allocator, .{}, handle, &state);
+var server = try coap.Server.initContext(allocator, .{}, handle, &state);
 
-fn handle(ctx: *State, request: coapd.Request) ?coapd.Response {
+fn handle(ctx: *State, request: coap.Request) ?coap.Response {
     _ = @atomicRmw(u64, &ctx.counter, .Add, 1, .monotonic);
-    return coapd.Response.ok(request.payload());
+    return coap.Response.ok(request.payload());
 }
 ```
 
@@ -164,24 +164,24 @@ threads — use atomic operations, mutexes, or thread-local state.
 Error:
 
 ```zig
-fn handler(request: coapd.Request) !?coapd.Response {
+fn handler(request: coap.Request) !?coap.Response {
     const data = try fetchData(request.arena);
     return .{ .payload = data };
 }
 
-var server = try coapd.Server.init(allocator, .{}, coapd.safeWrap(handler));
+var server = try coap.Server.init(allocator, .{}, coap.safeWrap(handler));
 ```
 
 `safeWrapContext` does the same for context handlers:
 
 ```zig
-fn handler(ctx: *State, request: coapd.Request) !?coapd.Response {
+fn handler(ctx: *State, request: coap.Request) !?coap.Response {
     const data = try ctx.lookup(request.arena);
     return .{ .payload = data };
 }
 
-var server = try coapd.Server.initContext(
-    allocator, .{}, coapd.safeWrapContext(*State, handler), &state,
+var server = try coap.Server.initContext(
+    allocator, .{}, coap.safeWrapContext(*State, handler), &state,
 );
 ```
 
@@ -211,15 +211,15 @@ responses, or use `safeWrap` for automatic error conversion.
 There is no built-in router. Use the request accessors to route:
 
 ```zig
-fn handler(request: coapd.Request) ?coapd.Response {
+fn handler(request: coap.Request) ?coap.Response {
     var it = request.pathSegments();
-    const seg1 = it.next() orelse return coapd.Response.notFound();
+    const seg1 = it.next() orelse return coap.Response.notFound();
 
     if (request.method() == .get and std.mem.eql(u8, seg1.value, "temperature")) {
-        return coapd.Response.ok("22.5");
+        return coap.Response.ok("22.5");
     }
 
-    return coapd.Response.notFound();
+    return coap.Response.notFound();
 }
 ```
 
@@ -228,19 +228,19 @@ fn handler(request: coapd.Request) ?coapd.Response {
 Use `Response.content()` to set Content-Format automatically:
 
 ```zig
-fn handler(request: coapd.Request) ?coapd.Response {
-    return coapd.Response.content(request.arena, .json, "{\"temp\": 22.5}");
+fn handler(request: coap.Request) ?coap.Response {
+    return coap.Response.content(request.arena, .json, "{\"temp\": 22.5}");
 }
 ```
 
 For custom options, use the arena allocator directly:
 
 ```zig
-fn handler(request: coapd.Request) ?coapd.Response {
+fn handler(request: coap.Request) ?coap.Response {
     var cf_buf: [2]u8 = undefined;
-    const cf = coapd.Option.content_format(.json, &cf_buf);
-    const opts = request.arena.dupe(coapd.Option, &.{cf}) catch
-        return coapd.Response.withCode(.internal_server_error);
+    const cf = coap.Option.content_format(.json, &cf_buf);
+    const opts = request.arena.dupe(coap.Option, &.{cf}) catch
+        return coap.Response.withCode(.internal_server_error);
 
     return .{ .code = .content, .options = opts, .payload = "{\"temp\": 22.5}" };
 }
@@ -254,7 +254,7 @@ multiple instances for multiple servers.
 ### init / deinit
 
 ```zig
-var client = try coapd.Client.init(allocator, .{
+var client = try coap.Client.init(allocator, .{
     .host = "127.0.0.1",
     .port = 5683,
     .max_in_flight = 32,       // max concurrent CON requests
@@ -360,7 +360,7 @@ smaller SZX value.
 All fields have sensible defaults. Pass `.{}` for a standard server on port 5683.
 
 ```zig
-var server = try coapd.Server.init(allocator, .{
+var server = try coap.Server.init(allocator, .{
     .port = 5683,                     // UDP listen port
     .bind_address = "0.0.0.0",        // IPv4 bind address
     .buffer_count = 512,              // io_uring provided buffers
@@ -429,7 +429,7 @@ before reaching the handler. The response includes `Content-Format: 40`
 (application/link-format).
 
 ```zig
-var server = try coapd.Server.init(allocator, .{
+var server = try coap.Server.init(allocator, .{
     .well_known_core = "</temperature>;rt=\"temperature\";if=\"sensor\"," ++
                        "</led>;rt=\"light\";if=\"actuator\"",
 }, handler);
@@ -446,7 +446,7 @@ kernel distributes incoming packets across sockets via `SO_REUSEPORT`
 (4-tuple hash).
 
 ```zig
-var server = try coapd.Server.init(allocator, .{
+var server = try coap.Server.init(allocator, .{
     .thread_count = 4,
 }, handler);
 ```
@@ -484,7 +484,7 @@ indices 1..N-1. This keeps each thread's io_uring buffers hot in L1/L2
 cache and reduces latency jitter from OS thread migration.
 
 ```zig
-var server = try coapd.Server.init(allocator, .{
+var server = try coap.Server.init(allocator, .{
     .thread_count = 4,
     .cpu_affinity = &.{ 0, 2, 4, 6 },  // pin to even cores
 }, handler);
@@ -496,7 +496,7 @@ permissions), a warning is logged and the thread continues unpinned.
 
 ## Rate Limiting
 
-coapd includes per-IP token bucket rate limiting, activated when the server
+coap includes per-IP token bucket rate limiting, activated when the server
 enters the `throttled` load level (see [Load Shedding](#load-shedding)).
 
 Configuration:
@@ -532,7 +532,7 @@ requests are dropped.
 
 ```zig
 // 1. Init — pre-allocates all memory.
-var server = try coapd.Server.init(allocator, config, handler);
+var server = try coap.Server.init(allocator, config, handler);
 defer server.deinit();
 
 // 2a. Run (blocking) — binds, spawns threads, loops until stop().
@@ -555,11 +555,11 @@ loop (e.g., graceful shutdown, integration with other I/O).
 
 ## Logging
 
-coapd uses `std.log` with the `.coapd` scope. Control verbosity via:
+coap uses `std.log` with the `.coap` scope. Control verbosity via:
 
 ```zig
 pub const std_options: std.Options = .{
-    .log_level = .warn,  // suppress info/debug from coapd
+    .log_level = .warn,  // suppress info/debug from coap
 };
 ```
 

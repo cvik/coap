@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Library module
-    const lib_mod = b.addModule("coapd", .{
+    const lib_mod = b.addModule("coap", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "coapd",
+        .name = "coap",
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        example_mod.addImport("coapd", lib_mod);
+        example_mod.addImport("coap", lib_mod);
         example_mod.addImport("coapz", coapz_dep.module("coapz"));
 
         const example_exe = b.addExecutable(.{
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_mod.addImport("coapz", coapz_dep.module("coapz"));
-    bench_mod.addImport("coapd", lib_mod);
+    bench_mod.addImport("coap", lib_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
