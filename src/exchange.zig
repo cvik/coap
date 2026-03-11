@@ -24,6 +24,8 @@ pub const State = enum(u8) {
 pub const Slot = struct {
     state: State,
     peer_key: u64,
+    /// Address-only hash (no message ID) for peer-based eviction.
+    addr_key: u32,
     message_id: u16,
     response_length: u16,
     /// Monotonic timestamp (ns) when exchange was completed.
@@ -78,6 +80,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Exchange {
         slot.* = .{
             .state = .free,
             .peer_key = 0,
+            .addr_key = 0,
             .message_id = 0,
             .response_length = 0,
             .completed_at_ns = 0,
@@ -105,6 +108,17 @@ pub fn deinit(exchange: *Exchange, allocator: std.mem.Allocator) void {
     allocator.free(exchange.slots);
     allocator.free(exchange.response_buffer);
     allocator.free(exchange.table);
+}
+
+/// Hash peer address only (no message ID) for peer-based eviction.
+pub fn addr_hash(address: std.net.Address) u32 {
+    const addr_bytes: [16]u8 = @bitCast(address.any);
+    var hash: u32 = 0x811c9dc5; // FNV-1a 32-bit offset basis
+    for (addr_bytes) |b| {
+        hash ^= b;
+        hash *%= 0x01000193; // FNV-1a 32-bit prime
+    }
+    return hash;
 }
 
 /// Compute a hash key from peer address and message ID.
@@ -146,6 +160,7 @@ pub fn find(exchange: *const Exchange, key: u64) ?u16 {
 pub fn insert(
     exchange: *Exchange,
     key: u64,
+    addr_key: u32,
     message_id: u16,
     response_data: []const u8,
     now_ns: i64,
@@ -171,6 +186,7 @@ pub fn insert(
     slot.* = .{
         .state = .completed,
         .peer_key = key,
+        .addr_key = addr_key,
         .message_id = message_id,
         .response_length = @intCast(response_data.len),
         .completed_at_ns = now_ns,
@@ -204,10 +220,24 @@ pub fn cached_response(exchange: *const Exchange, slot_idx: u16) []const u8 {
     return exchange.response_buffer[offset..][0..slot.response_length];
 }
 
+/// Evict all completed exchanges for a given peer address.
+/// Called when a new (non-duplicate) request arrives from a peer,
+/// proving the peer received all prior responses.
+pub fn evict_peer(exchange: *Exchange, ak: u32) u16 {
+    var evicted: u16 = 0;
+    for (exchange.slots, 0..) |*slot, i| {
+        if (slot.state != .completed) continue;
+        if (slot.addr_key != ak) continue;
+        exchange.remove(@intCast(i));
+        evicted += 1;
+    }
+    return evicted;
+}
+
 /// Evict exchanges that have expired past the exchange lifetime.
 /// Returns the number of evicted exchanges.
-pub fn evict_expired(exchange: *Exchange, now_ns: i64) u16 {
-    const lifetime_ns: i64 = @as(i64, constants.exchange_lifetime_ms) *
+pub fn evict_expired(exchange: *Exchange, now_ns: i64, lifetime_ms: u32) u16 {
+    const lifetime_ns: i64 = @as(i64, lifetime_ms) *
         std.time.ns_per_ms;
     var evicted: u16 = 0;
 
@@ -315,7 +345,7 @@ test "insert and find" {
 
     try testing.expect(pool.find(key) == null);
 
-    const slot = pool.insert(key, 0x1234, "response", 0);
+    const slot = pool.insert(key, 0, 0x1234, "response", 0);
     try testing.expect(slot != null);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
 
@@ -338,7 +368,7 @@ test "duplicate detection" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
     const key = Exchange.peer_key(addr, 0xAAAA);
 
-    _ = pool.insert(key, 0xAAAA, "first", 0);
+    _ = pool.insert(key, 0, 0xAAAA, "first", 0);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
 
     // Same key should be found (duplicate).
@@ -363,9 +393,9 @@ test "pool exhaustion" {
     const k2 = Exchange.peer_key(addr, 2);
     const k3 = Exchange.peer_key(addr, 3);
 
-    try testing.expect(pool.insert(k1, 1, "a", 0) != null);
-    try testing.expect(pool.insert(k2, 2, "b", 0) != null);
-    try testing.expect(pool.insert(k3, 3, "c", 0) == null);
+    try testing.expect(pool.insert(k1, 0, 1, "a", 0) != null);
+    try testing.expect(pool.insert(k2, 0, 2, "b", 0) != null);
+    try testing.expect(pool.insert(k3, 0, 3, "c", 0) == null);
     try testing.expectEqual(@as(u16, 2), pool.count_active);
 }
 
@@ -381,17 +411,17 @@ test "evict expired" {
     const k2 = Exchange.peer_key(addr, 2);
 
     // Insert at time 0.
-    _ = pool.insert(k1, 1, "old", 0);
+    _ = pool.insert(k1, 0, 1, "old", 0);
     // Insert at a recent time.
     const recent: i64 = @as(i64, constants.exchange_lifetime_ms) *
         std.time.ns_per_ms;
-    _ = pool.insert(k2, 2, "new", recent);
+    _ = pool.insert(k2, 0, 2, "new", recent);
 
     try testing.expectEqual(@as(u16, 2), pool.count_active);
 
     // Evict at time = lifetime + 1ms. Only the old one should expire.
     const now = recent + std.time.ns_per_ms;
-    const evicted = pool.evict_expired(now);
+    const evicted = pool.evict_expired(now, constants.exchange_lifetime_ms);
     try testing.expectEqual(@as(u16, 1), evicted);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
 
@@ -410,7 +440,7 @@ test "remove is public" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
     const key = Exchange.peer_key(addr, 0x0001);
 
-    const slot = pool.insert(key, 0x0001, "data", 0);
+    const slot = pool.insert(key, 0, 0x0001, "data", 0);
     try testing.expect(slot != null);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
 
@@ -433,10 +463,10 @@ test "rehash after remove does not orphan entries" {
     const key_c: u64 = 0x0003_0000_0000_0003; // desired=3
     const key_d: u64 = 0x0004_0000_0000_0005; // desired=5
 
-    _ = pool.insert(key_a, 1, "a", 0);
-    _ = pool.insert(key_b, 2, "b", 0);
-    _ = pool.insert(key_c, 3, "c", 0);
-    _ = pool.insert(key_d, 4, "d", 0);
+    _ = pool.insert(key_a, 0, 1, "a", 0);
+    _ = pool.insert(key_b, 0, 2, "b", 0);
+    _ = pool.insert(key_c, 0, 3, "c", 0);
+    _ = pool.insert(key_d, 0, 4, "d", 0);
 
     const slot_a = pool.find(key_a).?;
     pool.remove(slot_a);
@@ -456,8 +486,8 @@ test "rehash after remove with simple chain" {
     const key_x: u64 = 0x0001_0000_0000_0002; // desired=2
     const key_y: u64 = 0x0002_0000_0000_0002; // desired=2
 
-    _ = pool.insert(key_x, 1, "x", 0);
-    _ = pool.insert(key_y, 2, "y", 0);
+    _ = pool.insert(key_x, 0, 1, "x", 0);
+    _ = pool.insert(key_y, 0, 2, "y", 0);
 
     const slot_x = pool.find(key_x).?;
     pool.remove(slot_x);
@@ -481,13 +511,38 @@ test "rehash after remove wraps around table" {
     const key_f: u64 = 0x0002_0000_0000_0006; // desired=6
     const key_g: u64 = 0x0003_0000_0000_0006; // desired=6
 
-    _ = pool.insert(key_e, 1, "e", 0);
-    _ = pool.insert(key_f, 2, "f", 0);
-    _ = pool.insert(key_g, 3, "g", 0);
+    _ = pool.insert(key_e, 0, 1, "e", 0);
+    _ = pool.insert(key_f, 0, 2, "f", 0);
+    _ = pool.insert(key_g, 0, 3, "g", 0);
 
     const slot_e = pool.find(key_e).?;
     pool.remove(slot_e);
 
     try testing.expect(pool.find(key_f) != null);
     try testing.expect(pool.find(key_g) != null);
+}
+
+test "evict_peer removes all exchanges for a peer" {
+    var pool = try Exchange.init(testing.allocator, .{
+        .exchange_count = 8,
+        .response_size_max = 64,
+    });
+    defer pool.deinit(testing.allocator);
+
+    const addr_a = try std.net.Address.parseIp("10.0.0.1", 5683);
+    const addr_b = try std.net.Address.parseIp("10.0.0.2", 5683);
+    const ak_a = Exchange.addr_hash(addr_a);
+    const ak_b = Exchange.addr_hash(addr_b);
+
+    // Two exchanges from peer A, one from peer B.
+    _ = pool.insert(Exchange.peer_key(addr_a, 1), ak_a, 1, "a1", 0);
+    _ = pool.insert(Exchange.peer_key(addr_a, 2), ak_a, 2, "a2", 0);
+    _ = pool.insert(Exchange.peer_key(addr_b, 3), ak_b, 3, "b1", 0);
+    try testing.expectEqual(@as(u16, 3), pool.count_active);
+
+    // Evict peer A — should remove 2, leave peer B.
+    const evicted = pool.evict_peer(ak_a);
+    try testing.expectEqual(@as(u16, 2), evicted);
+    try testing.expectEqual(@as(u16, 1), pool.count_active);
+    try testing.expect(pool.find(Exchange.peer_key(addr_b, 3)) != null);
 }

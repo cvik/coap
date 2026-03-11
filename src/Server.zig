@@ -80,6 +80,11 @@ pub const Config = struct {
     handler_warn_ns: u64 = 0,
     /// Maximum worker restart attempts before giving up.
     max_worker_restarts: u16 = 5,
+    /// Exchange lifetime in milliseconds. Cached CON responses are
+    /// evicted after this duration. RFC 7252 default is ~247s; shorter
+    /// values reclaim slots faster on reliable networks.
+    /// 0 = use RFC 7252 derived value (exchange_lifetime_ms).
+    exchange_lifetime_ms: u32 = 0,
     /// CPU core IDs for thread pinning. Thread i pins to
     /// cpu_affinity[i % len]. null = no pinning (default).
     cpu_affinity: ?[]const u16 = null,
@@ -92,6 +97,7 @@ handler_context: ?*anyopaque,
 arena: std.heap.ArenaAllocator,
 config: Config,
 exchanges: Exchange,
+exchange_lifetime_ms: u32,
 running: std.atomic.Value(bool),
 
 // Pre-allocated per-CQE response state.
@@ -247,6 +253,10 @@ fn init_raw(
         .arena = std.heap.ArenaAllocator.init(allocator),
         .config = config,
         .exchanges = exchanges,
+        .exchange_lifetime_ms = if (config.exchange_lifetime_ms > 0)
+            config.exchange_lifetime_ms
+        else
+            constants.exchange_lifetime_ms,
         .running = std.atomic.Value(bool).init(true),
         .addrs_response = addrs_response,
         .msgs_response = msgs_response,
@@ -584,7 +594,7 @@ pub fn tick(server: *Server) !void {
     // Periodic exchange eviction (~every 10 seconds).
     const eviction_interval_ns: i64 = 10 * std.time.ns_per_s;
     if (server.tick_now_ns - server.last_eviction_ns > eviction_interval_ns) {
-        const evicted = server.exchanges.evict_expired(server.tick_now_ns);
+        const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
         if (evicted > 0) {
             log.debug("evicted {d} expired exchanges", .{evicted});
         }
@@ -702,6 +712,8 @@ fn handle_recv(
 
     const is_con = packet.kind == .confirmable;
 
+    const addr_key = Exchange.addr_hash(recv.peer_address);
+
     // CON duplicate detection.
     if (is_con) {
         const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
@@ -711,6 +723,9 @@ fn handle_recv(
             try server.send_data(cached, recv.peer_address, index);
             return;
         }
+        // New request from this peer — they received all prior responses,
+        // so evict stale exchanges for this address.
+        _ = server.exchanges.evict_peer(addr_key);
     }
 
     const request = handler.Request{
@@ -790,15 +805,16 @@ fn handle_recv(
             );
             if (server.exchanges.insert(
                 key,
+                addr_key,
                 packet.msg_id,
                 data_wire,
                 server.tick_now_ns,
             ) == null) {
                 // Try evicting expired entries before giving up.
-                const evicted = server.exchanges.evict_expired(server.tick_now_ns);
+                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
                 if (evicted > 0) {
                     server.last_eviction_ns = server.tick_now_ns;
-                    _ = server.exchanges.insert(key, packet.msg_id, data_wire, server.tick_now_ns);
+                    _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
                 } else {
                     log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
                 }
@@ -833,14 +849,15 @@ fn handle_recv(
         );
         if (server.exchanges.insert(
             key,
+            addr_key,
             packet.msg_id,
             data_wire,
             server.tick_now_ns,
         ) == null) {
-            const evicted = server.exchanges.evict_expired(server.tick_now_ns);
+            const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
             if (evicted > 0) {
                 server.last_eviction_ns = server.tick_now_ns;
-                _ = server.exchanges.insert(key, packet.msg_id, data_wire, server.tick_now_ns);
+                _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
             } else {
                 log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
             }
