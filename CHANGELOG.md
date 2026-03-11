@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.5] - 2026-03-11
+- Client: fix double-free of in-flight slot on timeout/reset in call()
+- Server: add 50ms tick timeout so run loop exits on SIGINT without traffic
+
 ## [0.2.4] - 2026-03-10
 - Server: measure handler duration per-invocation instead of per-tick
 - Server: validate CoAP version before processing (drop non-v1 packets)
