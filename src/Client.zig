@@ -538,11 +538,13 @@ pub fn call(
     slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
 
     client.insertTable(slot_idx, client.tokenKey(token));
-    // After insertTable, errors must use freeSlotAndTable.
-    errdefer client.freeSlotAndTable(slot_idx);
 
-    try client.sendDirect(wire);
+    client.sendDirect(wire) catch |err| {
+        client.freeSlotAndTable(slot_idx);
+        return err;
+    };
 
+    // waitForResponse owns slot cleanup on all paths (success, timeout, reset).
     return client.waitForResponse(allocator, slot_idx, code, options);
 }
 
