@@ -536,12 +536,19 @@ pub fn tick(server: *Server) !void {
 
     server.tick_now_ns = @intCast(std.time.nanoTimestamp());
 
+    // Submit a timeout so wait_cqes unblocks periodically, allowing
+    // the run loop to check the shutdown flag even when idle.
+    const tick_ts = linux.kernel_timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+    server.io.queue_timeout(&tick_ts) catch {};
+    _ = server.io.submit() catch {};
+
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
     var recv_fail_count: u32 = 0;
     var processed: u32 = 0;
 
     for (cqes[0..count], 0..) |cqe, index| {
+        if (Io.is_timeout(&cqe)) continue;
         if (Io.is_recv(&cqe) and !Io.is_success(&cqe)) {
             recv_failed = true;
             recv_fail_count += 1;

@@ -20,6 +20,7 @@ const UserData = enum(u64) {
     provide_buffers,
     send_msg,
     recv_msg,
+    tick_timeout,
 };
 
 ring: linux.IoUring,
@@ -217,9 +218,21 @@ pub fn decode_recv(io: *const Io, cqe: *const Cqe) !RecvResult {
     };
 }
 
+/// Queue a timeout that fires after `ms` milliseconds.
+/// Ensures `wait_cqes` unblocks periodically so the server can
+/// check shutdown flags even when no packets arrive.
+pub fn queue_timeout(io: *Io, ts: *const linux.kernel_timespec) !void {
+    _ = try io.ring.timeout(@intFromEnum(UserData.tick_timeout), ts, 0, 0);
+}
+
 /// Check whether a CQE is a recv_msg completion.
 pub fn is_recv(cqe: *const Cqe) bool {
     return cqe.user_data == @intFromEnum(UserData.recv_msg);
+}
+
+/// Check whether a CQE is a tick timeout completion.
+pub fn is_timeout(cqe: *const Cqe) bool {
+    return cqe.user_data == @intFromEnum(UserData.tick_timeout);
 }
 
 /// Check whether a CQE completed successfully.
