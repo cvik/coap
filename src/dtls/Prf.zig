@@ -38,8 +38,6 @@ pub fn prf(secret: []const u8, label: []const u8, seed: []const u8, out: []u8) v
         @memcpy(out[written..][0..n], block[0..n]);
         written += n;
 
-        if (written >= out.len) break;
-
         // A(i+1) = HMAC(secret, A(i))
         var next_a: [mac_len]u8 = undefined;
         {
