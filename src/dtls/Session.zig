@@ -168,6 +168,7 @@ pub const SessionTable = struct {
             break :blk idx;
         } else blk: {
             self.evictLru();
+            std.debug.assert(self.free_head != empty_sentinel);
             // After eviction, free_head should have the newly freed slot.
             const idx = self.free_head;
             self.free_head = self.slots[idx].next_free;
@@ -176,34 +177,36 @@ pub const SessionTable = struct {
 
         const session = &self.slots[slot_idx];
 
-        // Initialize session fields.
-        session.state = .handshaking;
-        session.peer_hash = addrHash(addr);
-        session.addr = addr;
-        session.client_write_key = [_]u8{0} ** 16;
-        session.server_write_key = [_]u8{0} ** 16;
-        session.client_write_iv = [_]u8{0} ** 4;
-        session.server_write_iv = [_]u8{0} ** 4;
-        session.read_epoch = 0;
-        session.write_epoch = 0;
-        session.read_sequence = 0;
-        session.write_sequence = 0;
-        session.replay_window = 0;
-        session.handshake_state = .idle;
-        session.handshake_hash = Sha256.init(.{});
-        session.client_random = [_]u8{0} ** 32;
-        session.server_random = [_]u8{0} ** 32;
-        session.message_seq = 0;
-        session.retransmit_deadline_ns = 0;
-        session.retransmit_count = 0;
-        session.retransmit_timeout_ms = 0;
-        session.master_secret = [_]u8{0} ** 48;
-        session.session_id = [_]u8{0} ** 32;
-        session.session_id_len = 0;
-        session.last_activity_ns = now_ns;
-        session.lru_prev = empty_sentinel;
-        session.lru_next = empty_sentinel;
-        session.next_free = empty_sentinel;
+        const hash = addrHash(addr);
+        session.* = .{
+            .state = .handshaking,
+            .peer_hash = hash,
+            .addr = addr,
+            .client_write_key = .{0} ** 16,
+            .server_write_key = .{0} ** 16,
+            .client_write_iv = .{0} ** 4,
+            .server_write_iv = .{0} ** 4,
+            .read_epoch = 0,
+            .write_epoch = 0,
+            .read_sequence = 0,
+            .write_sequence = 0,
+            .replay_window = 0,
+            .handshake_state = .idle,
+            .handshake_hash = Sha256.init(.{}),
+            .client_random = .{0} ** 32,
+            .server_random = .{0} ** 32,
+            .message_seq = 0,
+            .retransmit_deadline_ns = 0,
+            .retransmit_count = 0,
+            .retransmit_timeout_ms = 0,
+            .master_secret = .{0} ** 48,
+            .session_id = .{0} ** 32,
+            .session_id_len = 0,
+            .last_activity_ns = now_ns,
+            .lru_prev = empty_sentinel,
+            .lru_next = empty_sentinel,
+            .next_free = empty_sentinel,
+        };
 
         self.insertIntoTable(slot_idx);
         self.lruPushFront(session);
@@ -221,6 +224,7 @@ pub const SessionTable = struct {
 
     /// Release a session back to the free list, zeroing key material.
     pub fn release(self: *SessionTable, session: *Session) void {
+        std.debug.assert(session.state != .free);
         session.zeroKeys();
         const slot_idx = self.slotIndex(session);
         self.removeFromTable(slot_idx);
@@ -243,10 +247,15 @@ pub const SessionTable = struct {
     fn insertIntoTable(self: *SessionTable, slot_idx: u32) void {
         const hash = self.slots[slot_idx].peer_hash;
         var idx: u32 = @intCast(hash & self.table_mask);
-        while (self.table[idx] != empty_sentinel) {
+        var probes: u32 = 0;
+        while (probes <= self.table_mask) : (probes += 1) {
+            if (self.table[idx] == empty_sentinel) {
+                self.table[idx] = slot_idx;
+                return;
+            }
             idx = (idx + 1) & self.table_mask;
         }
-        self.table[idx] = slot_idx;
+        unreachable; // table always has empty slots (size >= 2x capacity)
     }
 
     fn removeFromTable(self: *SessionTable, slot_idx: u32) void {
@@ -285,7 +294,6 @@ pub const SessionTable = struct {
     }
 
     fn lruRemove(self: *SessionTable, session: *Session) void {
-        const slot_idx = self.slotIndex(session);
         const prev = session.lru_prev;
         const next = session.lru_next;
 
@@ -303,7 +311,6 @@ pub const SessionTable = struct {
             self.lru_tail = prev;
         }
 
-        _ = slot_idx;
         session.lru_prev = empty_sentinel;
         session.lru_next = empty_sentinel;
     }
