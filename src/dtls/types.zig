@@ -56,6 +56,11 @@ pub const Psk = struct {
     key: []const u8,
 };
 
+/// Maximum PSK identity length.
+pub const max_psk_identity_len: usize = 128;
+/// Maximum PSK key length.
+pub const max_psk_key_len: usize = 64;
+
 /// Maximum cookie length (HMAC-SHA256 output).
 pub const max_cookie_len: usize = 32;
 

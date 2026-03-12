@@ -24,6 +24,7 @@ pub const KeyBlock = struct {
 /// Build PSK pre-master secret: <2-byte len><zeroes><2-byte len><PSK bytes>
 /// RFC 4279 section 2.
 pub fn buildPreMasterSecret(psk: []const u8, buf: []u8) []const u8 {
+    std.debug.assert(psk.len <= types.max_psk_key_len);
     const psk_len: u16 = @intCast(psk.len);
     const total = 2 + psk.len + 2 + psk.len;
     std.debug.assert(buf.len >= total);
@@ -52,12 +53,14 @@ pub fn deriveKeys(master_secret: [48]u8, server_random: [32]u8, client_random: [
     @memcpy(seed[32..64], &client_random);
     var material: [40]u8 = undefined;
     Prf.prf(&master_secret, "key expansion", &seed, &material);
-    return .{
+    const kb: KeyBlock = .{
         .client_write_key = material[0..16].*,
         .server_write_key = material[16..32].*,
         .client_write_iv = material[32..36].*,
         .server_write_iv = material[36..40].*,
     };
+    std.crypto.secureZero(u8, &material);
+    return kb;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +135,8 @@ pub fn serverProcessMessage(
     cookie_secret: [32]u8,
     send_buf: []u8,
 ) HandshakeAction {
+    if (psk.identity.len > types.max_psk_identity_len or psk.key.len > types.max_psk_key_len)
+        return .{ .failed = .internal_error };
     switch (content_type) {
         .handshake => return serverProcessHandshake(session, payload, psk, cookie_secret, send_buf),
         .change_cipher_spec => return serverProcessCcs(session, payload),
@@ -163,7 +168,7 @@ fn serverProcessHandshake(
         .expect_finished => {
             if (msg.msg_type != .finished)
                 return .{ .failed = .unexpected_message };
-            return serverHandleFinished(session, msg.body, payload, psk, send_buf);
+            return serverHandleFinished(session, msg.body, payload, send_buf);
         },
         else => return .{ .failed = .unexpected_message },
     }
@@ -258,7 +263,7 @@ fn serverHandleClientHello(
         std.mem.writeInt(u16, sh_body[35..37], @intFromEnum(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
         sh_body[37] = 0; // compression = null
 
-        session.message_seq += 1; // server message_seq starts at 1 (client was 0)
+        // Server's own message_seq counter starts at 0, independent of client's.
         const hs_msg = encodeHandshakeMessage(.server_hello, session.message_seq, &sh_body, &hs_buf);
         session.handshake_hash.update(hs_msg);
         const rec = Record.encodePlaintext(.handshake, hs_msg, &session.write_sequence, &record_buf);
@@ -346,6 +351,7 @@ fn serverHandleClientKeyExchange(
     var pms_buf: [256]u8 = undefined;
     const pre_master = buildPreMasterSecret(psk.key, &pms_buf);
     session.master_secret = deriveMasterSecret(pre_master, session.client_random, session.server_random);
+    std.crypto.secureZero(u8, &pms_buf);
     const keys = deriveKeys(session.master_secret, session.server_random, session.client_random);
     session.client_write_key = keys.client_write_key;
     session.server_write_key = keys.server_write_key;
@@ -360,11 +366,8 @@ fn serverHandleFinished(
     session: *Session.Session,
     body: []const u8,
     full_hs_msg: []const u8,
-    psk: types.Psk,
     send_buf: []u8,
 ) HandshakeAction {
-    _ = psk;
-
     if (body.len != 12) return .{ .failed = .decode_error };
 
     // Compute expected client verify_data: PRF(master, "client finished", SHA256(all_hs_msgs_before_finished))
@@ -450,7 +453,8 @@ pub fn clientBuildInitialHello(
     psk: types.Psk,
     send_buf: []u8,
 ) HandshakeAction {
-    _ = psk;
+    if (psk.identity.len > types.max_psk_identity_len or psk.key.len > types.max_psk_key_len)
+        return .{ .failed = .internal_error };
 
     // Generate client_random.
     std.crypto.random.bytes(&session.client_random);
@@ -655,6 +659,7 @@ fn clientHandleServerHelloDone(
     var pms_buf: [256]u8 = undefined;
     const pre_master = buildPreMasterSecret(psk.key, &pms_buf);
     session.master_secret = deriveMasterSecret(pre_master, session.client_random, session.server_random);
+    std.crypto.secureZero(u8, &pms_buf);
     const keys = deriveKeys(session.master_secret, session.server_random, session.client_random);
     session.client_write_key = keys.client_write_key;
     session.server_write_key = keys.server_write_key;
