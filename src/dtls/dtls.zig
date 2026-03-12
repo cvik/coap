@@ -18,4 +18,5 @@ test {
     _ = Session;
     _ = Handshake;
     _ = @import("integration_test.zig");
+    _ = @import("openssl_interop_test.zig");
 }

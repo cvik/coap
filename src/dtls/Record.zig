@@ -21,8 +21,10 @@ const Header = struct {
 /// Layout: ContentType(1) | Version(2) | Epoch(2) | SequenceNumber(6) | Length(2)
 fn parseHeader(buf: []const u8) ?Header {
     if (buf.len < types.record_header_len) return null;
-    // Version check: must be DTLS 1.2 (0xFE 0xFD).
-    if (buf[1] != 0xFE or buf[2] != 0xFD) return null;
+    // Version check: accept DTLS 1.0 (0xFE 0xFF) and 1.2 (0xFE 0xFD).
+    // RFC 6347 §4.1: record layer version may be DTLS 1.0 during initial
+    // handshake for backward compatibility (e.g. HelloVerifyRequest).
+    if (buf[1] != 0xFE or (buf[2] != 0xFD and buf[2] != 0xFF)) return null;
     return .{
         .content_type = @as(types.ContentType, @enumFromInt(buf[0])),
         .epoch = std.mem.readInt(u16, buf[3..5], .big),
