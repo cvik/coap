@@ -27,6 +27,7 @@ const std = @import("std");
 const posix = std.posix;
 const coapz = @import("coapz");
 const constants = @import("constants.zig");
+const dtls = @import("dtls/dtls.zig");
 const log = std.log.scoped(.coap_client);
 
 const Client = @This();
@@ -46,6 +47,10 @@ pub const Config = struct {
     /// Block size exponent for Block1/Block2: `block_size = 2^(szx+4)`.
     /// Default: 6 (1024 bytes).
     default_szx: u3 = 6,
+    /// PSK credentials for DTLS. null = plain UDP.
+    psk: ?dtls.types.Psk = null,
+    /// DTLS handshake timeout in milliseconds.
+    handshake_timeout_ms: u32 = 10_000,
 };
 
 /// Response from a CON request (`call`, `get`, `post`, `put`, `delete`, `upload`).
@@ -282,7 +287,7 @@ pub const ObserveStream = struct {
 
         var buf: [constants.buffer_size_default]u8 = undefined;
         const wire = dereg.writeBuf(&buf) catch return;
-        self.client.sendDirect(wire) catch {};
+        self.client.sendCoap(wire) catch {};
 
         for (sub.pending[0..sub.pending_count]) |*p| {
             self.client.allocator.free(p.data);
@@ -323,6 +328,9 @@ next_msg_id_val: u16,
 next_token_val: u64,
 rng: std.Random.DefaultPrng,
 
+dtls_session: ?dtls.Session.Session,
+dtls_client_hs_state: dtls.Handshake.ClientHandshakeState,
+
 const empty_sentinel: u16 = 0xFFFF;
 
 /// Create a client and connect to the server at `config.host:config.port`.
@@ -337,7 +345,12 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     if (config.max_in_flight == 0) return error.InvalidConfig;
     if (config.buffer_size < 64) return error.InvalidConfig;
 
-    const dest = try std.net.Address.parseIp(config.host, config.port);
+    var effective_config = config;
+    if (config.psk != null and config.port == constants.port_default) {
+        effective_config.port = constants.coaps_port_default;
+    }
+
+    const dest = try std.net.Address.parseIp(effective_config.host, effective_config.port);
     if (dest.any.family != posix.AF.INET) return error.UnsupportedAddressFamily;
 
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
@@ -409,7 +422,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
 
     return .{
         .allocator = allocator,
-        .config = config,
+        .config = effective_config,
         .fd = fd,
         .send_buf = send_buf,
         .recv_buf = recv_buf,
@@ -422,12 +435,15 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         .next_msg_id_val = initial_msg_id,
         .next_token_val = std.crypto.random.int(u64),
         .rng = rng,
+        .dtls_session = if (effective_config.psk != null) std.mem.zeroes(dtls.Session.Session) else null,
+        .dtls_client_hs_state = .idle,
     };
 }
 
 /// Release all client-owned memory and close the socket.
 /// Outstanding `Result` values must be deinited separately by the caller.
 pub fn deinit(client: *Client) void {
+    if (client.dtls_session) |*sess| sess.zeroKeys();
     for (&client.observes) |*obs| {
         if (obs.active) {
             for (obs.pending[0..obs.pending_count]) |*p| {
@@ -440,6 +456,103 @@ pub fn deinit(client: *Client) void {
     client.allocator.free(client.recv_buf);
     client.allocator.free(client.slots);
     client.allocator.free(client.slot_table);
+}
+
+// ─── DTLS handshake ──────────────────────────────────────────────
+
+/// Perform the DTLS 1.2 PSK handshake. Must be called after init() and
+/// before any CoAP send/recv when PSK is configured.
+pub fn handshake(client: *Client) !void {
+    const psk = client.config.psk orelse return error.NoPskConfigured;
+    var sess = &(client.dtls_session orelse return error.NoPskConfigured);
+
+    // Initialize session state.
+    sess.state = .handshaking;
+    sess.write_sequence = 0;
+    sess.read_sequence = 0;
+    sess.write_epoch = 0;
+    sess.read_epoch = 0;
+    sess.replay_window = 0;
+
+    var send_buf: [512]u8 = undefined;
+
+    // Build and send initial ClientHello.
+    const action = dtls.Handshake.clientBuildInitialHello(
+        sess,
+        &client.dtls_client_hs_state,
+        psk,
+        &send_buf,
+    );
+    switch (action) {
+        .send => |data| try client.sendDirect(data),
+        .failed => return error.HandshakeFailed,
+        else => unreachable,
+    }
+
+    const deadline_ns: i128 = std.time.nanoTimestamp() +
+        @as(i128, client.config.handshake_timeout_ms) * std.time.ns_per_ms;
+
+    // Loop: receive server messages, process, send responses.
+    while (client.dtls_client_hs_state != .complete) {
+        const data = client.recvUntil(deadline_ns) orelse return error.Timeout;
+
+        // Must be a DTLS record.
+        if (data.len < 1 or !dtls.types.isDtlsContentType(data[0])) continue;
+
+        // Check epoch from record header.
+        const epoch = if (data.len >= 5) std.mem.readInt(u16, data[3..5], .big) else 0;
+
+        if (epoch == 0) {
+            const record = dtls.Record.decodePlaintext(data) orelse continue;
+            const hs_action = dtls.Handshake.clientProcessMessage(
+                sess,
+                &client.dtls_client_hs_state,
+                record.content_type,
+                record.payload,
+                psk,
+                &send_buf,
+            );
+            switch (hs_action) {
+                .send => |sdata| try client.sendDirect(sdata),
+                .established => {
+                    sess.state = .established;
+                    return;
+                },
+                .failed => return error.HandshakeFailed,
+                .none => {},
+            }
+        } else {
+            // Encrypted record (server Finished comes encrypted).
+            var pt_buf: [512]u8 = undefined;
+            const record = dtls.Record.decodeEncrypted(
+                data,
+                sess.server_write_key,
+                sess.server_write_iv,
+                &sess.replay_window,
+                &sess.read_sequence,
+                &pt_buf,
+            ) orelse continue;
+            const hs_action = dtls.Handshake.clientProcessMessage(
+                sess,
+                &client.dtls_client_hs_state,
+                record.content_type,
+                record.payload,
+                psk,
+                &send_buf,
+            );
+            switch (hs_action) {
+                .send => |sdata| try client.sendDirect(sdata),
+                .established => {
+                    sess.state = .established;
+                    return;
+                },
+                .failed => return error.HandshakeFailed,
+                .none => {},
+            }
+        }
+    }
+
+    sess.state = .established;
 }
 
 // ─── cast (NON fire-and-forget) ──────────────────────────────────
@@ -473,7 +586,7 @@ pub fn cast(
 
     var buf: [constants.buffer_size_default]u8 = undefined;
     const wire = try packet.writeBuf(&buf);
-    try client.sendDirect(wire);
+    try client.sendCoap(wire);
 }
 
 // ─── call (CON with retransmission + Block2 reassembly) ──────────
@@ -539,7 +652,7 @@ pub fn call(
 
     client.insertTable(slot_idx, client.tokenKey(token));
 
-    client.sendDirect(wire) catch |err| {
+    client.sendCoap(wire) catch |err| {
         client.freeSlotAndTable(slot_idx);
         return err;
     };
@@ -606,7 +719,7 @@ pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !
 pub fn sendRaw(client: *Client, packet: coapz.Packet) !void {
     var buf: [constants.buffer_size_default]u8 = undefined;
     const wire = try packet.writeBuf(&buf);
-    try client.sendDirect(wire);
+    try client.sendCoap(wire);
 }
 
 /// Receive a single raw CoAP packet, blocking up to `timeout_ms`.
@@ -624,10 +737,12 @@ pub fn recvRaw(
         const now = std.time.nanoTimestamp();
         if (now >= deadline) return null;
 
-        const data = client.tryRecv() orelse {
+        const raw_data = client.tryRecv() orelse {
             std.Thread.sleep(1 * std.time.ns_per_ms);
             continue;
         };
+        var pt_buf: [constants.buffer_size_default]u8 = undefined;
+        const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
         const packet = coapz.Packet.read(allocator, data) catch continue;
         return packet;
     }
@@ -714,7 +829,7 @@ pub fn observe(
         sub.active = false;
     }
 
-    try client.sendDirect(wire);
+    try client.sendCoap(wire);
 
     // Wait for the initial ACK (confirms subscription).
     try client.waitForAck(slot_idx);
@@ -824,6 +939,25 @@ fn sendDirect(client: *Client, data: []const u8) !void {
     };
 }
 
+/// Send CoAP data, encrypting as a DTLS application_data record if DTLS is active.
+fn sendCoap(client: *Client, wire: []const u8) !void {
+    if (client.dtls_session) |*sess| {
+        if (sess.state != .established) return error.DtlsNotEstablished;
+        var enc_buf: [constants.buffer_size_default + dtls.types.record_overhead]u8 = undefined;
+        const encrypted = dtls.Record.encodeEncrypted(
+            .application_data,
+            wire,
+            sess.client_write_key,
+            sess.client_write_iv,
+            sess.write_epoch,
+            &sess.write_sequence,
+            &enc_buf,
+        );
+        return client.sendDirect(encrypted);
+    }
+    return client.sendDirect(wire);
+}
+
 fn sendAck(client: *Client, msg_id: u16, token: []const u8) !void {
     const ack = coapz.Packet{
         .kind = .acknowledgement,
@@ -836,7 +970,7 @@ fn sendAck(client: *Client, msg_id: u16, token: []const u8) !void {
     };
     var buf: [64]u8 = undefined;
     const wire = ack.writeBuf(&buf) catch return;
-    client.sendDirect(wire) catch {};
+    client.sendCoap(wire) catch {};
 }
 
 /// Non-blocking recv. Returns data slice or null if nothing available.
@@ -858,10 +992,34 @@ fn recvUntil(client: *Client, deadline_ns: i128) ?[]const u8 {
     }
 }
 
+/// Decrypt a DTLS record if DTLS is active, returning the plaintext CoAP data.
+/// Returns the raw data unchanged if no DTLS.
+/// Returns null if decryption fails or not application_data.
+fn decryptRecv(client: *Client, data: []const u8, pt_buf: []u8) ?[]const u8 {
+    const sess = &(client.dtls_session orelse return data);
+    if (sess.state != .established) return null;
+
+    if (data.len < 1 or !dtls.types.isDtlsContentType(data[0])) return null;
+
+    const record = dtls.Record.decodeEncrypted(
+        data,
+        sess.server_write_key,
+        sess.server_write_iv,
+        &sess.replay_window,
+        &sess.read_sequence,
+        pt_buf,
+    ) orelse return null;
+
+    if (record.content_type != .application_data) return null;
+    return record.payload;
+}
+
 /// Process one recv cycle. Returns true if data was received and dispatched.
 fn tickOnce(client: *Client) !bool {
     const deadline = std.time.nanoTimestamp() + 50 * std.time.ns_per_ms;
-    const data = client.recvUntil(deadline) orelse return false;
+    const raw_data = client.recvUntil(deadline) orelse return false;
+    var pt_buf: [constants.buffer_size_default]u8 = undefined;
+    const data = client.decryptRecv(raw_data, &pt_buf) orelse return false;
     client.dispatchRecv(data);
     return true;
 }
@@ -924,7 +1082,7 @@ fn waitForResponse(
                 return error.Timeout;
             }
             const wire = client.send_buf[slot.send_offset..][0..slot.send_len];
-            client.sendDirect(wire) catch {};
+            client.sendCoap(wire) catch {};
             slot.retransmit_count += 1;
             slot.timeout_ns *= 2;
             slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
@@ -935,7 +1093,9 @@ fn waitForResponse(
             slot.next_retransmit_ns,
             now + 50 * std.time.ns_per_ms,
         );
-        const data = client.recvUntil(poll_deadline) orelse continue;
+        const raw_data = client.recvUntil(poll_deadline) orelse continue;
+        var pt_buf: [constants.buffer_size_default]u8 = undefined;
+        const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
 
         if (data.len < 4) continue;
 
@@ -1080,7 +1240,7 @@ fn sendBlock2Request(
     client.insertTable(new_slot_idx, client.tokenKey(token));
     errdefer client.freeSlotAndTable(new_slot_idx);
 
-    try client.sendDirect(wire);
+    try client.sendCoap(wire);
 
     return new_slot_idx;
 }
@@ -1098,7 +1258,7 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
                 return error.Timeout;
             }
             const wire = client.send_buf[slot.send_offset..][0..slot.send_len];
-            client.sendDirect(wire) catch {};
+            client.sendCoap(wire) catch {};
             slot.retransmit_count += 1;
             slot.timeout_ns *= 2;
             slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
@@ -1108,7 +1268,9 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             slot.next_retransmit_ns,
             now + 50 * std.time.ns_per_ms,
         );
-        const data = client.recvUntil(poll_deadline) orelse continue;
+        const raw_data = client.recvUntil(poll_deadline) orelse continue;
+        var pt_buf_ack: [constants.buffer_size_default]u8 = undefined;
+        const data = client.decryptRecv(raw_data, &pt_buf_ack) orelse continue;
 
         if (data.len < 4) continue;
         const tkl: u8 = data[0] & 0x0F;
