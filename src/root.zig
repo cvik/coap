@@ -89,6 +89,12 @@ pub const safeWrap = @import("handler.zig").safeWrap;
 /// See `safeWrap` for the non-context variant.
 pub const safeWrapContext = @import("handler.zig").safeWrapContext;
 
+/// DTLS 1.2 module (CoAPs, RFC 7252 §9).
+pub const dtls = @import("dtls/dtls.zig");
+
+/// PSK credential for use with DTLS.
+pub const Psk = dtls.Psk;
+
 /// Full coapz library re-export for advanced use (packet construction, etc.).
 pub const coap = @import("coapz");
 
@@ -118,4 +124,5 @@ test {
     _ = Client;
     _ = Exchange;
     _ = RateLimiter;
+    _ = dtls;
 }
