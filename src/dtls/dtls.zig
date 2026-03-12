@@ -5,10 +5,12 @@ pub const ContentType = types.ContentType;
 pub const Ccm = @import("Ccm.zig");
 pub const Prf = @import("Prf.zig");
 pub const Cookie = @import("Cookie.zig");
+pub const Record = @import("Record.zig");
 
 test {
     _ = types;
     _ = Ccm;
     _ = Prf;
     _ = Cookie;
+    _ = Record;
 }
