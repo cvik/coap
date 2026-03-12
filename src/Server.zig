@@ -191,10 +191,18 @@ pub fn initContext(
 
 fn init_raw(
     allocator: std.mem.Allocator,
-    config: Config,
+    config_in: Config,
     handler_fn: handler.HandlerFn,
     handler_context: ?*anyopaque,
 ) !Server {
+    var config = config_in;
+
+    // When PSK is configured and the port is still the plain CoAP default,
+    // switch to the CoAPs (DTLS) default port per RFC 7252 §6.2.
+    if (config.psk != null and config.port == constants.port_default) {
+        config.port = constants.coaps_port_default;
+    }
+
     if (config.buffer_count == 0 or
         config.buffer_size < 64 or
         config.port == 0) return error.InvalidConfig;
@@ -325,6 +333,10 @@ pub fn deinit(server: *Server) void {
     server.allocator.free(server.rate_limit_rst);
     if (server.rate_limiter) |*rl| rl.deinit(server.allocator);
     if (server.dtls_sessions) |tbl| {
+        // Zero key material from all active sessions before freeing.
+        for (tbl.slots) |*slot| {
+            if (slot.state != .free) slot.zeroKeys();
+        }
         tbl.deinit(server.allocator);
         server.allocator.destroy(tbl);
     }
@@ -661,6 +673,11 @@ pub fn tick(server: *Server) !void {
         if (evicted_sessions > 0) {
             log.debug("evicted {d} timed-out DTLS sessions", .{evicted_sessions});
         }
+
+        // TODO: scan handshaking sessions for expired retransmit deadlines and
+        // re-send the server's last flight. Currently the server relies on the
+        // client to retransmit, which is sufficient for most cases but not
+        // fully spec-compliant (RFC 6347 §4.2.4).
     }
 
     // Compute load level based on buffer/exchange pool utilization.
@@ -951,22 +968,72 @@ fn processDtlsRecord(
     const tbl = server.dtls_sessions.?;
     const peer = recv.peer_address;
 
-    // Look up existing session or allocate a new one.
-    var session = tbl.lookup(peer) orelse blk: {
-        const s = tbl.allocate(peer, server.tick_now_ns) orelse {
-            log.warn("DTLS session table full, dropping packet", .{});
-            release_buffer_robust(&server.io, recv.buffer_id);
-            server.buffers_outstanding -|= 1;
-            return;
-        };
-        break :blk s;
-    };
-
     // Determine epoch from record header (bytes 3-4 big-endian).
     const record_epoch = if (recv.payload.len >= 5)
         std.mem.readInt(u16, recv.payload[3..5], .big)
     else
         0;
+
+    // Look up existing session.
+    var session = tbl.lookup(peer);
+
+    // For epoch 0 records from unknown peers, perform stateless cookie
+    // verification before allocating a session. This prevents resource
+    // exhaustion from spoofed source addresses (RFC 6347 §4.2.1).
+    if (session == null and record_epoch == 0) {
+        const record = dtls.Record.decodePlaintext(recv.payload) orelse {
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            log.debug("DTLS: malformed plaintext record", .{});
+            return;
+        };
+
+        if (record.content_type == .handshake) {
+            if (!dtls.Handshake.isClientHelloWithValidCookie(
+                record.payload,
+                server.dtls_cookie_secret,
+                server.dtls_cookie_secret_prev,
+                peer,
+            )) {
+                // No cookie or invalid cookie — send stateless HVR without
+                // allocating a session (anti-amplification).
+                const buf = server.response_buf(index);
+                if (dtls.Handshake.buildStatelessHvr(
+                    record.payload,
+                    server.dtls_cookie_secret,
+                    peer,
+                    buf,
+                )) |hvr| {
+                    release_buffer_robust(&server.io, recv.buffer_id);
+                    server.buffers_outstanding -|= 1;
+                    server.send_data(hvr, peer, index) catch |err| {
+                        log.warn("DTLS stateless HVR send failed: {}", .{err});
+                    };
+                } else {
+                    release_buffer_robust(&server.io, recv.buffer_id);
+                    server.buffers_outstanding -|= 1;
+                    log.debug("DTLS: invalid ClientHello, dropping", .{});
+                }
+                return;
+            }
+        }
+
+        // Valid cookie — allocate session now.
+        session = tbl.allocate(peer, server.tick_now_ns) orelse {
+            log.warn("DTLS session table full, dropping packet", .{});
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            return;
+        };
+    }
+
+    // For non-epoch-0 packets from unknown peers, drop.
+    const sess = session orelse {
+        release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
+        log.debug("DTLS: no session for encrypted record, dropping", .{});
+        return;
+    };
 
     if (record_epoch == 0) {
         // Plaintext record (handshake / CCS before encryption).
@@ -979,11 +1046,12 @@ fn processDtlsRecord(
 
         const buf = server.response_buf(index);
         const action = dtls.Handshake.serverProcessMessage(
-            session,
+            sess,
             record.content_type,
             record.payload,
             psk,
             server.dtls_cookie_secret,
+            server.dtls_cookie_secret_prev,
             buf,
         );
 
@@ -994,25 +1062,25 @@ fn processDtlsRecord(
 
         switch (action) {
             .send => |data| {
-                tbl.promote(session, server.tick_now_ns);
+                tbl.promote(sess, server.tick_now_ns);
                 server.send_data(data, peer, index) catch |err| {
                     log.warn("DTLS handshake send failed: {}", .{err});
                 };
             },
             .established => {
-                tbl.promote(session, server.tick_now_ns);
+                tbl.promote(sess, server.tick_now_ns);
                 log.debug("DTLS session established: {any}", .{peer});
             },
             .failed => |desc| {
                 log.debug("DTLS handshake failed: {any}", .{desc});
-                server.sendDtlsAlert(session, .fatal, desc, index, peer);
-                tbl.release(session);
+                server.sendDtlsAlert(sess, .fatal, desc, index, peer);
+                tbl.release(sess);
             },
             .none => {},
         }
     } else {
         // Encrypted record (epoch >= 1) — must be an established session.
-        if (session.state != .established) {
+        if (sess.state != .established) {
             release_buffer_robust(&server.io, recv.buffer_id);
             server.buffers_outstanding -|= 1;
             log.debug("DTLS: encrypted record for non-established session", .{});
@@ -1022,10 +1090,10 @@ fn processDtlsRecord(
         var plaintext_buf: [constants.buffer_size_default]u8 = undefined;
         const record = dtls.Record.decodeEncrypted(
             recv.payload,
-            session.client_write_key,
-            session.client_write_iv,
-            &session.replay_window,
-            &session.read_sequence,
+            sess.client_write_key,
+            sess.client_write_iv,
+            &sess.replay_window,
+            &sess.read_sequence,
             &plaintext_buf,
         ) orelse {
             release_buffer_robust(&server.io, recv.buffer_id);
@@ -1038,19 +1106,19 @@ fn processDtlsRecord(
         release_buffer_robust(&server.io, recv.buffer_id);
         server.buffers_outstanding -|= 1;
 
-        tbl.promote(session, server.tick_now_ns);
+        tbl.promote(sess, server.tick_now_ns);
 
         switch (record.content_type) {
             .application_data => {
-                server.processDtlsCoap(record.payload, session, peer, index);
+                server.processDtlsCoap(record.payload, sess, peer, index);
             },
             .alert => {
                 if (record.payload.len >= 2 and record.payload[0] == @intFromEnum(dtls.types.AlertLevel.fatal)) {
                     log.debug("DTLS: received fatal alert {d}", .{record.payload[1]});
-                    tbl.release(session);
+                    tbl.release(sess);
                 } else if (record.payload.len >= 2 and record.payload[1] == @intFromEnum(dtls.types.AlertDescription.close_notify)) {
                     log.debug("DTLS: close_notify from peer", .{});
-                    tbl.release(session);
+                    tbl.release(sess);
                 }
             },
             else => {

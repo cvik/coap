@@ -133,12 +133,13 @@ pub fn serverProcessMessage(
     payload: []const u8,
     psk: types.Psk,
     cookie_secret: [32]u8,
+    cookie_secret_prev: [32]u8,
     send_buf: []u8,
 ) HandshakeAction {
     if (psk.identity.len > types.max_psk_identity_len or psk.key.len > types.max_psk_key_len)
         return .{ .failed = .internal_error };
     switch (content_type) {
-        .handshake => return serverProcessHandshake(session, payload, psk, cookie_secret, send_buf),
+        .handshake => return serverProcessHandshake(session, payload, psk, cookie_secret, cookie_secret_prev, send_buf),
         .change_cipher_spec => return serverProcessCcs(session, payload),
         else => return .{ .failed = .unexpected_message },
     }
@@ -149,6 +150,7 @@ fn serverProcessHandshake(
     payload: []const u8,
     psk: types.Psk,
     cookie_secret: [32]u8,
+    cookie_secret_prev: [32]u8,
     send_buf: []u8,
 ) HandshakeAction {
     const msg = decodeHandshakeMessage(payload) orelse
@@ -158,7 +160,7 @@ fn serverProcessHandshake(
         .idle, .expect_client_hello, .cookie_sent => {
             if (msg.msg_type != .client_hello)
                 return .{ .failed = .unexpected_message };
-            return serverHandleClientHello(session, msg.body, payload, psk, cookie_secret, send_buf);
+            return serverHandleClientHello(session, msg.body, payload, psk, cookie_secret, cookie_secret_prev, send_buf);
         },
         .expect_client_key_exchange => {
             if (msg.msg_type != .client_key_exchange)
@@ -172,6 +174,82 @@ fn serverProcessHandshake(
         },
         else => return .{ .failed = .unexpected_message },
     }
+}
+
+/// Stateless check: is the payload a ClientHello with a valid cookie?
+/// Returns true only if the payload parses as a ClientHello containing a
+/// cookie that passes rotation-aware verification against the peer address.
+/// Used to gate session allocation — no session is created until the cookie
+/// exchange succeeds.
+pub fn isClientHelloWithValidCookie(
+    payload: []const u8,
+    cookie_secret: [32]u8,
+    cookie_secret_prev: [32]u8,
+    peer_addr: std.net.Address,
+) bool {
+    const msg = decodeHandshakeMessage(payload) orelse return false;
+    if (msg.msg_type != .client_hello) return false;
+    const body = msg.body;
+
+    // Parse enough of the ClientHello to extract cookie.
+    var off: usize = 0;
+    if (body.len < 2 + 32 + 1) return false;
+    off += 2; // client_version
+    const client_random: [32]u8 = body[off..][0..32].*;
+    off += 32;
+
+    // session_id
+    if (off >= body.len) return false;
+    const sid_len = body[off];
+    off += 1;
+    if (off + sid_len > body.len) return false;
+    off += sid_len;
+
+    // cookie
+    if (off >= body.len) return false;
+    const cookie_len = body[off];
+    off += 1;
+    if (off + cookie_len > body.len) return false;
+    if (cookie_len == 0) return false;
+    const cookie = body[off..][0..cookie_len];
+
+    return Cookie.verifyWithRotation(cookie_secret, cookie_secret_prev, peer_addr, client_random, cookie);
+}
+
+/// Build a HelloVerifyRequest statelessly (no session required).
+/// Returns the encoded DTLS record slice within `send_buf`, or null if
+/// the payload does not parse as a valid ClientHello.
+pub fn buildStatelessHvr(
+    payload: []const u8,
+    cookie_secret: [32]u8,
+    peer_addr: std.net.Address,
+    send_buf: []u8,
+) ?[]const u8 {
+    const msg = decodeHandshakeMessage(payload) orelse return null;
+    if (msg.msg_type != .client_hello) return null;
+    const body = msg.body;
+
+    if (body.len < 2 + 32 + 1) return null;
+    const client_random: [32]u8 = body[2..34].*;
+
+    const cookie = Cookie.generate(cookie_secret, peer_addr, client_random);
+
+    // HelloVerifyRequest body: server_version(2) + cookie_len(1) + cookie(32)
+    var hvr_body: [35]u8 = undefined;
+    hvr_body[0] = 0xFE; // DTLS 1.2
+    hvr_body[1] = 0xFD;
+    hvr_body[2] = 32;
+    @memcpy(hvr_body[3..35], &cookie);
+
+    var hs_buf: [64]u8 = undefined;
+    const hs_msg = encodeHandshakeMessage(.hello_verify_request, 0, &hvr_body, &hs_buf);
+
+    var record_buf: [128]u8 = undefined;
+    var seq: u48 = 0;
+    const rec = Record.encodePlaintext(.handshake, hs_msg, &seq, &record_buf);
+    if (rec.len > send_buf.len) return null;
+    @memcpy(send_buf[0..rec.len], rec);
+    return send_buf[0..rec.len];
 }
 
 fn serverProcessCcs(
@@ -196,6 +274,7 @@ fn serverHandleClientHello(
     full_hs_msg: []const u8,
     psk: types.Psk,
     cookie_secret: [32]u8,
+    cookie_secret_prev: [32]u8,
     send_buf: []u8,
 ) HandshakeAction {
     // Parse ClientHello body:
@@ -233,8 +312,8 @@ fn serverHandleClientHello(
         return serverSendHelloVerifyRequest(session, client_random, cookie_secret, send_buf);
     }
 
-    // Verify cookie.
-    if (!Cookie.verify(cookie_secret, session.addr, client_random, cookie)) {
+    // Verify cookie against current and previous secrets (rotation-safe).
+    if (!Cookie.verifyWithRotation(cookie_secret, cookie_secret_prev, session.addr, client_random, cookie)) {
         return serverSendHelloVerifyRequest(session, client_random, cookie_secret, send_buf);
     }
 
@@ -861,7 +940,7 @@ test "full server handshake" {
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_hello, 0, ch_body_buf[0..ch_len], &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
         switch (action) {
             .send => |data| {
                 try testing.expect(data.len > 0);
@@ -886,7 +965,7 @@ test "full server handshake" {
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_hello, 0, ch_body_buf[0..ch_len], &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
         switch (action) {
             .send => |data| {
                 try testing.expect(data.len > 0);
@@ -906,14 +985,14 @@ test "full server handshake" {
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_key_exchange, 1, cke_body[0 .. 2 + psk_identity.len], &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
         try testing.expectEqual(HandshakeAction.none, action);
         try testing.expectEqual(Session.ServerHandshakeState.expect_change_cipher_spec, server_session.handshake_state);
     }
 
     // Step 4: ChangeCipherSpec
     {
-        const action = serverProcessMessage(&server_session, .change_cipher_spec, &[_]u8{0x01}, psk, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .change_cipher_spec, &[_]u8{0x01}, psk, cookie_secret, cookie_secret, &send_buf);
         try testing.expectEqual(HandshakeAction.none, action);
         try testing.expectEqual(Session.ServerHandshakeState.expect_finished, server_session.handshake_state);
         try testing.expectEqual(@as(u16, 1), server_session.read_epoch);
@@ -932,7 +1011,7 @@ test "full server handshake" {
         var hs_buf: [64]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.finished, 2, &client_verify, &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
         switch (action) {
             .send => |data| {
                 try testing.expect(data.len > 0);
@@ -975,7 +1054,7 @@ test "full client-server handshake integration" {
     // Server processes ClientHello → HelloVerifyRequest
     {
         const rec = Record.decodePlaintext(client_data) orelse return error.TestUnexpectedNull;
-        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, &send_buf2);
+        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
         switch (action) {
             .send => |data| {
                 // Client processes HVR
@@ -1001,7 +1080,7 @@ test "full client-server handshake integration" {
     var server_flight: []const u8 = undefined;
     {
         const rec = Record.decodePlaintext(client_data) orelse return error.TestUnexpectedNull;
-        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, &send_buf2);
+        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
         switch (action) {
             .send => |data| server_flight = data,
             else => return error.TestUnexpectedResult,
@@ -1050,7 +1129,7 @@ test "full client-server handshake integration" {
                                 srv_off += srv_total;
                                 continue;
                             };
-                            _ = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, &send_buf2);
+                            _ = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
                         } else {
                             // Encrypted record (Finished).
                             var pt_buf: [256]u8 = undefined;
@@ -1065,7 +1144,7 @@ test "full client-server handshake integration" {
                                 srv_off += srv_total;
                                 continue;
                             };
-                            const srv_action = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, &send_buf2);
+                            const srv_action = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
                             switch (srv_action) {
                                 .send => |srv_resp| {
                                     // Server sends CCS + Finished back. Feed to client.
