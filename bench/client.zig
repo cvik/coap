@@ -20,6 +20,12 @@ const Config = struct {
     window_size: u16 = 256,
     embedded_server: bool = true,
     thread_count: u16 = 1,
+    use_dtls: bool = false,
+};
+
+const bench_psk: coap.Psk = .{
+    .identity = "bench",
+    .key = "0123456789abcdef",
 };
 
 pub fn main() !void {
@@ -37,8 +43,18 @@ pub fn main() !void {
     };
 
     if (config.embedded_server) {
-        server_pid = try fork_server(config.port, config.thread_count);
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        const psk: ?coap.Psk = if (config.use_dtls) bench_psk else null;
+        server_pid = try fork_server(config.port, config.thread_count, psk);
+        std.Thread.sleep(150 * std.time.ns_per_ms);
+    }
+
+    // DTLS benchmark path: sequential CON requests via coap.Client.
+    if (config.use_dtls) {
+        const dtls_port: u16 = if (config.port == 5683) 5684 else config.port;
+        var result = try run_dtls_bench(allocator, config, dtls_port);
+        defer if (result.latencies.len > 0) allocator.free(result.latencies);
+        report(config, &result, result.elapsed_ns);
+        return;
     }
 
     // Build the request template.
@@ -179,6 +195,8 @@ pub fn main() !void {
         .latency_sum_ns = 0,
         .latencies = main_result.latencies,
         .latency_count = main_result.latency_count,
+        .elapsed_ns = elapsed_ns,
+        .handshake_ns = null,
     };
 
     // Merge latencies into a single sorted array for percentiles.
@@ -280,18 +298,22 @@ fn echo_handler(request: coap.Request) ?coap.Response {
     return coap.Response.ok(request.payload());
 }
 
-fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
+fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // Child process: run the echo server.
+        // When PSK is set, bind on the DTLS port (5684) as well as plain (5683).
+        // The server config port field is used — caller passes the right port.
+        const bind_port: u16 = if (psk != null) 5684 else port;
         var server = coap.Server.init(
             std.heap.page_allocator,
             .{
-                .port = port,
+                .port = bind_port,
                 .buffer_count = 512,
                 .buffer_size = 1280,
                 .thread_count = thread_count,
                 .rate_limit_ip_count = 0,
+                .psk = psk,
             },
             echo_handler,
         ) catch std.process.exit(1);
@@ -299,6 +321,95 @@ fn fork_server(port: u16, thread_count: u16) !posix.pid_t {
         unreachable;
     }
     return pid;
+}
+
+/// DTLS benchmark: single coap.Client, sequential CON GET requests.
+/// Returns a BenchResult with handshake_ns populated.
+fn run_dtls_bench(
+    allocator: std.mem.Allocator,
+    config: Config,
+    port: u16,
+) !BenchResult {
+    const count = config.request_count;
+    const warmup = config.warmup_count;
+
+    std.debug.print(
+        "benchmarking DTLS: {d} requests (payload={d}B, CON, port={d})...\n",
+        .{ count, config.payload_size, port },
+    );
+
+    var client = try coap.Client.init(allocator, .{
+        .host = config.host,
+        .port = port,
+        .psk = bench_psk,
+    });
+    defer client.deinit();
+
+    // Measure handshake latency.
+    const hs_start = std.time.nanoTimestamp();
+    try client.handshake();
+    const handshake_ns = std.time.nanoTimestamp() - hs_start;
+    std.debug.print("  handshake: {d:.2} ms\n", .{
+        @as(f64, @floatFromInt(handshake_ns)) / 1e6,
+    });
+
+    // Build payload.
+    const payload = try allocator.alloc(u8, config.payload_size);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    // Warmup.
+    if (warmup > 0) {
+        std.debug.print("  warming up ({d} requests)...\n", .{warmup});
+        for (0..warmup) |_| {
+            const r = client.call(allocator, .get, &.{}, payload) catch continue;
+            r.deinit(allocator);
+        }
+    }
+
+    // Timed benchmark.
+    const latencies = try allocator.alloc(i64, count);
+    var result = BenchResult{
+        .sent = 0,
+        .received = 0,
+        .bytes_sent = 0,
+        .bytes_received = 0,
+        .errors = 0,
+        .latency_min_ns = std.math.maxInt(i128),
+        .latency_max_ns = 0,
+        .latency_sum_ns = 0,
+        .latencies = latencies,
+        .latency_count = 0,
+        .handshake_ns = handshake_ns,
+    };
+
+    const bench_start = std.time.nanoTimestamp();
+
+    for (0..count) |_| {
+        const req_start = std.time.nanoTimestamp();
+        const r = client.call(allocator, .get, &.{}, payload) catch {
+            result.errors += 1;
+            result.sent += 1;
+            continue;
+        };
+        const latency = std.time.nanoTimestamp() - req_start;
+        r.deinit(allocator);
+
+        result.sent += 1;
+        result.received += 1;
+        result.bytes_sent += 4 + payload.len;
+        result.bytes_received += 4;
+        result.latency_sum_ns += latency;
+        if (latency < result.latency_min_ns) result.latency_min_ns = latency;
+        if (latency > result.latency_max_ns) result.latency_max_ns = latency;
+        if (result.latency_count < count) {
+            result.latencies[result.latency_count] = @intCast(latency);
+            result.latency_count += 1;
+        }
+    }
+
+    result.elapsed_ns = std.time.nanoTimestamp() - bench_start;
+    return result;
 }
 
 const BenchResult = struct {
@@ -312,6 +423,8 @@ const BenchResult = struct {
     latency_sum_ns: i128,
     latencies: []i64,
     latency_count: u32,
+    elapsed_ns: i128 = 0,
+    handshake_ns: ?i128 = null,
 };
 
 fn run_bench(
@@ -480,9 +593,11 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
     const p99 = percentile_us(sorted, 0.99);
     const p999 = percentile_us(sorted, 0.999);
 
+    const mode = if (config.use_dtls) "DTLS/CoAPs" else "CoAP";
+
     std.debug.print(
         \\
-        \\── coap benchmark results ──
+        \\── {s} benchmark results ──
         \\  target:     {s}:{d}
         \\  requests:   {d} sent, {d} received ({d:.1}% loss)
         \\  throughput: {d:.0} req/s
@@ -490,12 +605,11 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
         \\  latency:    avg={d:.1}µs min={d:.1}µs max={d:.1}µs
         \\  percentiles: p50={d:.1}µs p99={d:.1}µs p99.9={d:.1}µs
         \\  bytes:      {d} sent, {d} received
-        \\  window:     {d}
-        \\  threads:    {d} server, {d} client
         \\
     , .{
+        mode,
         config.host,
-        config.port,
+        if (config.use_dtls) @as(u16, 5684) else config.port,
         result.sent,
         result.received,
         if (result.sent > 0)
@@ -513,10 +627,20 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
         p999,
         result.bytes_sent,
         result.bytes_received,
-        config.window_size,
-        config.thread_count,
-        config.thread_count,
     });
+
+    if (result.handshake_ns) |hs_ns| {
+        std.debug.print("  handshake:  {d:.2} ms\n", .{
+            @as(f64, @floatFromInt(hs_ns)) / 1e6,
+        });
+    } else {
+        std.debug.print("  window:     {d}\n  threads:    {d} server, {d} client\n", .{
+            config.window_size,
+            config.thread_count,
+            config.thread_count,
+        });
+    }
+    std.debug.print("\n", .{});
 }
 
 fn parse_args() Config {
@@ -569,6 +693,8 @@ fn parse_args() Config {
                 val,
                 10,
             ) catch 1;
+        } else if (std.mem.eql(u8, arg, "--dtls")) {
+            config.use_dtls = true;
         }
     }
 
