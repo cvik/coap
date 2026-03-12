@@ -43,7 +43,7 @@ pub fn encrypt(plaintext: []const u8, ad: []const u8, nonce: [nonce_len]u8, key:
     ctrEncrypt(aes, nonce, plaintext, out[0..plaintext.len]);
 
     // Step 3: Encrypt the tag with AES-CTR counter 0
-    var ctr0_block: [block_len]u8 = makeCtrBlock(nonce, 0);
+    const ctr0_block: [block_len]u8 = makeCtrBlock(nonce, 0);
     var ctr0_enc: [block_len]u8 = undefined;
     aes.encrypt(&ctr0_enc, &ctr0_block);
     for (0..tag_len) |i| {
@@ -71,7 +71,7 @@ pub fn decrypt(ciphertext_and_tag: []const u8, ad: []const u8, nonce: [nonce_len
     const mac_tag: [block_len]u8 = computeCbcMac(aes, out, ad, nonce);
 
     // Step 3: Decrypt the expected tag using AES-CTR counter 0
-    var ctr0_block: [block_len]u8 = makeCtrBlock(nonce, 0);
+    const ctr0_block: [block_len]u8 = makeCtrBlock(nonce, 0);
     var ctr0_enc: [block_len]u8 = undefined;
     aes.encrypt(&ctr0_enc, &ctr0_block);
     var expected_tag: [tag_len]u8 = undefined;
