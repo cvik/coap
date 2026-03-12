@@ -723,7 +723,7 @@ fn handle_recv(
         if (server.config.psk != null) {
             if (dtls.types.isDtlsContentType(recv.payload[0])) {
                 // DTLS record — handle in dedicated path.
-                server.processDtlsRecord(recv, index);
+                server.process_dtls_record(recv, index);
                 return;
             }
             // PSK configured but not a DTLS record — drop plain CoAP.
@@ -959,7 +959,7 @@ fn handle_recv(
 }
 
 /// Process a DTLS record: handshake, decrypt application data, dispatch to handler.
-fn processDtlsRecord(
+fn process_dtls_record(
     server: *Server,
     recv: Io.RecvResult,
     index: usize,
@@ -977,6 +977,10 @@ fn processDtlsRecord(
     // Look up existing session.
     var session = tbl.lookup(peer);
 
+    // Decode plaintext records early so we can reuse the result and
+    // avoid double-parsing.
+    var plaintext_record: ?dtls.Record.Record = null;
+
     // For epoch 0 records from unknown peers, perform stateless cookie
     // verification before allocating a session. This prevents resource
     // exhaustion from spoofed source addresses (RFC 6347 §4.2.1).
@@ -987,35 +991,43 @@ fn processDtlsRecord(
             log.debug("DTLS: malformed plaintext record", .{});
             return;
         };
+        plaintext_record = record;
 
-        if (record.content_type == .handshake) {
-            if (!dtls.Handshake.isClientHelloWithValidCookie(
+        // Only handshake records with a valid cookie can create sessions.
+        // All other epoch-0 records from unknown peers are dropped.
+        if (record.content_type != .handshake) {
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            log.debug("DTLS: non-handshake epoch-0 from unknown peer, dropping", .{});
+            return;
+        }
+
+        if (!dtls.Handshake.isClientHelloWithValidCookie(
+            record.payload,
+            server.dtls_cookie_secret,
+            server.dtls_cookie_secret_prev,
+            peer,
+        )) {
+            // No cookie or invalid cookie — send stateless HVR without
+            // allocating a session (anti-amplification).
+            const buf = server.response_buf(index);
+            if (dtls.Handshake.buildStatelessHvr(
                 record.payload,
                 server.dtls_cookie_secret,
-                server.dtls_cookie_secret_prev,
                 peer,
-            )) {
-                // No cookie or invalid cookie — send stateless HVR without
-                // allocating a session (anti-amplification).
-                const buf = server.response_buf(index);
-                if (dtls.Handshake.buildStatelessHvr(
-                    record.payload,
-                    server.dtls_cookie_secret,
-                    peer,
-                    buf,
-                )) |hvr| {
-                    release_buffer_robust(&server.io, recv.buffer_id);
-                    server.buffers_outstanding -|= 1;
-                    server.send_data(hvr, peer, index) catch |err| {
-                        log.warn("DTLS stateless HVR send failed: {}", .{err});
-                    };
-                } else {
-                    release_buffer_robust(&server.io, recv.buffer_id);
-                    server.buffers_outstanding -|= 1;
-                    log.debug("DTLS: invalid ClientHello, dropping", .{});
-                }
-                return;
+                buf,
+            )) |hvr| {
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                server.send_data(hvr, peer, index) catch |err| {
+                    log.warn("DTLS stateless HVR send failed: {}", .{err});
+                };
+            } else {
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                log.debug("DTLS: invalid ClientHello, dropping", .{});
             }
+            return;
         }
 
         // Valid cookie — allocate session now.
@@ -1036,8 +1048,8 @@ fn processDtlsRecord(
     };
 
     if (record_epoch == 0) {
-        // Plaintext record (handshake / CCS before encryption).
-        const record = dtls.Record.decodePlaintext(recv.payload) orelse {
+        // Reuse already-parsed record if available, otherwise decode.
+        const record = plaintext_record orelse dtls.Record.decodePlaintext(recv.payload) orelse {
             release_buffer_robust(&server.io, recv.buffer_id);
             server.buffers_outstanding -|= 1;
             log.debug("DTLS: malformed plaintext record", .{});
@@ -1073,7 +1085,7 @@ fn processDtlsRecord(
             },
             .failed => |desc| {
                 log.debug("DTLS handshake failed: {any}", .{desc});
-                server.sendDtlsAlert(sess, .fatal, desc, index, peer);
+                server.send_dtls_alert(sess, .fatal, desc, index, peer);
                 tbl.release(sess);
             },
             .none => {},
@@ -1110,7 +1122,7 @@ fn processDtlsRecord(
 
         switch (record.content_type) {
             .application_data => {
-                server.processDtlsCoap(record.payload, sess, peer, index);
+                server.process_dtls_coap(record.payload, sess, peer, index);
             },
             .alert => {
                 if (record.payload.len >= 2 and record.payload[0] == @intFromEnum(dtls.types.AlertLevel.fatal)) {
@@ -1129,7 +1141,7 @@ fn processDtlsRecord(
 }
 
 /// Parse decrypted application data as CoAP, invoke handler, encrypt and send response.
-fn processDtlsCoap(
+fn process_dtls_coap(
     server: *Server,
     coap_payload: []const u8,
     session: *dtls.Session.Session,
@@ -1208,7 +1220,7 @@ fn processDtlsCoap(
             .data_buf = &.{},
         };
 
-        const wire = server.sendDtlsPacket(session, response_packet, peer, index) catch |err| {
+        const wire = server.send_dtls_packet(session, response_packet, peer, index) catch |err| {
             log.warn("DTLS response send failed: {}", .{err});
             return;
         };
@@ -1220,6 +1232,8 @@ fn processDtlsCoap(
                 if (evicted > 0) {
                     server.last_eviction_ns = server.tick_now_ns;
                     _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
+                } else {
+                    log.warn("exchange pool full ({d} active), cannot cache DTLS response", .{server.exchanges.count_active});
                 }
             }
         }
@@ -1234,7 +1248,7 @@ fn processDtlsCoap(
             .payload = &.{},
             .data_buf = &.{},
         };
-        const wire = server.sendDtlsPacket(session, ack, peer, index) catch |err| {
+        const wire = server.send_dtls_packet(session, ack, peer, index) catch |err| {
             log.warn("DTLS empty ACK send failed: {}", .{err});
             return;
         };
@@ -1245,6 +1259,8 @@ fn processDtlsCoap(
             if (evicted > 0) {
                 server.last_eviction_ns = server.tick_now_ns;
                 _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
+            } else {
+                log.warn("exchange pool full ({d} active), cannot cache DTLS response", .{server.exchanges.count_active});
             }
         }
     }
@@ -1252,7 +1268,14 @@ fn processDtlsCoap(
 
 /// Encode a CoAP packet, encrypt it as a DTLS application_data record, and send.
 /// Returns the encrypted wire data (in the response buffer) for exchange caching.
-fn sendDtlsPacket(
+///
+/// Layout: CoAP plaintext is written at buf[29..] (after record_overhead).
+/// encodeEncrypted writes header at buf[0..13], explicit nonce at buf[13..21],
+/// and ciphertext at buf[21..]. The ciphertext region overlaps the plaintext
+/// start (buf[29]) only after the first 8 bytes of ciphertext. This is safe
+/// because CCM computes the MAC over plaintext first, then ctrEncrypt processes
+/// 16-byte blocks — each block's read completes before overlapping writes occur.
+fn send_dtls_packet(
     server: *Server,
     session: *dtls.Session.Session,
     pkt: coapz.Packet,
@@ -1283,7 +1306,7 @@ fn sendDtlsPacket(
 }
 
 /// Send a DTLS alert record to a peer. For plaintext (epoch 0) alerts.
-fn sendDtlsAlert(
+fn send_dtls_alert(
     server: *Server,
     session: *dtls.Session.Session,
     level: dtls.types.AlertLevel,
