@@ -34,6 +34,8 @@ pub const Request = struct {
     /// Use for temporary allocations needed during response construction
     /// (e.g. duping option slices via `Response.content()`).
     arena: std.mem.Allocator,
+    /// True when the request arrived over a DTLS-secured transport (CoAPs).
+    is_secure: bool = false,
 
     /// Request method (`.get`, `.post`, `.put`, `.delete`, …).
     pub inline fn method(self: Request) coapz.Code {
