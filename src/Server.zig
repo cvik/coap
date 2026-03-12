@@ -958,7 +958,8 @@ fn handle_recv(
     }
 }
 
-/// Process a DTLS record: handshake, decrypt application data, dispatch to handler.
+/// Process a DTLS datagram: may contain multiple records (a flight).
+/// Handles handshake, decrypt application data, dispatch to handler.
 fn process_dtls_record(
     server: *Server,
     recv: Io.RecvResult,
@@ -968,7 +969,7 @@ fn process_dtls_record(
     const tbl = server.dtls_sessions.?;
     const peer = recv.peer_address;
 
-    // Determine epoch from record header (bytes 3-4 big-endian).
+    // Determine epoch from first record header (bytes 3-4 big-endian).
     const record_epoch = if (recv.payload.len >= 5)
         std.mem.readInt(u16, recv.payload[3..5], .big)
     else
@@ -976,10 +977,6 @@ fn process_dtls_record(
 
     // Look up existing session.
     var session = tbl.lookup(peer);
-
-    // Decode plaintext records early so we can reuse the result and
-    // avoid double-parsing.
-    var plaintext_record: ?dtls.Record.Record = null;
 
     // For epoch 0 records from unknown peers, perform stateless cookie
     // verification before allocating a session. This prevents resource
@@ -991,7 +988,6 @@ fn process_dtls_record(
             log.debug("DTLS: malformed plaintext record", .{});
             return;
         };
-        plaintext_record = record;
 
         // Only handshake records with a valid cookie can create sessions.
         // All other epoch-0 records from unknown peers are dropped.
@@ -1047,95 +1043,148 @@ fn process_dtls_record(
         return;
     };
 
-    if (record_epoch == 0) {
-        // Reuse already-parsed record if available, otherwise decode.
-        const record = plaintext_record orelse dtls.Record.decodePlaintext(recv.payload) orelse {
-            release_buffer_robust(&server.io, recv.buffer_id);
-            server.buffers_outstanding -|= 1;
-            log.debug("DTLS: malformed plaintext record", .{});
-            return;
-        };
+    // Copy datagram to stack before releasing the recv buffer, so we can
+    // iterate through multiple records without the buffer being reused.
+    var dgram_buf: [constants.buffer_size_default]u8 = undefined;
+    const dgram_len = @min(recv.payload.len, dgram_buf.len);
+    @memcpy(dgram_buf[0..dgram_len], recv.payload[0..dgram_len]);
+    const dgram = dgram_buf[0..dgram_len];
 
-        const buf = server.response_buf(index);
-        const action = dtls.Handshake.serverProcessMessage(
-            sess,
-            record.content_type,
-            record.payload,
-            psk,
-            server.dtls_cookie_secret,
-            server.dtls_cookie_secret_prev,
-            buf,
-        );
+    release_buffer_robust(&server.io, recv.buffer_id);
+    server.buffers_outstanding -|= 1;
 
-        // Release recv buffer after processing — record.payload
-        // points into the recv buffer.
-        release_buffer_robust(&server.io, recv.buffer_id);
-        server.buffers_outstanding -|= 1;
+    // Iterate all records in the datagram.
+    var off: usize = 0;
+    while (off < dgram.len) {
+        const remaining = dgram[off..];
+        if (remaining.len < dtls.types.record_header_len) break;
 
-        switch (action) {
-            .send => |data| {
-                tbl.promote(sess, server.tick_now_ns);
-                server.send_data(data, peer, index) catch |err| {
-                    log.warn("DTLS handshake send failed: {}", .{err});
+        const rec_len = std.mem.readInt(u16, remaining[11..13], .big);
+        const total_rec = dtls.types.record_header_len + rec_len;
+        if (remaining.len < total_rec) break;
+
+        const rec_data = remaining[0..total_rec];
+        const rec_epoch = std.mem.readInt(u16, rec_data[3..5], .big);
+
+        off += total_rec;
+
+        if (rec_epoch == 0) {
+            const record = dtls.Record.decodePlaintext(rec_data) orelse continue;
+
+            const buf = server.response_buf(index);
+            const action = dtls.Handshake.serverProcessMessage(
+                sess,
+                record.content_type,
+                record.payload,
+                psk,
+                server.dtls_cookie_secret,
+                server.dtls_cookie_secret_prev,
+                buf,
+            );
+
+            switch (action) {
+                .send => |data| {
+                    tbl.promote(sess, server.tick_now_ns);
+                    server.send_data(data, peer, index) catch |err| {
+                        log.warn("DTLS handshake send failed: {}", .{err});
+                    };
+                },
+                .established => {
+                    tbl.promote(sess, server.tick_now_ns);
+                    log.debug("DTLS session established: {any}", .{peer});
+                },
+                .failed => |desc| {
+                    log.debug("DTLS handshake failed: {any}", .{desc});
+                    server.send_dtls_alert(sess, .fatal, desc, index, peer);
+                    tbl.release(sess);
+                    return;
+                },
+                .none => {},
+            }
+        } else {
+            // Encrypted record — during handshake this is the Finished message;
+            // for established sessions this is application_data.
+            if (sess.state == .established) {
+                var plaintext_buf: [constants.buffer_size_default]u8 = undefined;
+                const record = dtls.Record.decodeEncrypted(
+                    rec_data,
+                    sess.client_write_key,
+                    sess.client_write_iv,
+                    &sess.replay_window,
+                    &sess.read_sequence,
+                    &plaintext_buf,
+                ) orelse {
+                    log.debug("DTLS: decrypt/auth failed", .{});
+                    continue;
                 };
-            },
-            .established => {
+
                 tbl.promote(sess, server.tick_now_ns);
-                log.debug("DTLS session established: {any}", .{peer});
-            },
-            .failed => |desc| {
-                log.debug("DTLS handshake failed: {any}", .{desc});
-                server.send_dtls_alert(sess, .fatal, desc, index, peer);
-                tbl.release(sess);
-            },
-            .none => {},
-        }
-    } else {
-        // Encrypted record (epoch >= 1) — must be an established session.
-        if (sess.state != .established) {
-            release_buffer_robust(&server.io, recv.buffer_id);
-            server.buffers_outstanding -|= 1;
-            log.debug("DTLS: encrypted record for non-established session", .{});
-            return;
-        }
 
-        var plaintext_buf: [constants.buffer_size_default]u8 = undefined;
-        const record = dtls.Record.decodeEncrypted(
-            recv.payload,
-            sess.client_write_key,
-            sess.client_write_iv,
-            &sess.replay_window,
-            &sess.read_sequence,
-            &plaintext_buf,
-        ) orelse {
-            release_buffer_robust(&server.io, recv.buffer_id);
-            server.buffers_outstanding -|= 1;
-            log.debug("DTLS: decrypt/auth failed", .{});
-            return;
-        };
-
-        // Release recv buffer — plaintext is in stack buffer.
-        release_buffer_robust(&server.io, recv.buffer_id);
-        server.buffers_outstanding -|= 1;
-
-        tbl.promote(sess, server.tick_now_ns);
-
-        switch (record.content_type) {
-            .application_data => {
-                server.process_dtls_coap(record.payload, sess, peer, index);
-            },
-            .alert => {
-                if (record.payload.len >= 2 and record.payload[0] == @intFromEnum(dtls.types.AlertLevel.fatal)) {
-                    log.debug("DTLS: received fatal alert {d}", .{record.payload[1]});
-                    tbl.release(sess);
-                } else if (record.payload.len >= 2 and record.payload[1] == @intFromEnum(dtls.types.AlertDescription.close_notify)) {
-                    log.debug("DTLS: close_notify from peer", .{});
-                    tbl.release(sess);
+                switch (record.content_type) {
+                    .application_data => {
+                        server.process_dtls_coap(record.payload, sess, peer, index);
+                    },
+                    .alert => {
+                        if (record.payload.len >= 2 and record.payload[0] == @intFromEnum(dtls.types.AlertLevel.fatal)) {
+                            log.debug("DTLS: received fatal alert {d}", .{record.payload[1]});
+                            tbl.release(sess);
+                            return;
+                        } else if (record.payload.len >= 2 and record.payload[1] == @intFromEnum(dtls.types.AlertDescription.close_notify)) {
+                            log.debug("DTLS: close_notify from peer", .{});
+                            tbl.release(sess);
+                            return;
+                        }
+                    },
+                    else => {
+                        log.debug("DTLS: unexpected content type in encrypted record: {d}", .{@intFromEnum(record.content_type)});
+                    },
                 }
-            },
-            else => {
-                log.debug("DTLS: unexpected content type in encrypted record: {d}", .{@intFromEnum(record.content_type)});
-            },
+            } else {
+                // Handshaking — encrypted Finished record.
+                var plaintext_buf: [constants.buffer_size_default]u8 = undefined;
+                const record = dtls.Record.decodeEncrypted(
+                    rec_data,
+                    sess.client_write_key,
+                    sess.client_write_iv,
+                    &sess.replay_window,
+                    &sess.read_sequence,
+                    &plaintext_buf,
+                ) orelse {
+                    log.debug("DTLS: decrypt/auth failed (handshake)", .{});
+                    continue;
+                };
+
+                const buf = server.response_buf(index);
+                const action = dtls.Handshake.serverProcessMessage(
+                    sess,
+                    record.content_type,
+                    record.payload,
+                    psk,
+                    server.dtls_cookie_secret,
+                    server.dtls_cookie_secret_prev,
+                    buf,
+                );
+
+                switch (action) {
+                    .send => |data| {
+                        tbl.promote(sess, server.tick_now_ns);
+                        server.send_data(data, peer, index) catch |err| {
+                            log.warn("DTLS handshake send failed: {}", .{err});
+                        };
+                    },
+                    .established => {
+                        tbl.promote(sess, server.tick_now_ns);
+                        log.debug("DTLS session established: {any}", .{peer});
+                    },
+                    .failed => |desc| {
+                        log.debug("DTLS handshake failed: {any}", .{desc});
+                        server.send_dtls_alert(sess, .fatal, desc, index, peer);
+                        tbl.release(sess);
+                        return;
+                    },
+                    .none => {},
+                }
+            }
         }
     }
 }

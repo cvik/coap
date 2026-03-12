@@ -503,6 +503,8 @@ pub fn handshake(client: *Client) !void {
         @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
 
     // Loop: receive server messages, process, send responses.
+    // A single UDP datagram may contain multiple DTLS records (a flight),
+    // so we iterate through all records in each received datagram.
     var pt_buf: [512]u8 = undefined;
     while (client.dtls_client_hs_state != .complete) {
         const now = std.time.nanoTimestamp();
@@ -525,41 +527,56 @@ pub fn handshake(client: *Client) !void {
         // Must be a DTLS record.
         if (data.len < 1 or !dtls.types.isDtlsContentType(data[0])) continue;
 
-        // Decode based on epoch.
-        const epoch = if (data.len >= 5) std.mem.readInt(u16, data[3..5], .big) else 0;
-        const record = if (epoch == 0)
-            dtls.Record.decodePlaintext(data)
-        else
-            dtls.Record.decodeEncrypted(
-                data,
-                sess.server_write_key,
-                sess.server_write_iv,
-                &sess.replay_window,
-                &sess.read_sequence,
-                &pt_buf,
-            );
-        const rec = record orelse continue;
+        // Iterate all records in the datagram.
+        var off: usize = 0;
+        while (off < data.len) {
+            const remaining = data[off..];
+            if (remaining.len < dtls.types.record_header_len) break;
 
-        const hs_action = dtls.Handshake.clientProcessMessage(
-            sess,
-            &client.dtls_client_hs_state,
-            rec.content_type,
-            rec.payload,
-            psk,
-            &send_buf,
-        );
-        switch (hs_action) {
-            .send => |sdata| {
-                last_flight = sdata;
-                try client.sendDirect(sdata);
-                // Reset retransmit timer on new flight.
-                retransmit_timeout_ms = constants.dtls_retransmit_initial_ms;
-                retransmit_deadline_ns = std.time.nanoTimestamp() +
-                    @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
-            },
-            .established => return,
-            .failed => return error.HandshakeFailed,
-            .none => {},
+            const rec_len = std.mem.readInt(u16, remaining[11..13], .big);
+            const total_rec = dtls.types.record_header_len + rec_len;
+            if (remaining.len < total_rec) break;
+
+            const rec_data = remaining[0..total_rec];
+            const epoch = std.mem.readInt(u16, rec_data[3..5], .big);
+
+            const record = if (epoch == 0)
+                dtls.Record.decodePlaintext(rec_data)
+            else
+                dtls.Record.decodeEncrypted(
+                    rec_data,
+                    sess.server_write_key,
+                    sess.server_write_iv,
+                    &sess.replay_window,
+                    &sess.read_sequence,
+                    &pt_buf,
+                );
+
+            off += total_rec;
+
+            const rec = record orelse continue;
+
+            const hs_action = dtls.Handshake.clientProcessMessage(
+                sess,
+                &client.dtls_client_hs_state,
+                rec.content_type,
+                rec.payload,
+                psk,
+                &send_buf,
+            );
+            switch (hs_action) {
+                .send => |sdata| {
+                    last_flight = sdata;
+                    try client.sendDirect(sdata);
+                    // Reset retransmit timer on new flight.
+                    retransmit_timeout_ms = constants.dtls_retransmit_initial_ms;
+                    retransmit_deadline_ns = std.time.nanoTimestamp() +
+                        @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+                },
+                .established => return,
+                .failed => return error.HandshakeFailed,
+                .none => {},
+            }
         }
     }
 }
