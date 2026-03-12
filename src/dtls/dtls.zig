@@ -17,4 +17,5 @@ test {
     _ = Record;
     _ = Session;
     _ = Handshake;
+    _ = @import("integration_test.zig");
 }
