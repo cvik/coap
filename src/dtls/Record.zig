@@ -39,6 +39,7 @@ fn writeHeader(
     sequence_number: u48,
     length: u16,
 ) void {
+    std.debug.assert(out.len >= types.record_header_len);
     out[0] = @intFromEnum(content_type);
     // Version: DTLS 1.2 = 0xFE 0xFD
     out[1] = 0xFE;
@@ -48,16 +49,30 @@ fn writeHeader(
     std.mem.writeInt(u16, out[11..13], length, .big);
 }
 
+/// Build the 13-byte additional data for AEAD (RFC 5246 §6.2.3.3).
+/// Layout: seq_num(8) || type(1) || version(2) || length(2)
+/// where seq_num = epoch(2) || sequence_number(6) for DTLS.
+fn buildAd(epoch: u16, seq: u48, content_type: types.ContentType, plaintext_len: u16) [types.record_header_len]u8 {
+    var ad: [types.record_header_len]u8 = undefined;
+    std.mem.writeInt(u16, ad[0..2], epoch, .big);
+    std.mem.writeInt(u48, ad[2..8], seq, .big);
+    ad[8] = @intFromEnum(content_type);
+    ad[9] = 0xFE; // DTLS 1.2
+    ad[10] = 0xFD;
+    std.mem.writeInt(u16, ad[11..13], plaintext_len, .big);
+    return ad;
+}
+
 /// Build the 8-byte explicit nonce: epoch(2) || seq(6), both big-endian.
-fn buildExplicitNonce(epoch: u16, seq: u48) [8]u8 {
-    var en: [8]u8 = undefined;
+fn buildExplicitNonce(epoch: u16, seq: u48) [types.explicit_nonce_len]u8 {
+    var en: [types.explicit_nonce_len]u8 = undefined;
     std.mem.writeInt(u16, en[0..2], epoch, .big);
-    std.mem.writeInt(u48, en[2..8], seq, .big);
+    std.mem.writeInt(u48, en[2..types.explicit_nonce_len], seq, .big);
     return en;
 }
 
 /// Build the 12-byte nonce for CCM: implicit_iv(4) || explicit_nonce(8).
-fn buildNonce(implicit_iv: [4]u8, explicit_nonce: [8]u8) [12]u8 {
+fn buildNonce(implicit_iv: [4]u8, explicit_nonce: [types.explicit_nonce_len]u8) [12]u8 {
     var nonce: [12]u8 = undefined;
     @memcpy(nonce[0..4], &implicit_iv);
     @memcpy(nonce[4..12], &explicit_nonce);
@@ -90,19 +105,6 @@ fn replayCheck(seq: u48, window: *u64, max_seq: *u48) bool {
     return true;
 }
 
-/// Undo a replay window update when decryption fails.
-fn replayUndo(seq: u48, window: *u64, max_seq: *u48) void {
-    if (seq == max_seq.*) {
-        // Was the new max — can't easily undo the shift.
-        return;
-    }
-    const diff = max_seq.* - seq;
-    if (diff < 64) {
-        const bit: u64 = @as(u64, 1) << @intCast(diff);
-        window.* &= ~bit;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -116,6 +118,7 @@ pub fn encodePlaintext(
     sequence_number: *u48,
     out: []u8,
 ) []const u8 {
+    std.debug.assert(payload.len <= std.math.maxInt(u16));
     const total = types.record_header_len + payload.len;
     std.debug.assert(out.len >= total);
 
@@ -138,6 +141,7 @@ pub fn encodeEncrypted(
     sequence_number: *u48,
     out: []u8,
 ) []const u8 {
+    std.debug.assert(plaintext.len + types.encryption_overhead <= std.math.maxInt(u16));
     const ciphertext_and_tag_len = plaintext.len + types.ccm8_tag_len;
     const record_len = types.explicit_nonce_len + ciphertext_and_tag_len;
     const total = types.record_header_len + record_len;
@@ -152,11 +156,10 @@ pub fn encodeEncrypted(
     writeHeader(out, content_type, epoch, seq, @intCast(record_len));
 
     // Write explicit nonce.
-    @memcpy(out[types.record_header_len..][0..8], &explicit_nonce);
+    @memcpy(out[types.record_header_len..][0..types.explicit_nonce_len], &explicit_nonce);
 
-    // Build AD: same 13-byte header but with plaintext length in the length field.
-    var ad: [types.record_header_len]u8 = undefined;
-    writeHeader(&ad, content_type, epoch, seq, @intCast(plaintext.len));
+    // Build AD with plaintext length (RFC 5246 §6.2.3.3 ordering).
+    const ad = buildAd(epoch, seq, content_type, @intCast(plaintext.len));
 
     // Encrypt into out after the explicit nonce.
     const ct_slice = out[types.record_header_len + types.explicit_nonce_len ..][0..ciphertext_and_tag_len];
@@ -204,23 +207,28 @@ pub fn decodeEncrypted(
     if (buf.len < end) return null;
 
     const record_body = buf[types.record_header_len..end];
-    const explicit_nonce: [8]u8 = record_body[0..8].*;
+    const explicit_nonce: [types.explicit_nonce_len]u8 = record_body[0..types.explicit_nonce_len].*;
     const ct_and_tag = record_body[types.explicit_nonce_len..];
     const plaintext_len = ct_and_tag.len - types.ccm8_tag_len;
 
     if (plaintext_buf.len < plaintext_len) return null;
 
+    // Save replay state for rollback on auth failure.
+    const saved_window = replay_window.*;
+    const saved_max_seq = max_seq.*;
+
     // Anti-replay check.
     if (!replayCheck(hdr.sequence_number, replay_window, max_seq)) return null;
 
-    // Build AD with plaintext length.
-    var ad: [types.record_header_len]u8 = undefined;
-    writeHeader(&ad, hdr.content_type, hdr.epoch, hdr.sequence_number, @intCast(plaintext_len));
+    // Build AD with plaintext length (RFC 5246 §6.2.3.3 ordering).
+    const ad = buildAd(hdr.epoch, hdr.sequence_number, hdr.content_type, @intCast(plaintext_len));
 
     const nonce = buildNonce(read_iv, explicit_nonce);
     const out_slice = plaintext_buf[0..plaintext_len];
     Ccm.decrypt(ct_and_tag, &ad, nonce, read_key, out_slice) catch {
-        replayUndo(hdr.sequence_number, replay_window, max_seq);
+        // Auth failed — restore replay window state.
+        replay_window.* = saved_window;
+        max_seq.* = saved_max_seq;
         return null;
     };
 
