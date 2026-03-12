@@ -8,6 +8,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - Multi-threaded via SO_REUSEPORT (no shared state between threads)
 - Per-IP rate limiting with token bucket and three-level load shedding
 - .well-known/core resource discovery (RFC 6690)
+- DTLS 1.2 PSK security (RFC 6347) with AES-128-CCM-8
 - Simple handler interface: `fn(Request) ?Response`
 - Context handlers and error-handling wrappers (`safeWrap`)
 - ~840K req/s single-threaded, ~2.8M req/s multi-threaded on loopback
@@ -18,6 +19,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - Transparent Block2 response reassembly
 - Block1 segmented upload (RFC 7959)
 - Observe subscriptions (RFC 7641)
+- DTLS 1.2 PSK handshake and encrypted transport
 - Pre-allocated in-flight tracking, zero hot-path allocations
 
 ## Quick Start
@@ -70,6 +72,37 @@ pub fn main() !void {
     std.debug.print("response: {s}\n", .{result.payload});
 }
 ```
+
+### Server with DTLS
+
+Pass PSK credentials to enable DTLS automatically. The server binds on port
+5684 (CoAPS) and requires a valid DTLS handshake before accepting requests.
+
+```zig
+var server = try coap.Server.init(allocator, .{
+    .psk = .{ .identity = "device1", .key = "supersecretkey1!" },
+}, handler);
+defer server.deinit();
+try server.run();
+```
+
+### Client with DTLS
+
+```zig
+var client = try coap.Client.init(allocator, .{
+    .host = "10.0.0.1",
+    .psk = .{ .identity = "device1", .key = "supersecretkey1!" },
+});
+defer client.deinit();
+
+try client.handshake();
+
+const result = try client.get(allocator, "/temperature");
+defer result.deinit(allocator);
+```
+
+All send/recv methods automatically encrypt/decrypt after `handshake()`.
+Handlers can check `request.is_secure` to distinguish DTLS from plain requests.
 
 ## Installation
 
@@ -494,6 +527,33 @@ When `null` (default), no affinity is set — the OS schedules threads
 freely. If pinning fails (e.g., core ID out of range or insufficient
 permissions), a warning is logged and the thread continues unpinned.
 
+### `psk`
+
+PSK credentials for DTLS 1.2 (RFC 6347). When set, the server requires a
+DTLS handshake before accepting CoAP requests. Uses
+`TLS_PSK_WITH_AES_128_CCM_8` (the mandatory cipher suite for CoAP, per
+RFC 7252 §9). The port auto-switches to 5684 (CoAPS) if the default 5683
+was configured.
+
+```zig
+var server = try coap.Server.init(allocator, .{
+    .psk = .{ .identity = "device1", .key = "supersecretkey1!" },
+}, handler);
+```
+
+When `null` (default), no DTLS — plain CoAP over UDP.
+
+### `dtls_session_count`
+
+Maximum concurrent DTLS sessions. Each session holds handshake state and
+encryption keys. Sessions are evicted LRU when the table is full.
+Default: `65536`.
+
+### `dtls_session_timeout_s`
+
+Idle DTLS session timeout in seconds. Sessions with no activity for this
+duration are evicted. Default: `300` (5 minutes).
+
 ## Rate Limiting
 
 coap includes per-IP token bucket rate limiting, activated when the server
@@ -592,12 +652,25 @@ Echo server on loopback, minimal CoAP NON GET (6 bytes):
 | p50 / p99 / p99.9 | 286µs / 750µs / 1766µs |
 | Packet loss | 0% |
 
+**DTLS** (`--dtls --count 1000 --warmup 100`):
+
+| Metric | Value |
+|--------|-------|
+| Handshake | ~1.8ms |
+| Throughput | ~1,800 req/s |
+| Avg latency | ~558µs |
+| p50 / p99 / p99.9 | ~559µs / ~586µs / ~612µs |
+
+DTLS uses sequential CON requests through `coap.Client` (no pipelining),
+so throughput reflects per-request encryption overhead. The handshake
+completes in a single round-trip on loopback.
+
 Loopback numbers are bottlenecked by the kernel's UDP stack. With a real
 NIC and RSS distributing across queues, throughput scales further with
 core count.
 
 Benchmark options: `--count`, `--window`, `--payload`, `--con`,
-`--threads`, `--warmup`, `--no-server`, `--host`, `--port`.
+`--threads`, `--warmup`, `--no-server`, `--host`, `--port`, `--dtls`.
 
 ## Requirements
 
@@ -613,6 +686,7 @@ Benchmark options: `--count`, `--window`, `--payload`, `--con`,
 - [x] .well-known/core resource discovery (RFC 6690)
 - [x] Per-IP rate limiting and load shedding
 - [x] Client library (cast, call, observe, block transfer)
+- [x] DTLS 1.2 PSK security (RFC 6347)
 - [ ] Routing
 
 ## License

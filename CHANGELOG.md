@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0] - 2026-03-12
+- DTLS 1.2 PSK security (RFC 6347) for server and client
+- TLS_PSK_WITH_AES_128_CCM_8 cipher suite (RFC 7252 §9 mandatory)
+- Pure Zig AES-128-CCM-8 AEAD and TLS 1.2 PRF implementation
+- Stateless cookie exchange for anti-amplification (RFC 6347 §4.2.1)
+- Pre-allocated session table with O(1) LRU eviction
+- Anti-replay sliding window (64-bit, RFC 6347 §4.1.2.6)
+- Client DTLS handshake with RFC 6347 §4.2.4 retransmission
+- Auto port switching to 5684 (CoAPS) when PSK configured
+- Wire discrimination: DTLS vs plain CoAP on same server
+- Request.is_secure flag for handler-level security detection
+- Benchmark --dtls flag for DTLS throughput measurement
+
 ## [0.2.6] - 2026-03-12
 - Server: peer-based exchange eviction on new CON request from same address
 - Server: configurable `exchange_lifetime_ms` option (default: RFC 7252 derived)
