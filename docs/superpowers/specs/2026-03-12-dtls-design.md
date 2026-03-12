@@ -42,7 +42,9 @@ authentication, built on `std.crypto.core.aes.Aes128`.
 
 Parameters:
 - Key: 16 bytes (AES-128)
-- Nonce: 12 bytes (4-byte implicit IV XOR 8-byte explicit from record header)
+- Nonce: 12 bytes = implicit_iv (4 bytes from key material) || explicit_nonce (8 bytes from record)
+  - Per RFC 6655 §3: concatenation, not XOR
+  - The 8-byte explicit nonce (epoch || sequence_number) is transmitted on the wire
 - Tag: 8 bytes (CCM-8)
 
 ```zig
@@ -104,14 +106,18 @@ SequenceNumber:  u48   (6 bytes, per-epoch, monotonic)
 Length:          u16   (payload length, includes 8-byte tag if encrypted)
 ```
 
-Encryption (epoch > 0):
-- Nonce = implicit_iv (4 bytes from key material) XOR (epoch || sequence padded to 12 bytes)
+Encryption (epoch > 0, per RFC 6655 §3 GenericAEADCipher):
+- Nonce = implicit_iv (4 bytes) || explicit_nonce (8 bytes)
+  - explicit_nonce = epoch (2 bytes) || sequence_number (6 bytes), sent on the wire
 - Additional data = 13-byte record header (length field = plaintext length)
-- Output = AES-CCM-8(plaintext, ad, nonce, key) → ciphertext || 8-byte tag
+- Wire format: record_header (13) || explicit_nonce (8) || ciphertext || tag (8)
+- Total overhead: 29 bytes per record (13 header + 8 explicit nonce + 8 tag)
+- Max plaintext per record: buffer_size - 29 (default 1280 - 29 = 1251 bytes)
 
 Anti-replay:
 - 64-bit sliding window for received sequence numbers (RFC 6347 §4.1.2.6)
 - Duplicate or too-old sequence numbers silently dropped
+- Window size is tunable if reordering issues arise in practice
 
 ```zig
 pub const Record = struct {
@@ -125,7 +131,9 @@ pub fn decode(buf: []const u8, session: *const Session) ?Record
 pub fn encode(content_type: ContentType, plaintext: []const u8, session: *Session, out: []u8) []const u8
 ```
 
-No allocations. 21 bytes overhead per record (13 header + 8 tag).
+No allocations. 29 bytes overhead per record (13 header + 8 explicit nonce + 8 tag).
+All DTLS records are bounded by `buffer_size` (default 1280), ensuring they fit within
+the IPv6 minimum MTU without IP fragmentation.
 
 ### Handshake.zig — PSK Handshake State Machine
 
@@ -154,6 +162,7 @@ pub const ServerHandshakeState = enum {
     expect_client_hello,
     cookie_sent,
     expect_client_key_exchange,
+    expect_change_cipher_spec,
     expect_finished,
     complete,
 };
@@ -173,15 +182,28 @@ pub const ClientHandshakeState = enum {
 ```
 
 Cookie mechanism (RFC 6347 §4.2.1):
-- Cookie = HMAC-SHA256(server_secret, client_ip || client_random), truncated to 32 bytes
+- Cookie = HMAC-SHA256(server_secret, client_ip || client_random)
 - Server secret rotates periodically (default 300s)
 - Stateless — no session allocated until cookie verified
 - Prevents spoofed-source-IP amplification attacks
+
+Handshake message header (12 bytes, distinct from record header):
+```
+msg_type:        u8   (client_hello=1, server_hello=2, etc.)
+length:          u24  (total message body length)
+message_seq:     u16  (handshake-level sequence, NOT record sequence)
+fragment_offset: u24
+fragment_length: u24
+```
+- `message_seq` is a separate counter from the record layer sequence number
+- Retransmitted handshake messages reuse the same `message_seq`
+- Receiver deduplicates by `message_seq`, not record sequence number
 
 Handshake retransmission (RFC 6347 §4.2.4):
 - Initial timeout: 1s, doubles per retransmit, max 60s
 - Max retransmits: 5 (then handshake fails)
 - Timer checks in tick() — iterate handshaking sessions list
+- Flights are identified by `message_seq`, retransmits resend the full flight
 
 Key derivation (PSK, RFC 4279 §2):
 - Pre-master secret: `<2-byte len><zeroes of PSK length><2-byte len><PSK bytes>`
@@ -193,11 +215,34 @@ Finished message:
 - verify_data = PRF(master, label, SHA256(all_handshake_messages))[0..12]
 - Requires incremental SHA-256 hash of all handshake message bodies
 
+ChangeCipherSpec handling:
+- CCS is a single-byte record (content type 20, payload `0x01`)
+- CCS itself is sent/received under the current (old) epoch
+- On sending CCS: increment write_epoch, reset write_sequence to 0, activate write keys
+- On receiving CCS: increment read_epoch, reset read_sequence to 0, activate read keys
+- CCS arriving out of order (before expected) triggers handshake failure
+
+Alert protocol:
+- Send `handshake_failure` (40) on: unknown PSK identity, unexpected message type
+- Send `decrypt_error` (51) on: Finished verify_data mismatch
+- Send `bad_record_mac` (20) on: record decryption/authentication failure
+- Send `close_notify` (0) on: graceful session teardown
+- Received alerts: log, tear down session, release slot
+
+ServerKeyExchange:
+- Sent with psk_identity_hint from config. If config identity is empty, ServerKeyExchange
+  is omitted entirely and client state machine skips to expect ServerHelloDone.
+
 Fragmentation:
 - PSK handshake messages are small (<200 bytes), single-fragment sends
 - Receive-side reassembly supported for interop with peers that fragment
 
-No allocations during handshake. Handshake hash state (~128 bytes) stored in session.
+Re-encoding state for retransmission:
+- Server retransmit flight: server_random, selected cipher suite, psk_identity_hint
+- Client retransmit flight: client_random, cookie, psk_identity
+- These are stored in the session's handshake state during handshake, freed on completion
+
+No allocations during handshake. Handshake hash state (~112 bytes) stored in session.
 Retransmit re-encodes from state rather than buffering the flight.
 
 ### Session.zig — Per-Peer Session Table
@@ -207,8 +252,8 @@ Pre-allocated open-addressed hash table of session slots.
 ```zig
 pub const Session = struct {
     state: State,                    // free, handshaking, established
-    peer_addr: u64,                  // hash of peer address for lookup
-    addr: std.net.Address,           // full peer address
+    peer_addr: u64,                  // hash of peer address for table indexing
+    addr: std.net.Address,           // full peer address for equality check after hash lookup
 
     // Crypto state (epoch 1+)
     client_write_key: [16]u8,
@@ -221,9 +266,13 @@ pub const Session = struct {
     write_sequence: u48,
     replay_window: u64,              // anti-replay bitmask
 
-    // Handshake state
+    // Handshake state (active during handshaking, retained for retransmit re-encoding)
     handshake: HandshakeState,
-    handshake_hash: Sha256,          // incremental hash of handshake messages
+    handshake_hash: Sha256,          // incremental hash (~112 bytes)
+    client_random: [32]u8,           // needed for key derivation + retransmit
+    server_random: [32]u8,           // needed for key derivation + retransmit
+    cookie: [32]u8,                  // client: for retransmit; server: not stored
+    message_seq: u16,                // handshake-level sequence counter
     retransmit_deadline_ns: i64,
     retransmit_count: u8,
     retransmit_timeout_ms: u32,
@@ -241,11 +290,14 @@ pub const Session = struct {
 };
 ```
 
+Estimated size: ~400 bytes per slot. At default 65536 sessions: ~25MB per thread.
+At 100K sessions: ~38MB per thread. Configurable via `dtls_session_count`.
+
 Table operations:
-- **Lookup:** hash peer address → probe table → return `*Session` or null. O(1) average.
+- **Lookup:** hash peer address → probe table → compare full `addr` for equality → return `*Session` or null. O(1) average. Hash is for indexing only; full address comparison prevents collision-based session confusion (security critical).
 - **Allocate:** pop from free list. If empty, evict from LRU tail (check idle timeout first). O(1).
 - **Promote:** on activity, move session to LRU head. O(1).
-- **Release:** zero all key material (`@memset` volatile), push to free list. O(1).
+- **Release:** zero all key material via `std.crypto.utils.secureZero`, push to free list. O(1).
 
 Separate linked-list head for `handshaking` sessions for efficient retransmit timer scan.
 
@@ -266,7 +318,10 @@ Packet processing in `tick()`:
 ```
 recv UDP datagram
   ├─ if no PSK configured → plain CoAP (unchanged)
-  ├─ read ContentType byte
+  ├─ read first byte to discriminate:
+  │    DTLS content types (20-25) → DTLS processing
+  │    CoAP version bits 01 (0x40-0x7F) → drop (PSK configured = DTLS only, no plain CoAP)
+  │    other → drop
   ├─ handshake (22):
   │    ├─ no cookie → HelloVerifyRequest (stateless, no session)
   │    ├─ valid cookie → allocate session, drive state machine
@@ -294,21 +349,32 @@ Retransmit timer check at end of each `tick()` — iterate handshaking sessions 
 
 ```
 init():
-  if psk provided → create socket, perform blocking DTLS handshake, store session
+  create socket (unchanged)
+  if psk provided → store PSK, session state = idle
   else → plain UDP (unchanged)
 
+handshake():
+  drive DTLS handshake via internal tick loop with configurable timeout (default 10s)
+  on success → session state = established
+  on timeout/failure → return error
+
 call()/cast():
-  if session → Record.encode before send
+  if session established → Record.encode before send
   else → plain CoAP send
 
 recv:
-  if session → Record.decode before CoAP parse
+  if session established → Record.decode before CoAP parse
   else → plain CoAP parse
 ```
 
+The handshake is separated from `init()` so the caller controls when it happens.
+`handshake()` runs an internal tick loop (reusing the existing `tickOnce()` pattern)
+and returns once complete or on timeout. The socket remains non-blocking throughout.
+
 Config addition:
 ```zig
-psk: ?Psk = null,    // null = plain UDP
+psk: ?Psk = null,              // null = plain UDP
+handshake_timeout_ms: u32 = 10_000,
 ```
 
 ## Config Summary
@@ -332,6 +398,8 @@ pub const Psk = struct {
     key: []const u8,
 };
 ```
+Both slices must remain valid for the lifetime of the Server/Client.
+The implementation does not copy them.
 
 ## Testing
 
@@ -369,16 +437,18 @@ bits `01` (values 0x40-0x7F). No overlap — single byte distinguishes them.
 
 ## Memory Budget
 
-Per session: ~320 bytes. At default 65536 sessions: ~20MB per thread.
-At 100K sessions: ~30MB per thread. Configurable via `dtls_session_count`.
+Per session: ~400 bytes. At default 65536 sessions: ~25MB per thread.
+At 100K sessions: ~38MB per thread. Configurable via `dtls_session_count`.
 
 ## Security Considerations
 
-- Key material zeroed on session release (volatile memset)
+- Key material zeroed on session release via `std.crypto.utils.secureZero`
 - Cookie exchange prevents amplification attacks
 - Anti-replay window prevents record replay
 - No session allocated until cookie verified (prevents state exhaustion)
 - Server secret rotation with overlap window for cookie continuity
+- Session table lookup uses full address equality after hash indexing (prevents hash collision attacks)
+- When PSK is configured, plain CoAP is rejected (DTLS-only mode)
 
 ## Future Work (Not in Scope)
 
