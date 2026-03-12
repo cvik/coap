@@ -44,14 +44,14 @@ pub fn main() !void {
 
     if (config.embedded_server) {
         const psk: ?coap.Psk = if (config.use_dtls) bench_psk else null;
-        server_pid = try fork_server(config.port, config.thread_count, psk);
+        const server_port: u16 = if (config.use_dtls and config.port == 5683) 5684 else config.port;
+        server_pid = try fork_server(server_port, config.thread_count, psk);
         std.Thread.sleep(150 * std.time.ns_per_ms);
     }
 
     // DTLS benchmark path: sequential CON requests via coap.Client.
     if (config.use_dtls) {
-        const dtls_port: u16 = if (config.port == 5683) 5684 else config.port;
-        var result = try run_dtls_bench(allocator, config, dtls_port);
+        var result = try run_dtls_bench(allocator, config);
         defer if (result.latencies.len > 0) allocator.free(result.latencies);
         report(config, &result, result.elapsed_ns);
         return;
@@ -302,13 +302,10 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // Child process: run the echo server.
-        // When PSK is set, bind on the DTLS port (5684) as well as plain (5683).
-        // The server config port field is used — caller passes the right port.
-        const bind_port: u16 = if (psk != null) 5684 else port;
         var server = coap.Server.init(
             std.heap.page_allocator,
             .{
-                .port = bind_port,
+                .port = port,
                 .buffer_count = 512,
                 .buffer_size = 1280,
                 .thread_count = thread_count,
@@ -328,10 +325,10 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
 fn run_dtls_bench(
     allocator: std.mem.Allocator,
     config: Config,
-    port: u16,
 ) !BenchResult {
     const count = config.request_count;
     const warmup = config.warmup_count;
+    const port: u16 = if (config.port == 5683) 5684 else config.port;
 
     std.debug.print(
         "benchmarking DTLS: {d} requests (payload={d}B, CON, port={d})...\n",
@@ -369,6 +366,7 @@ fn run_dtls_bench(
 
     // Timed benchmark.
     const latencies = try allocator.alloc(i64, count);
+    errdefer allocator.free(latencies);
     var result = BenchResult{
         .sent = 0,
         .received = 0,
@@ -403,7 +401,7 @@ fn run_dtls_bench(
         if (latency < result.latency_min_ns) result.latency_min_ns = latency;
         if (latency > result.latency_max_ns) result.latency_max_ns = latency;
         if (result.latency_count < count) {
-            result.latencies[result.latency_count] = @intCast(latency);
+            result.latencies[result.latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
             result.latency_count += 1;
         }
     }
@@ -609,7 +607,7 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
     , .{
         mode,
         config.host,
-        if (config.use_dtls) @as(u16, 5684) else config.port,
+        if (config.use_dtls and config.port == 5683) @as(u16, 5684) else config.port,
         result.sent,
         result.received,
         if (result.sent > 0)
