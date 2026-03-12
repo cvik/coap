@@ -6,6 +6,7 @@ pub const Ccm = @import("Ccm.zig");
 pub const Prf = @import("Prf.zig");
 pub const Cookie = @import("Cookie.zig");
 pub const Record = @import("Record.zig");
+pub const Session = @import("Session.zig");
 
 test {
     _ = types;
@@ -13,4 +14,5 @@ test {
     _ = Prf;
     _ = Cookie;
     _ = Record;
+    _ = Session;
 }
