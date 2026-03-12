@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.6] - 2026-03-12
+- Server: peer-based exchange eviction on new CON request from same address
+- Server: configurable `exchange_lifetime_ms` option (default: RFC 7252 derived)
+- Exchange: `addr_hash()` and `evict_peer()` for address-only eviction
+
 ## [0.2.5] - 2026-03-11
 - Client: fix double-free of in-flight slot on timeout/reset in call()
 - Server: add 50ms tick timeout so run loop exits on SIGINT without traffic

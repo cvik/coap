@@ -1,6 +1,6 @@
 .{
     .name = .coap,
-    .version = "0.2.5",
+    .version = "0.2.6",
     .minimum_zig_version = "0.15.1",
     .fingerprint = 0x67bf20367bf50f8b,
     .dependencies = .{
