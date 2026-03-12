@@ -7,6 +7,7 @@ pub const Prf = @import("Prf.zig");
 pub const Cookie = @import("Cookie.zig");
 pub const Record = @import("Record.zig");
 pub const Session = @import("Session.zig");
+pub const Handshake = @import("Handshake.zig");
 
 test {
     _ = types;
@@ -15,4 +16,5 @@ test {
     _ = Cookie;
     _ = Record;
     _ = Session;
+    _ = Handshake;
 }
