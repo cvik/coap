@@ -41,3 +41,19 @@ pub const max_rtt_ms: u32 = 2 * max_latency_ms + processing_delay_ms;
 pub const exchange_lifetime_ms: u32 = max_transmit_span_ms +
     2 * max_latency_ms + processing_delay_ms;
 pub const non_lifetime_ms: u32 = max_transmit_span_ms + max_latency_ms;
+
+/// Default CoAPs (DTLS) port per RFC 7252 section 6.2.
+pub const coaps_port_default: u16 = 5684;
+
+/// DTLS handshake retransmit initial timeout (ms).
+pub const dtls_retransmit_initial_ms: u32 = 1_000;
+/// DTLS handshake retransmit max timeout (ms).
+pub const dtls_retransmit_max_ms: u32 = 60_000;
+/// DTLS max handshake retransmit attempts.
+pub const dtls_max_retransmits: u8 = 5;
+/// Default DTLS session idle timeout (seconds).
+pub const dtls_session_timeout_s: u16 = 300;
+/// Default DTLS session table capacity.
+pub const dtls_session_count_default: u32 = 65536;
+/// DTLS cookie server secret rotation interval (seconds).
+pub const dtls_cookie_secret_rotation_s: u16 = 300;

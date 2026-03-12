@@ -30,6 +30,7 @@ const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
+const dtls = @import("dtls/dtls.zig");
 const log = std.log.scoped(.coap);
 
 const Cqe = linux.io_uring_cqe;
@@ -88,6 +89,12 @@ pub const Config = struct {
     /// CPU core IDs for thread pinning. Thread i pins to
     /// cpu_affinity[i % len]. null = no pinning (default).
     cpu_affinity: ?[]const u16 = null,
+    /// PSK credentials for DTLS. null = plain UDP only.
+    psk: ?dtls.types.Psk = null,
+    /// Maximum concurrent DTLS sessions.
+    dtls_session_count: u32 = constants.dtls_session_count_default,
+    /// Idle DTLS session timeout in seconds.
+    dtls_session_timeout_s: u16 = constants.dtls_session_timeout_s,
 };
 
 allocator: std.mem.Allocator,
@@ -134,6 +141,12 @@ tick_now_ns: i64,
 /// Pre-allocated RST buffers for rate-limited/shed CON packets.
 rate_limit_rst: []u8,
 
+// DTLS state.
+dtls_sessions: ?*dtls.Session.SessionTable,
+dtls_cookie_secret: [32]u8,
+dtls_cookie_secret_prev: [32]u8,
+dtls_cookie_rotation_ns: i64,
+
 /// Initialize with a simple handler (no context).
 ///
 /// Pre-allocates all buffers. Returns `error.InvalidConfig` if
@@ -178,10 +191,18 @@ pub fn initContext(
 
 fn init_raw(
     allocator: std.mem.Allocator,
-    config: Config,
+    config_in: Config,
     handler_fn: handler.HandlerFn,
     handler_context: ?*anyopaque,
 ) !Server {
+    var config = config_in;
+
+    // When PSK is configured and the port is still the plain CoAP default,
+    // switch to the CoAPs (DTLS) default port per RFC 7252 §6.2.
+    if (config.psk != null and config.port == constants.port_default) {
+        config.port = constants.coaps_port_default;
+    }
+
     if (config.buffer_count == 0 or
         config.buffer_size < 64 or
         config.port == 0) return error.InvalidConfig;
@@ -245,6 +266,22 @@ fn init_raw(
     }
     errdefer if (rate_limiter) |*rl| rl.deinit(allocator);
 
+    var dtls_sessions: ?*dtls.Session.SessionTable = null;
+    var dtls_cookie_secret: [32]u8 = .{0} ** 32;
+    var dtls_cookie_secret_prev: [32]u8 = .{0} ** 32;
+    if (config.psk != null) {
+        const tbl_ptr = try allocator.create(dtls.Session.SessionTable);
+        errdefer allocator.destroy(tbl_ptr);
+        tbl_ptr.* = try dtls.Session.SessionTable.init(allocator, .{
+            .capacity = config.dtls_session_count,
+            .timeout_s = config.dtls_session_timeout_s,
+        });
+        errdefer tbl_ptr.deinit(allocator);
+        dtls_sessions = tbl_ptr;
+        std.crypto.random.bytes(&dtls_cookie_secret);
+        std.crypto.random.bytes(&dtls_cookie_secret_prev);
+    }
+
     return .{
         .allocator = allocator,
         .io = io,
@@ -275,6 +312,10 @@ fn init_raw(
         .rate_limiter = rate_limiter,
         .tick_now_ns = 0,
         .rate_limit_rst = rate_limit_rst,
+        .dtls_sessions = dtls_sessions,
+        .dtls_cookie_secret = dtls_cookie_secret,
+        .dtls_cookie_secret_prev = dtls_cookie_secret_prev,
+        .dtls_cookie_rotation_ns = 0,
     };
 }
 
@@ -291,6 +332,16 @@ pub fn deinit(server: *Server) void {
     server.allocator.free(server.emergency_ack);
     server.allocator.free(server.rate_limit_rst);
     if (server.rate_limiter) |*rl| rl.deinit(server.allocator);
+    if (server.dtls_sessions) |tbl| {
+        // Zero key material from all active sessions before freeing.
+        for (tbl.slots) |*slot| {
+            if (slot.state != .free) slot.zeroKeys();
+        }
+        tbl.deinit(server.allocator);
+        server.allocator.destroy(tbl);
+    }
+    std.crypto.secureZero(u8, &server.dtls_cookie_secret);
+    std.crypto.secureZero(u8, &server.dtls_cookie_secret_prev);
 }
 
 /// Bind the socket, register buffers, and arm the multishot recv.
@@ -601,6 +652,34 @@ pub fn tick(server: *Server) !void {
         server.last_eviction_ns = server.tick_now_ns;
     }
 
+    // DTLS cookie secret rotation and session timeout eviction.
+    if (server.dtls_sessions) |tbl| {
+        const rotation_ns: i64 = @as(i64, constants.dtls_cookie_secret_rotation_s) * std.time.ns_per_s;
+        if (server.tick_now_ns - server.dtls_cookie_rotation_ns > rotation_ns) {
+            server.dtls_cookie_secret_prev = server.dtls_cookie_secret;
+            std.crypto.random.bytes(&server.dtls_cookie_secret);
+            server.dtls_cookie_rotation_ns = server.tick_now_ns;
+        }
+
+        // Evict timed-out sessions from LRU tail.
+        const timeout_ns: i64 = @as(i64, server.config.dtls_session_timeout_s) * std.time.ns_per_s;
+        var evicted_sessions: u32 = 0;
+        while (tbl.lru_tail != 0xFFFFFFFF) {
+            const tail = &tbl.slots[tbl.lru_tail];
+            if (server.tick_now_ns - tail.last_activity_ns < timeout_ns) break;
+            tbl.release(tail);
+            evicted_sessions += 1;
+        }
+        if (evicted_sessions > 0) {
+            log.debug("evicted {d} timed-out DTLS sessions", .{evicted_sessions});
+        }
+
+        // TODO: scan handshaking sessions for expired retransmit deadlines and
+        // re-send the server's last flight. Currently the server relies on the
+        // client to retransmit, which is sufficient for most cases but not
+        // fully spec-compliant (RFC 6347 §4.2.4).
+    }
+
     // Compute load level based on buffer/exchange pool utilization.
     server.update_load_level();
 
@@ -639,11 +718,25 @@ fn handle_recv(
         @memcpy(&raw_header, recv.payload[0..4]);
     }
 
-    // Drop non-CoAP-v1 packets early.
-    if (recv.payload.len >= 1 and (recv.payload[0] >> 6) != 1) {
-        release_buffer_robust(&server.io, recv.buffer_id);
-        server.buffers_outstanding -|= 1;
-        return;
+    // Wire discrimination: DTLS content types (20-25) vs CoAP v1 (top 2 bits = 01).
+    if (recv.payload.len >= 1) {
+        if (server.config.psk != null) {
+            if (dtls.types.isDtlsContentType(recv.payload[0])) {
+                // DTLS record — handle in dedicated path.
+                server.process_dtls_record(recv, index);
+                return;
+            }
+            // PSK configured but not a DTLS record — drop plain CoAP.
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            return;
+        }
+        // No PSK — drop non-CoAP-v1 packets.
+        if ((recv.payload[0] >> 6) != 1) {
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            return;
+        }
     }
 
     // Load shedding: drop new packets when critically loaded.
@@ -863,6 +956,425 @@ fn handle_recv(
             }
         }
     }
+}
+
+/// Process a DTLS datagram: may contain multiple records (a flight).
+/// Handles handshake, decrypt application data, dispatch to handler.
+fn process_dtls_record(
+    server: *Server,
+    recv: Io.RecvResult,
+    index: usize,
+) void {
+    const psk = server.config.psk.?;
+    const tbl = server.dtls_sessions.?;
+    const peer = recv.peer_address;
+
+    // Determine epoch from first record header (bytes 3-4 big-endian).
+    const record_epoch = if (recv.payload.len >= 5)
+        std.mem.readInt(u16, recv.payload[3..5], .big)
+    else
+        0;
+
+    // Look up existing session.
+    var session = tbl.lookup(peer);
+
+    // For epoch 0 records from unknown peers, perform stateless cookie
+    // verification before allocating a session. This prevents resource
+    // exhaustion from spoofed source addresses (RFC 6347 §4.2.1).
+    if (session == null and record_epoch == 0) {
+        const record = dtls.Record.decodePlaintext(recv.payload) orelse {
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            log.debug("DTLS: malformed plaintext record", .{});
+            return;
+        };
+
+        // Only handshake records with a valid cookie can create sessions.
+        // All other epoch-0 records from unknown peers are dropped.
+        if (record.content_type != .handshake) {
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            log.debug("DTLS: non-handshake epoch-0 from unknown peer, dropping", .{});
+            return;
+        }
+
+        if (!dtls.Handshake.isClientHelloWithValidCookie(
+            record.payload,
+            server.dtls_cookie_secret,
+            server.dtls_cookie_secret_prev,
+            peer,
+        )) {
+            // No cookie or invalid cookie — send stateless HVR without
+            // allocating a session (anti-amplification).
+            const buf = server.response_buf(index);
+            if (dtls.Handshake.buildStatelessHvr(
+                record.payload,
+                server.dtls_cookie_secret,
+                peer,
+                buf,
+            )) |hvr| {
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                server.send_data(hvr, peer, index) catch |err| {
+                    log.warn("DTLS stateless HVR send failed: {}", .{err});
+                };
+            } else {
+                release_buffer_robust(&server.io, recv.buffer_id);
+                server.buffers_outstanding -|= 1;
+                log.debug("DTLS: invalid ClientHello, dropping", .{});
+            }
+            return;
+        }
+
+        // Valid cookie — allocate session now.
+        session = tbl.allocate(peer, server.tick_now_ns) orelse {
+            log.warn("DTLS session table full, dropping packet", .{});
+            release_buffer_robust(&server.io, recv.buffer_id);
+            server.buffers_outstanding -|= 1;
+            return;
+        };
+    }
+
+    // For non-epoch-0 packets from unknown peers, drop.
+    const sess = session orelse {
+        release_buffer_robust(&server.io, recv.buffer_id);
+        server.buffers_outstanding -|= 1;
+        log.debug("DTLS: no session for encrypted record, dropping", .{});
+        return;
+    };
+
+    // Copy datagram to stack before releasing the recv buffer, so we can
+    // iterate through multiple records without the buffer being reused.
+    var dgram_buf: [constants.buffer_size_default]u8 = undefined;
+    const dgram_len = @min(recv.payload.len, dgram_buf.len);
+    @memcpy(dgram_buf[0..dgram_len], recv.payload[0..dgram_len]);
+    const dgram = dgram_buf[0..dgram_len];
+
+    release_buffer_robust(&server.io, recv.buffer_id);
+    server.buffers_outstanding -|= 1;
+
+    // Iterate all records in the datagram.
+    var off: usize = 0;
+    while (off < dgram.len) {
+        const remaining = dgram[off..];
+        if (remaining.len < dtls.types.record_header_len) break;
+
+        const rec_len = std.mem.readInt(u16, remaining[11..13], .big);
+        const total_rec = dtls.types.record_header_len + rec_len;
+        if (remaining.len < total_rec) break;
+
+        const rec_data = remaining[0..total_rec];
+        const rec_epoch = std.mem.readInt(u16, rec_data[3..5], .big);
+
+        off += total_rec;
+
+        if (rec_epoch == 0) {
+            const record = dtls.Record.decodePlaintext(rec_data) orelse continue;
+
+            const buf = server.response_buf(index);
+            const action = dtls.Handshake.serverProcessMessage(
+                sess,
+                record.content_type,
+                record.payload,
+                psk,
+                server.dtls_cookie_secret,
+                server.dtls_cookie_secret_prev,
+                buf,
+            );
+
+            switch (action) {
+                .send => |data| {
+                    tbl.promote(sess, server.tick_now_ns);
+                    server.send_data(data, peer, index) catch |err| {
+                        log.warn("DTLS handshake send failed: {}", .{err});
+                    };
+                },
+                .established => {
+                    tbl.promote(sess, server.tick_now_ns);
+                    log.debug("DTLS session established: {any}", .{peer});
+                },
+                .failed => |desc| {
+                    log.debug("DTLS handshake failed: {any}", .{desc});
+                    server.send_dtls_alert(sess, .fatal, desc, index, peer);
+                    tbl.release(sess);
+                    return;
+                },
+                .none => {},
+            }
+        } else {
+            // Encrypted record — during handshake this is the Finished message;
+            // for established sessions this is application_data.
+            if (sess.state == .established) {
+                var plaintext_buf: [constants.buffer_size_default]u8 = undefined;
+                const record = dtls.Record.decodeEncrypted(
+                    rec_data,
+                    sess.client_write_key,
+                    sess.client_write_iv,
+                    &sess.replay_window,
+                    &sess.read_sequence,
+                    &plaintext_buf,
+                ) orelse {
+                    log.debug("DTLS: decrypt/auth failed", .{});
+                    continue;
+                };
+
+                tbl.promote(sess, server.tick_now_ns);
+
+                switch (record.content_type) {
+                    .application_data => {
+                        server.process_dtls_coap(record.payload, sess, peer, index);
+                    },
+                    .alert => {
+                        if (record.payload.len >= 2 and record.payload[0] == @intFromEnum(dtls.types.AlertLevel.fatal)) {
+                            log.debug("DTLS: received fatal alert {d}", .{record.payload[1]});
+                            tbl.release(sess);
+                            return;
+                        } else if (record.payload.len >= 2 and record.payload[1] == @intFromEnum(dtls.types.AlertDescription.close_notify)) {
+                            log.debug("DTLS: close_notify from peer", .{});
+                            tbl.release(sess);
+                            return;
+                        }
+                    },
+                    else => {
+                        log.debug("DTLS: unexpected content type in encrypted record: {d}", .{@intFromEnum(record.content_type)});
+                    },
+                }
+            } else {
+                // Handshaking — encrypted Finished record.
+                var plaintext_buf: [constants.buffer_size_default]u8 = undefined;
+                const record = dtls.Record.decodeEncrypted(
+                    rec_data,
+                    sess.client_write_key,
+                    sess.client_write_iv,
+                    &sess.replay_window,
+                    &sess.read_sequence,
+                    &plaintext_buf,
+                ) orelse {
+                    log.debug("DTLS: decrypt/auth failed (handshake)", .{});
+                    continue;
+                };
+
+                const buf = server.response_buf(index);
+                const action = dtls.Handshake.serverProcessMessage(
+                    sess,
+                    record.content_type,
+                    record.payload,
+                    psk,
+                    server.dtls_cookie_secret,
+                    server.dtls_cookie_secret_prev,
+                    buf,
+                );
+
+                switch (action) {
+                    .send => |data| {
+                        tbl.promote(sess, server.tick_now_ns);
+                        server.send_data(data, peer, index) catch |err| {
+                            log.warn("DTLS handshake send failed: {}", .{err});
+                        };
+                    },
+                    .established => {
+                        tbl.promote(sess, server.tick_now_ns);
+                        log.debug("DTLS session established: {any}", .{peer});
+                    },
+                    .failed => |desc| {
+                        log.debug("DTLS handshake failed: {any}", .{desc});
+                        server.send_dtls_alert(sess, .fatal, desc, index, peer);
+                        tbl.release(sess);
+                        return;
+                    },
+                    .none => {},
+                }
+            }
+        }
+    }
+}
+
+/// Parse decrypted application data as CoAP, invoke handler, encrypt and send response.
+fn process_dtls_coap(
+    server: *Server,
+    coap_payload: []const u8,
+    session: *dtls.Session.Session,
+    peer: std.net.Address,
+    index: usize,
+) void {
+    const arena = server.arena.allocator();
+
+    const packet = coapz.Packet.read(arena, coap_payload) catch |err| {
+        log.debug("DTLS: malformed CoAP in application_data: {}", .{err});
+        return;
+    };
+
+    if (packet.kind == .reset) return;
+
+    const is_con = packet.kind == .confirmable;
+    const addr_key = Exchange.addr_hash(peer);
+
+    // CON duplicate detection.
+    if (is_con) {
+        const key = Exchange.peer_key(peer, packet.msg_id);
+        if (server.exchanges.find(key)) |slot_idx| {
+            // Duplicate CON — retransmit cached response (already encrypted).
+            const cached = server.exchanges.cached_response(slot_idx);
+            server.send_data(cached, peer, index) catch {};
+            return;
+        }
+        _ = server.exchanges.evict_peer(addr_key);
+    }
+
+    const request = handler.Request{
+        .packet = packet,
+        .peer_address = peer,
+        .arena = arena,
+        .is_secure = true,
+    };
+
+    const maybe_response = blk: {
+        if (server.config.well_known_core) |wkc| {
+            if (is_well_known_core(packet)) {
+                var cf_buf: [2]u8 = undefined;
+                const cf_opt = coapz.Option.content_format(.link_format, &cf_buf);
+                const opts = arena.dupe(coapz.Option, &.{cf_opt}) catch return;
+                break :blk @as(?handler.Response, .{
+                    .code = .content,
+                    .options = opts,
+                    .payload = wkc,
+                });
+            }
+        }
+        const before = if (server.config.handler_warn_ns > 0) std.time.nanoTimestamp() else 0;
+        const result = server.handler_fn(server.handler_context, request);
+        if (server.config.handler_warn_ns > 0) {
+            const after = std.time.nanoTimestamp();
+            const elapsed: u64 = @intCast(@max(0, after - before));
+            if (elapsed > server.config.handler_warn_ns) {
+                log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
+            }
+        }
+        break :blk result;
+    };
+
+    if (maybe_response) |response| {
+        const response_kind: coapz.MessageKind = if (is_con)
+            .acknowledgement
+        else
+            .non_confirmable;
+
+        const response_packet = coapz.Packet{
+            .kind = response_kind,
+            .code = response.code,
+            .msg_id = if (is_con) packet.msg_id else server.nextMsgId(),
+            .token = packet.token,
+            .options = response.options,
+            .payload = response.payload,
+            .data_buf = &.{},
+        };
+
+        const wire = server.send_dtls_packet(session, response_packet, peer, index) catch |err| {
+            log.warn("DTLS response send failed: {}", .{err});
+            return;
+        };
+
+        if (is_con) {
+            const key = Exchange.peer_key(peer, packet.msg_id);
+            if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
+                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                if (evicted > 0) {
+                    server.last_eviction_ns = server.tick_now_ns;
+                    _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
+                } else {
+                    log.warn("exchange pool full ({d} active), cannot cache DTLS response", .{server.exchanges.count_active});
+                }
+            }
+        }
+    } else if (is_con) {
+        // Empty ACK for CON with no handler response.
+        const ack = coapz.Packet{
+            .kind = .acknowledgement,
+            .code = .empty,
+            .msg_id = packet.msg_id,
+            .token = &.{},
+            .options = &.{},
+            .payload = &.{},
+            .data_buf = &.{},
+        };
+        const wire = server.send_dtls_packet(session, ack, peer, index) catch |err| {
+            log.warn("DTLS empty ACK send failed: {}", .{err});
+            return;
+        };
+
+        const key = Exchange.peer_key(peer, packet.msg_id);
+        if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
+            const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+            if (evicted > 0) {
+                server.last_eviction_ns = server.tick_now_ns;
+                _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
+            } else {
+                log.warn("exchange pool full ({d} active), cannot cache DTLS response", .{server.exchanges.count_active});
+            }
+        }
+    }
+}
+
+/// Encode a CoAP packet, encrypt it as a DTLS application_data record, and send.
+/// Returns the encrypted wire data (in the response buffer) for exchange caching.
+///
+/// Layout: CoAP plaintext is written at buf[29..] (after record_overhead).
+/// encodeEncrypted writes header at buf[0..13], explicit nonce at buf[13..21],
+/// and ciphertext at buf[21..]. The ciphertext region overlaps the plaintext
+/// start (buf[29]) only after the first 8 bytes of ciphertext. This is safe
+/// because CCM computes the MAC over plaintext first, then ctrEncrypt processes
+/// 16-byte blocks — each block's read completes before overlapping writes occur.
+fn send_dtls_packet(
+    server: *Server,
+    session: *dtls.Session.Session,
+    pkt: coapz.Packet,
+    peer: std.net.Address,
+    index: usize,
+) ![]const u8 {
+    const buf = server.response_buf(index);
+
+    // Encode CoAP into the tail of the buffer (after DTLS overhead).
+    const overhead = dtls.types.record_overhead;
+    if (buf.len <= overhead) return error.BufferTooSmall;
+    const coap_buf = buf[overhead..];
+    const coap_wire = pkt.writeBuf(coap_buf) catch |err| return err;
+
+    // Encrypt into the buffer from the start.
+    const encrypted = dtls.Record.encodeEncrypted(
+        .application_data,
+        coap_wire,
+        session.server_write_key,
+        session.server_write_iv,
+        session.write_epoch,
+        &session.write_sequence,
+        buf,
+    );
+
+    try server.send_raw(encrypted, peer, index);
+    return encrypted;
+}
+
+/// Send a DTLS alert record to a peer. For plaintext (epoch 0) alerts.
+fn send_dtls_alert(
+    server: *Server,
+    session: *dtls.Session.Session,
+    level: dtls.types.AlertLevel,
+    desc: dtls.types.AlertDescription,
+    index: usize,
+    peer: std.net.Address,
+) void {
+    var alert_payload: [2]u8 = undefined;
+    dtls.types.encodeAlert(level, desc, &alert_payload);
+
+    const buf = server.response_buf(index);
+    const record = dtls.Record.encodePlaintext(
+        .alert,
+        &alert_payload,
+        &session.write_sequence,
+        buf,
+    );
+
+    server.send_data(record, peer, index) catch {};
 }
 
 /// Send a pre-allocated empty ACK when OOM prevents normal response.
