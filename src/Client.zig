@@ -344,6 +344,9 @@ const empty_sentinel: u16 = 0xFFFF;
 pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     if (config.max_in_flight == 0) return error.InvalidConfig;
     if (config.buffer_size < 64) return error.InvalidConfig;
+    // DTLS encryption uses comptime-sized stack buffers bounded by buffer_size_default.
+    if (config.psk != null and config.buffer_size > constants.buffer_size_default)
+        return error.InvalidConfig;
 
     var effective_config = config;
     if (config.psk != null and config.port == constants.port_default) {
@@ -462,6 +465,7 @@ pub fn deinit(client: *Client) void {
 
 /// Perform the DTLS 1.2 PSK handshake. Must be called after init() and
 /// before any CoAP send/recv when PSK is configured.
+/// Retransmits lost flights per RFC 6347 §4.2.4.
 pub fn handshake(client: *Client) !void {
     const psk = client.config.psk orelse return error.NoPskConfigured;
     var sess = &(client.dtls_session orelse return error.NoPskConfigured);
@@ -483,76 +487,81 @@ pub fn handshake(client: *Client) !void {
         psk,
         &send_buf,
     );
-    switch (action) {
-        .send => |data| try client.sendDirect(data),
+    var last_flight: []const u8 = switch (action) {
+        .send => |data| data,
         .failed => return error.HandshakeFailed,
         else => unreachable,
-    }
+    };
+    try client.sendDirect(last_flight);
 
     const deadline_ns: i128 = std.time.nanoTimestamp() +
         @as(i128, client.config.handshake_timeout_ms) * std.time.ns_per_ms;
 
+    // Retransmit timer (RFC 6347 §4.2.4): exponential backoff.
+    var retransmit_timeout_ms: u32 = constants.dtls_retransmit_initial_ms;
+    var retransmit_deadline_ns: i128 = std.time.nanoTimestamp() +
+        @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+
     // Loop: receive server messages, process, send responses.
+    var pt_buf: [512]u8 = undefined;
     while (client.dtls_client_hs_state != .complete) {
-        const data = client.recvUntil(deadline_ns) orelse return error.Timeout;
+        const now = std.time.nanoTimestamp();
+        if (now >= deadline_ns) return error.Timeout;
+
+        // Retransmit last flight if timer expired.
+        if (now >= retransmit_deadline_ns) {
+            if (retransmit_timeout_ms >= constants.dtls_retransmit_max_ms)
+                return error.Timeout;
+            client.sendDirect(last_flight) catch {};
+            retransmit_timeout_ms = @min(retransmit_timeout_ms * 2, constants.dtls_retransmit_max_ms);
+            retransmit_deadline_ns = now + @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+            continue;
+        }
+
+        // Poll until retransmit deadline or overall deadline.
+        const poll_deadline = @min(retransmit_deadline_ns, deadline_ns);
+        const data = client.recvUntil(poll_deadline) orelse continue;
 
         // Must be a DTLS record.
         if (data.len < 1 or !dtls.types.isDtlsContentType(data[0])) continue;
 
-        // Check epoch from record header.
+        // Decode based on epoch.
         const epoch = if (data.len >= 5) std.mem.readInt(u16, data[3..5], .big) else 0;
-
-        if (epoch == 0) {
-            const record = dtls.Record.decodePlaintext(data) orelse continue;
-            const hs_action = dtls.Handshake.clientProcessMessage(
-                sess,
-                &client.dtls_client_hs_state,
-                record.content_type,
-                record.payload,
-                psk,
-                &send_buf,
-            );
-            switch (hs_action) {
-                .send => |sdata| try client.sendDirect(sdata),
-                .established => {
-                    sess.state = .established;
-                    return;
-                },
-                .failed => return error.HandshakeFailed,
-                .none => {},
-            }
-        } else {
-            // Encrypted record (server Finished comes encrypted).
-            var pt_buf: [512]u8 = undefined;
-            const record = dtls.Record.decodeEncrypted(
+        const record = if (epoch == 0)
+            dtls.Record.decodePlaintext(data)
+        else
+            dtls.Record.decodeEncrypted(
                 data,
                 sess.server_write_key,
                 sess.server_write_iv,
                 &sess.replay_window,
                 &sess.read_sequence,
                 &pt_buf,
-            ) orelse continue;
-            const hs_action = dtls.Handshake.clientProcessMessage(
-                sess,
-                &client.dtls_client_hs_state,
-                record.content_type,
-                record.payload,
-                psk,
-                &send_buf,
             );
-            switch (hs_action) {
-                .send => |sdata| try client.sendDirect(sdata),
-                .established => {
-                    sess.state = .established;
-                    return;
-                },
-                .failed => return error.HandshakeFailed,
-                .none => {},
-            }
+        const rec = record orelse continue;
+
+        const hs_action = dtls.Handshake.clientProcessMessage(
+            sess,
+            &client.dtls_client_hs_state,
+            rec.content_type,
+            rec.payload,
+            psk,
+            &send_buf,
+        );
+        switch (hs_action) {
+            .send => |sdata| {
+                last_flight = sdata;
+                try client.sendDirect(sdata);
+                // Reset retransmit timer on new flight.
+                retransmit_timeout_ms = constants.dtls_retransmit_initial_ms;
+                retransmit_deadline_ns = std.time.nanoTimestamp() +
+                    @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+            },
+            .established => return,
+            .failed => return error.HandshakeFailed,
+            .none => {},
         }
     }
-
-    sess.state = .established;
 }
 
 // ─── cast (NON fire-and-forget) ──────────────────────────────────
