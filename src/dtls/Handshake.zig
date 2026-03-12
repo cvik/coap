@@ -247,6 +247,8 @@ pub fn buildStatelessHvr(
     var record_buf: [128]u8 = undefined;
     var seq: u48 = 0;
     const rec = Record.encodePlaintext(.handshake, hs_msg, &seq, &record_buf);
+    // RFC 6347 §4.2.1: HVR uses DTLS 1.0 record version (pre-negotiation).
+    record_buf[2] = 0xFF;
     if (rec.len > send_buf.len) return null;
     @memcpy(send_buf[0..rec.len], rec);
     return send_buf[0..rec.len];
@@ -401,6 +403,8 @@ fn serverSendHelloVerifyRequest(
 
     var record_buf: [128]u8 = undefined;
     const rec = Record.encodePlaintext(.handshake, hs_msg, &session.write_sequence, &record_buf);
+    // RFC 6347 §4.2.1: HVR uses DTLS 1.0 record version (pre-negotiation).
+    record_buf[2] = 0xFF;
     @memcpy(send_buf[0..rec.len], rec);
 
     session.handshake_state = .cookie_sent;
@@ -552,6 +556,9 @@ pub fn clientBuildInitialHello(
 
     var record_buf: [350]u8 = undefined;
     const rec = Record.encodePlaintext(.handshake, hs_msg, &session.write_sequence, &record_buf);
+    // RFC 6347 §4.2.1: initial ClientHello uses DTLS 1.0 record version
+    // for backward compatibility (before version negotiation).
+    record_buf[2] = 0xFF;
     @memcpy(send_buf[0..rec.len], rec);
 
     client_hs_state.* = .expect_hello_verify_or_server_hello;
@@ -647,9 +654,6 @@ fn clientHandleHelloVerifyRequest(
     // Reset hash — HVR and initial ClientHello are not included.
     session.handshake_hash = Sha256.init(.{});
 
-    // Reset write sequence for retransmitted ClientHello.
-    session.write_sequence = 0;
-
     // Build new ClientHello with cookie.
     var ch_body: [256]u8 = undefined;
     const ch_len = buildClientHelloBody(session.client_random, cookie, &ch_body);
@@ -661,6 +665,9 @@ fn clientHandleHelloVerifyRequest(
 
     var record_buf: [350]u8 = undefined;
     const rec = Record.encodePlaintext(.handshake, hs_msg, &session.write_sequence, &record_buf);
+    // RFC 6347 §4.2.1: ClientHello retransmission (with cookie) also uses
+    // DTLS 1.0 record version — version negotiation not yet complete.
+    record_buf[2] = 0xFF;
     @memcpy(send_buf[0..rec.len], rec);
 
     client_hs_state.* = .expect_hello_verify_or_server_hello;
