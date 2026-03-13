@@ -1,32 +1,80 @@
-/// coap benchmark client.
+/// CoAP benchmark suite.
 ///
-/// Sends CoAP requests using a pipelined sliding window and measures
-/// throughput and latency. Forks an embedded echo server by default.
-/// When --threads N is used, spawns N client threads (each with its own
-/// socket/source port) so SO_REUSEPORT distributes across server threads.
+/// Runs a matrix of scenarios (plain/DTLS × CON/NON × 1/N threads × payload
+/// sizes) and prints a compact summary table. Forks embedded echo servers
+/// as needed, grouped by (thread_count, use_dtls) to minimize restarts.
 const std = @import("std");
-const linux = std.os.linux;
 const posix = std.posix;
 const coapz = @import("coapz");
 const coap = @import("coap");
-
-const Config = struct {
-    host: []const u8 = "127.0.0.1",
-    port: u16 = 5683,
-    request_count: u32 = 100_000,
-    payload_size: u16 = 0,
-    warmup_count: u32 = 1_000,
-    use_confirmable: bool = false,
-    window_size: u16 = 256,
-    embedded_server: bool = true,
-    thread_count: u16 = 1,
-    use_dtls: bool = false,
-};
 
 const bench_psk: coap.Psk = .{
     .identity = "bench",
     .key = "0123456789abcdef",
 };
+
+// ── Types ──────────────────────────────────────────────────────────────
+
+const SuiteConfig = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 5683,
+    warmup_count: u32 = 1_000,
+    window_size: u16 = 256,
+    embedded_server: bool = true,
+    thread_count: u16 = 0, // 0 = nproc
+    count_override: ?u32 = null,
+    filter_plain: bool = true,
+    filter_dtls: bool = true,
+    filter_con: bool = true,
+    filter_non: bool = true,
+    filter_single: bool = true,
+    filter_multi: bool = true,
+};
+
+const Scenario = struct {
+    label: []const u8,
+    use_dtls: bool,
+    use_confirmable: bool,
+    multi_thread: bool,
+    payload_size: u16,
+    request_count: u32,
+};
+
+const ScenarioResult = struct {
+    rps: f64,
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+    errors: u64,
+};
+
+const ServerGroup = struct {
+    use_dtls: bool,
+    thread_count: u16,
+};
+
+const scenario_templates = [_]Scenario{
+    .{ .label = "Plain NON  1T     0B", .use_dtls = false, .use_confirmable = false, .multi_thread = false, .payload_size = 0, .request_count = 100_000 },
+    .{ .label = "Plain NON  1T   100B", .use_dtls = false, .use_confirmable = false, .multi_thread = false, .payload_size = 100, .request_count = 100_000 },
+    .{ .label = "Plain NON  1T  1000B", .use_dtls = false, .use_confirmable = false, .multi_thread = false, .payload_size = 1000, .request_count = 100_000 },
+    .{ .label = "Plain CON  1T     0B", .use_dtls = false, .use_confirmable = true, .multi_thread = false, .payload_size = 0, .request_count = 100_000 },
+    .{ .label = "Plain CON  1T   100B", .use_dtls = false, .use_confirmable = true, .multi_thread = false, .payload_size = 100, .request_count = 100_000 },
+    .{ .label = "Plain CON  1T  1000B", .use_dtls = false, .use_confirmable = true, .multi_thread = false, .payload_size = 1000, .request_count = 100_000 },
+    .{ .label = "Plain NON ##T     0B", .use_dtls = false, .use_confirmable = false, .multi_thread = true, .payload_size = 0, .request_count = 100_000 },
+    .{ .label = "Plain NON ##T   100B", .use_dtls = false, .use_confirmable = false, .multi_thread = true, .payload_size = 100, .request_count = 100_000 },
+    .{ .label = "Plain NON ##T  1000B", .use_dtls = false, .use_confirmable = false, .multi_thread = true, .payload_size = 1000, .request_count = 100_000 },
+    .{ .label = "Plain CON ##T     0B", .use_dtls = false, .use_confirmable = true, .multi_thread = true, .payload_size = 0, .request_count = 100_000 },
+    .{ .label = "Plain CON ##T   100B", .use_dtls = false, .use_confirmable = true, .multi_thread = true, .payload_size = 100, .request_count = 100_000 },
+    .{ .label = "Plain CON ##T  1000B", .use_dtls = false, .use_confirmable = true, .multi_thread = true, .payload_size = 1000, .request_count = 100_000 },
+    .{ .label = "DTLS  CON  1T     0B", .use_dtls = true, .use_confirmable = true, .multi_thread = false, .payload_size = 0, .request_count = 25_000 },
+    .{ .label = "DTLS  CON  1T   100B", .use_dtls = true, .use_confirmable = true, .multi_thread = false, .payload_size = 100, .request_count = 25_000 },
+    .{ .label = "DTLS  CON  1T  1000B", .use_dtls = true, .use_confirmable = true, .multi_thread = false, .payload_size = 1000, .request_count = 25_000 },
+    .{ .label = "DTLS  CON ##T     0B", .use_dtls = true, .use_confirmable = true, .multi_thread = true, .payload_size = 0, .request_count = 25_000 },
+    .{ .label = "DTLS  CON ##T   100B", .use_dtls = true, .use_confirmable = true, .multi_thread = true, .payload_size = 100, .request_count = 25_000 },
+    .{ .label = "DTLS  CON ##T  1000B", .use_dtls = true, .use_confirmable = true, .multi_thread = true, .payload_size = 1000, .request_count = 25_000 },
+};
+
+// ── Main ───────────────────────────────────────────────────────────────
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -34,39 +82,94 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const config = parse_args();
+    const cpu_count: u16 = if (config.thread_count > 0)
+        config.thread_count
+    else
+        @intCast(@min(std.Thread.getCpuCount() catch 1, std.math.maxInt(u16)));
 
-    // Fork an echo server process for CPU isolation.
-    var server_pid: ?posix.pid_t = null;
-    defer if (server_pid) |pid| {
-        posix.kill(pid, posix.SIG.TERM) catch {};
-        _ = posix.waitpid(pid, 0);
-    };
-
-    if (config.embedded_server) {
-        const psk: ?coap.Psk = if (config.use_dtls) bench_psk else null;
-        const server_port: u16 = if (config.use_dtls and config.port == 5683) 5684 else config.port;
-        server_pid = try fork_server(server_port, config.thread_count, psk);
-        std.Thread.sleep(150 * std.time.ns_per_ms);
+    var scenarios: [scenario_templates.len]?Scenario = .{null} ** scenario_templates.len;
+    var total: u16 = 0;
+    for (scenario_templates, 0..) |tmpl, i| {
+        if (tmpl.use_dtls and !config.filter_dtls) continue;
+        if (!tmpl.use_dtls and !config.filter_plain) continue;
+        if (tmpl.use_confirmable and !config.filter_con) continue;
+        if (!tmpl.use_confirmable and !config.filter_non) continue;
+        if (tmpl.multi_thread and !config.filter_multi) continue;
+        if (!tmpl.multi_thread and !config.filter_single) continue;
+        var s = tmpl;
+        if (config.count_override) |c| s.request_count = c;
+        scenarios[i] = s;
+        total += 1;
     }
 
-    // DTLS benchmark path: sequential CON requests via coap.Client.
-    if (config.use_dtls) {
-        var result = try run_dtls_bench(allocator, config);
-        defer if (result.latencies.len > 0) allocator.free(result.latencies);
-        report(config, &result, result.elapsed_ns);
+    if (total == 0) {
+        std.debug.print("warning: no scenarios match the given filters\n", .{});
         return;
     }
 
-    // Build the request template.
-    const payload = try allocator.alloc(u8, config.payload_size);
+    std.debug.print("── benchmark suite ({d} scenarios, {d} CPUs) ──\n\n", .{ total, cpu_count });
+
+    var results: [scenario_templates.len]?ScenarioResult = .{null} ** scenario_templates.len;
+    var current_group: ?ServerGroup = null;
+    var server_pid: ?posix.pid_t = null;
+    var scenario_num: u16 = 0;
+
+    defer kill_server(&server_pid);
+
+    for (scenarios, 0..) |maybe_scenario, i| {
+        const s = maybe_scenario orelse continue;
+        scenario_num += 1;
+        const tc = if (s.multi_thread) cpu_count else 1;
+        const group = ServerGroup{ .use_dtls = s.use_dtls, .thread_count = tc };
+        const port = if (s.use_dtls and config.port == 5683) @as(u16, 5684) else config.port;
+
+        if (config.embedded_server) {
+            const need_restart = if (current_group) |cur|
+                cur.use_dtls != group.use_dtls or cur.thread_count != group.thread_count
+            else
+                true;
+
+            if (need_restart) {
+                kill_server(&server_pid);
+                const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
+                server_pid = try fork_server(port, tc, psk);
+                std.Thread.sleep(150 * std.time.ns_per_ms);
+                current_group = group;
+            }
+        }
+
+        const label = format_label(s.label, tc);
+        std.debug.print("[{d:>2}/{d}] {s} ... ", .{ scenario_num, total, &label });
+
+        const result = if (s.use_dtls)
+            try run_scenario_dtls(allocator, config, s, tc, port)
+        else
+            try run_scenario_plain(allocator, config, s, tc, port);
+
+        results[i] = result;
+        std.debug.print("{d:>10} req/s\n", .{@as(u64, @intFromFloat(result.rps))});
+    }
+
+    std.debug.print("\n", .{});
+    print_summary(cpu_count, &results, &scenarios);
+}
+
+// ── Plain UDP scenario ─────────────────────────────────────────────────
+
+fn run_scenario_plain(
+    allocator: std.mem.Allocator,
+    config: SuiteConfig,
+    s: Scenario,
+    tc: u16,
+    port: u16,
+) !ScenarioResult {
+    const count = s.request_count;
+
+    const payload = try allocator.alloc(u8, s.payload_size);
     defer allocator.free(payload);
     @memset(payload, 'x');
 
-    const kind: coapz.MessageKind = if (config.use_confirmable)
-        .confirmable
-    else
-        .non_confirmable;
-
+    const kind: coapz.MessageKind = if (s.use_confirmable) .confirmable else .non_confirmable;
     const template = coapz.Packet{
         .kind = kind,
         .code = .get,
@@ -79,69 +182,25 @@ pub fn main() !void {
     const template_wire = try template.write(allocator);
     defer allocator.free(template_wire);
 
-    // Connectivity probe (single socket).
-    if (!config.embedded_server) {
-        const probe_fd = try make_client_socket(config.host, config.port);
-        defer posix.close(probe_fd);
-        const probe = [_]u8{ 0x40, 0x00, 0x00, 0x00 };
-        _ = posix.send(probe_fd, &probe, 0) catch {};
-        var tmp: [64]u8 = undefined;
-        _ = posix.recv(probe_fd, &tmp, 0) catch |err| {
-            if (err == error.ConnectionRefused) {
-                std.debug.print(
-                    "error: no server on {s}:{d}\n",
-                    .{ config.host, config.port },
-                );
-                std.process.exit(1);
-            }
-        };
-    }
-
-    // Warmup (single socket).
+    // Warmup.
     if (config.warmup_count > 0) {
-        std.debug.print(
-            "warming up ({d} requests)...\n",
-            .{config.warmup_count},
-        );
-        const warmup_fd = try make_client_socket(config.host, config.port);
-        defer posix.close(warmup_fd);
-        _ = try run_bench(
-            allocator,
-            warmup_fd,
-            template_wire,
-            config.warmup_count,
-            config.window_size,
-            false,
-        );
+        const fd = try make_client_socket(config.host, port);
+        defer posix.close(fd);
+        _ = try run_bench(allocator, fd, template_wire, config.warmup_count, config.window_size, false);
     }
 
-    // Benchmark.
-    const n_clients = config.thread_count;
-    std.debug.print(
-        "benchmarking {d} requests (payload={d}B, {s}, window={d}, {d} client{s})...\n",
-        .{
-            config.request_count,
-            config.payload_size,
-            if (config.use_confirmable) "CON" else "NON",
-            config.window_size,
-            n_clients,
-            if (n_clients > 1) "s" else "",
-        },
-    );
-
-    const extra: u16 = n_clients -| 1;
+    const extra: u16 = tc -| 1;
     const threads = try allocator.alloc(std.Thread, extra);
     defer allocator.free(threads);
 
-    const per_thread = config.request_count / n_clients;
-    const remainder = config.request_count % n_clients;
+    const per_thread = count / tc;
+    const remainder = count % tc;
 
-    const worker_results = try allocator.alloc(WorkerResult, n_clients);
+    const worker_results = try allocator.alloc(PlainWorkerResult, tc);
     defer {
         for (worker_results) |*wr| {
             if (wr.result) |*r| {
-                if (r.latencies.len > 0)
-                    allocator.free(r.latencies);
+                if (r.latencies.len > 0) allocator.free(r.latencies);
             }
         }
         allocator.free(worker_results);
@@ -149,270 +208,196 @@ pub fn main() !void {
 
     const start = std.time.nanoTimestamp();
 
-    // Spawn extra client threads.
-    for (0..extra) |i| {
-        worker_results[i] = .{};
-        threads[i] = try std.Thread.spawn(.{}, client_worker, .{
-            allocator,
-            config,
-            template_wire,
-            per_thread,
-            &worker_results[i],
+    for (0..extra) |j| {
+        worker_results[j] = .{};
+        threads[j] = try std.Thread.spawn(.{}, plain_worker, .{
+            allocator, config.host, port, template_wire, per_thread, config.window_size, &worker_results[j],
         });
     }
 
-    // Main thread runs its share (gets the remainder too).
-    const main_count = per_thread + remainder;
-    const main_fd = try make_client_socket(config.host, config.port);
+    const main_fd = try make_client_socket(config.host, port);
     defer posix.close(main_fd);
-
-    const main_result = try run_bench(
-        allocator,
-        main_fd,
-        template_wire,
-        main_count,
-        config.window_size,
-        true,
-    );
+    const main_result = try run_bench(allocator, main_fd, template_wire, per_thread + remainder, config.window_size, true);
     worker_results[extra] = .{ .result = main_result };
 
-    // Join all threads.
-    for (threads) |t| {
-        t.join();
-    }
+    for (threads) |t| t.join();
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
+    return aggregate_plain(allocator, worker_results, elapsed_ns);
+}
 
-    // Aggregate results.
-    var agg = BenchResult{
-        .sent = 0,
-        .received = 0,
-        .bytes_sent = 0,
-        .bytes_received = 0,
-        .errors = 0,
-        .latency_min_ns = std.math.maxInt(i128),
-        .latency_max_ns = 0,
-        .latency_sum_ns = 0,
-        .latencies = main_result.latencies,
-        .latency_count = main_result.latency_count,
-        .elapsed_ns = elapsed_ns,
-        .handshake_ns = null,
-    };
+const PlainWorkerResult = struct {
+    result: ?BenchResult = null,
+};
 
-    // Merge latencies into a single sorted array for percentiles.
-    // Count total latencies first.
-    var total_latencies: u64 = 0;
+fn plain_worker(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    template_wire: []const u8,
+    count: u32,
+    window_size: u16,
+    out: *PlainWorkerResult,
+) void {
+    const fd = make_client_socket(host, port) catch return;
+    defer posix.close(fd);
+    out.result = run_bench(allocator, fd, template_wire, count, window_size, true) catch return;
+}
+
+fn aggregate_plain(allocator: std.mem.Allocator, worker_results: []PlainWorkerResult, elapsed_ns: i128) !ScenarioResult {
+    var total_sent: u64 = 0;
+    var total_errors: u64 = 0;
+    var total_lat_count: u64 = 0;
+
     for (worker_results) |wr| {
         if (wr.result) |r| {
-            total_latencies += r.latency_count;
+            total_sent += r.sent;
+            total_errors += r.errors;
+            total_lat_count += r.latency_count;
         }
     }
 
-    const merged_latencies = if (total_latencies > 0)
-        try allocator.alloc(i64, total_latencies)
+    const merged = if (total_lat_count > 0)
+        try allocator.alloc(i64, total_lat_count)
     else
         @as([]i64, &.{});
-    defer if (total_latencies > 0) allocator.free(merged_latencies);
+    defer if (total_lat_count > 0) allocator.free(merged);
 
-    var merge_off: u64 = 0;
+    var off: u64 = 0;
     for (worker_results) |wr| {
         if (wr.result) |r| {
-            agg.sent += r.sent;
-            agg.received += r.received;
-            agg.bytes_sent += r.bytes_sent;
-            agg.bytes_received += r.bytes_received;
-            agg.errors += r.errors;
-            agg.latency_sum_ns += r.latency_sum_ns;
-            if (r.received > 0 and r.latency_min_ns < agg.latency_min_ns)
-                agg.latency_min_ns = r.latency_min_ns;
-            if (r.latency_max_ns > agg.latency_max_ns)
-                agg.latency_max_ns = r.latency_max_ns;
             if (r.latency_count > 0) {
-                @memcpy(
-                    merged_latencies[merge_off..][0..r.latency_count],
-                    r.latencies[0..r.latency_count],
-                );
-                merge_off += r.latency_count;
+                @memcpy(merged[off..][0..r.latency_count], r.latencies[0..r.latency_count]);
+                off += r.latency_count;
             }
         }
     }
 
-    agg.latencies = merged_latencies;
-    agg.latency_count = @intCast(total_latencies);
+    std.mem.sortUnstable(i64, merged, {}, std.sort.asc(i64));
 
-    report(config, &agg, elapsed_ns);
+    const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    return .{
+        .rps = if (elapsed_s > 0) @as(f64, @floatFromInt(total_sent)) / elapsed_s else 0,
+        .p50_us = percentile_us(merged, 0.50),
+        .p99_us = percentile_us(merged, 0.99),
+        .p999_us = percentile_us(merged, 0.999),
+        .errors = total_errors,
+    };
 }
 
-const WorkerResult = struct {
-    result: ?BenchResult = null,
+// ── DTLS scenario ──────────────────────────────────────────────────────
+
+fn run_scenario_dtls(
+    allocator: std.mem.Allocator,
+    config: SuiteConfig,
+    s: Scenario,
+    tc: u16,
+    port: u16,
+) !ScenarioResult {
+    const count = s.request_count;
+    const extra: u16 = tc -| 1;
+    const threads = try allocator.alloc(std.Thread, extra);
+    defer allocator.free(threads);
+
+    const per_thread = count / tc;
+    const remainder = count % tc;
+
+    const worker_results = try allocator.alloc(DtlsWorkerResult, tc);
+    defer {
+        for (worker_results) |*wr| {
+            if (wr.latencies) |l| allocator.free(l);
+        }
+        allocator.free(worker_results);
+    }
+
+    const start = std.time.nanoTimestamp();
+
+    for (0..extra) |j| {
+        worker_results[j] = .{};
+        threads[j] = try std.Thread.spawn(.{}, dtls_worker, .{
+            allocator, config.host, port, config.window_size, s.payload_size,
+            per_thread, config.warmup_count, &worker_results[j],
+        });
+    }
+
+    worker_results[extra] = .{};
+    dtls_worker(
+        allocator, config.host, port, config.window_size, s.payload_size,
+        per_thread + remainder, config.warmup_count, &worker_results[extra],
+    );
+
+    for (threads) |t| t.join();
+
+    const elapsed_ns = std.time.nanoTimestamp() - start;
+    return aggregate_dtls(allocator, worker_results, elapsed_ns);
+}
+
+const DtlsWorkerResult = struct {
+    sent: u64 = 0,
+    errors: u64 = 0,
+    latencies: ?[]i64 = null,
+    latency_count: u32 = 0,
 };
 
-fn client_worker(
+fn dtls_worker(
     allocator: std.mem.Allocator,
-    config: Config,
-    template_wire: []const u8,
+    host: []const u8,
+    port: u16,
+    window: u16,
+    payload_size: u16,
     count: u32,
-    out: *WorkerResult,
+    warmup_count: u32,
+    out: *DtlsWorkerResult,
 ) void {
-    const fd = make_client_socket(config.host, config.port) catch return;
-    defer posix.close(fd);
-
-    out.result = run_bench(
-        allocator,
-        fd,
-        template_wire,
-        count,
-        config.window_size,
-        true,
-    ) catch return;
-}
-
-fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
-    const dest = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(
-        posix.AF.INET,
-        posix.SOCK.DGRAM,
-        0,
-    );
-    errdefer posix.close(fd);
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
-
-    // Tune socket buffers.
-    const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
-
-    // Receive timeout for draining at end of benchmark.
-    const timeout = posix.timeval{ .sec = 0, .usec = 100_000 };
-    try posix.setsockopt(
-        fd,
-        posix.SOL.SOCKET,
-        posix.SO.RCVTIMEO,
-        std.mem.asBytes(&timeout),
-    );
-
-    return fd;
-}
-
-fn echo_handler(request: coap.Request) ?coap.Response {
-    return coap.Response.ok(request.payload());
-}
-
-fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
-    const pid = try posix.fork();
-    if (pid == 0) {
-        // Child process: run the echo server.
-        var server = coap.Server.init(
-            std.heap.page_allocator,
-            .{
-                .port = port,
-                .buffer_count = 512,
-                .buffer_size = 1280,
-                .thread_count = thread_count,
-                .rate_limit_ip_count = 0,
-                .psk = psk,
-            },
-            echo_handler,
-        ) catch std.process.exit(1);
-        server.run() catch std.process.exit(1);
-        unreachable;
-    }
-    return pid;
-}
-
-/// DTLS benchmark: pipelined CON requests via submit/poll sliding window.
-/// Returns a BenchResult with handshake_ns populated.
-fn run_dtls_bench(
-    allocator: std.mem.Allocator,
-    config: Config,
-) !BenchResult {
-    const count = config.request_count;
-    const warmup = config.warmup_count;
-    const port: u16 = if (config.port == 5683) 5684 else config.port;
-    const window: u16 = config.window_size;
-
-    std.debug.print(
-        "benchmarking DTLS: {d} requests (payload={d}B, CON, window={d}, port={d})...\n",
-        .{ count, config.payload_size, window, port },
-    );
-
-    var client = try coap.Client.init(allocator, .{
-        .host = config.host,
+    var client = coap.Client.init(allocator, .{
+        .host = host,
         .port = port,
         .psk = bench_psk,
         .max_in_flight = window,
-    });
+    }) catch return;
     defer client.deinit();
 
-    // Measure handshake latency.
-    const hs_start = std.time.nanoTimestamp();
-    try client.handshake();
-    const handshake_ns = std.time.nanoTimestamp() - hs_start;
-    std.debug.print("  handshake: {d:.2} ms\n", .{
-        @as(f64, @floatFromInt(handshake_ns)) / 1e6,
-    });
+    client.handshake() catch return;
 
-    // Build payload.
-    const payload = try allocator.alloc(u8, config.payload_size);
+    const payload = allocator.alloc(u8, payload_size) catch return;
     defer allocator.free(payload);
     @memset(payload, 'x');
 
-    // Warmup (sequential).
-    if (warmup > 0) {
-        std.debug.print("  warming up ({d} requests)...\n", .{warmup});
-        for (0..warmup) |_| {
-            const r = client.call(allocator, .get, &.{}, payload) catch continue;
-            r.deinit(allocator);
-        }
+    for (0..warmup_count) |_| {
+        const r = client.call(allocator, .get, &.{}, payload) catch continue;
+        r.deinit(allocator);
     }
 
-    // Per-handle timestamps for latency tracking.
-    const timestamps = try allocator.alloc(i128, window);
+    const timestamps = allocator.alloc(i128, window) catch return;
     defer allocator.free(timestamps);
     @memset(timestamps, 0);
 
-    // Timed benchmark — sliding window.
-    const latencies = try allocator.alloc(i64, count);
-    errdefer allocator.free(latencies);
+    const latencies = allocator.alloc(i64, count) catch return;
 
-    var result = BenchResult{
-        .sent = 0,
-        .received = 0,
-        .bytes_sent = 0,
-        .bytes_received = 0,
-        .errors = 0,
-        .latency_min_ns = std.math.maxInt(i128),
-        .latency_max_ns = 0,
-        .latency_sum_ns = 0,
-        .latencies = latencies,
-        .latency_count = 0,
-        .handshake_ns = handshake_ns,
-    };
-
-    const bench_start = std.time.nanoTimestamp();
+    var sent: u64 = 0;
+    var received: u64 = 0;
+    var errors: u64 = 0;
+    var latency_count: u32 = 0;
     var total_sent: u32 = 0;
     var in_flight: u16 = 0;
 
-    while (result.received + result.errors < count) {
-        // Fill the window.
+    while (received + errors < count) {
         while (in_flight < window and total_sent < count) {
             const handle = client.submit(.get, &.{}, payload) catch {
-                result.errors += 1;
+                errors += 1;
                 total_sent += 1;
                 continue;
             };
             timestamps[handle] = std.time.nanoTimestamp();
             total_sent += 1;
             in_flight += 1;
-            result.sent += 1;
-            result.bytes_sent += 4 + payload.len;
+            sent += 1;
         }
 
         if (in_flight == 0) break;
 
-        // Poll for completions.
         const c = client.poll(allocator, 50) catch {
-            result.errors += 1;
+            errors += 1;
             if (in_flight > 0) in_flight -= 1;
             continue;
         };
@@ -421,32 +406,70 @@ fn run_dtls_bench(
         in_flight -|= 1;
 
         if (completion.result._timeout or completion.result._reset) {
-            result.errors += 1;
+            errors += 1;
             continue;
         }
         defer completion.result.deinit(allocator);
 
-        result.received += 1;
-        result.bytes_received += 4;
+        received += 1;
 
-        // Latency tracking.
         const ts = timestamps[completion.handle];
         if (ts > 0) {
             const latency = std.time.nanoTimestamp() - ts;
-            result.latency_sum_ns += latency;
-            if (latency < result.latency_min_ns) result.latency_min_ns = latency;
-            if (latency > result.latency_max_ns) result.latency_max_ns = latency;
-            if (result.latency_count < count) {
-                result.latencies[result.latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
-                result.latency_count += 1;
+            if (latency_count < count) {
+                latencies[latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
+                latency_count += 1;
             }
             timestamps[completion.handle] = 0;
         }
     }
 
-    result.elapsed_ns = std.time.nanoTimestamp() - bench_start;
-    return result;
+    out.sent = sent;
+    out.errors = errors;
+    out.latencies = latencies;
+    out.latency_count = latency_count;
 }
+
+fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResult, elapsed_ns: i128) !ScenarioResult {
+    var total_sent: u64 = 0;
+    var total_errors: u64 = 0;
+    var total_lat_count: u64 = 0;
+
+    for (worker_results) |wr| {
+        total_sent += wr.sent;
+        total_errors += wr.errors;
+        total_lat_count += wr.latency_count;
+    }
+
+    const merged = if (total_lat_count > 0)
+        try allocator.alloc(i64, total_lat_count)
+    else
+        @as([]i64, &.{});
+    defer if (total_lat_count > 0) allocator.free(merged);
+
+    var off: u64 = 0;
+    for (worker_results) |wr| {
+        if (wr.latencies) |l| {
+            if (wr.latency_count > 0) {
+                @memcpy(merged[off..][0..wr.latency_count], l[0..wr.latency_count]);
+                off += wr.latency_count;
+            }
+        }
+    }
+
+    std.mem.sortUnstable(i64, merged, {}, std.sort.asc(i64));
+
+    const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    return .{
+        .rps = if (elapsed_s > 0) @as(f64, @floatFromInt(total_sent)) / elapsed_s else 0,
+        .p50_us = percentile_us(merged, 0.50),
+        .p99_us = percentile_us(merged, 0.99),
+        .p999_us = percentile_us(merged, 0.999),
+        .errors = total_errors,
+    };
+}
+
+// ── Low-level UDP bench (unchanged) ────────────────────────────────────
 
 const BenchResult = struct {
     sent: u64,
@@ -459,8 +482,6 @@ const BenchResult = struct {
     latency_sum_ns: i128,
     latencies: []i64,
     latency_count: u32,
-    elapsed_ns: i128 = 0,
-    handshake_ns: ?i128 = null,
 };
 
 fn run_bench(
@@ -507,7 +528,6 @@ fn run_bench(
     var consecutive_timeouts: u32 = 0;
 
     while (result.received + result.errors < count) {
-        // Fill the send window.
         while (in_flight < window and total_sent < count) {
             const id_hi: u8 = @intCast(msg_id >> 8);
             const id_lo: u8 = @intCast(msg_id & 0xFF);
@@ -532,16 +552,12 @@ fn run_bench(
             msg_id +%= 1;
         }
 
-        if (in_flight == 0) {
-            break;
-        }
+        if (in_flight == 0) break;
 
-        // Receive one response (blocks up to SO_RCVTIMEO).
         const n = posix.recv(fd, &recv_buf, 0) catch |err| {
             if (err == error.WouldBlock) {
                 consecutive_timeouts += 1;
                 if (consecutive_timeouts >= 3 and in_flight > 0) {
-                    // Count in-flight packets as lost and clear window.
                     result.errors += @intCast(in_flight);
                     in_flight = 0;
                     if (total_sent >= count) break;
@@ -549,9 +565,7 @@ fn run_bench(
                 continue;
             }
             result.errors += 1;
-            if (in_flight > 0) {
-                in_flight -= 1;
-            }
+            if (in_flight > 0) in_flight -= 1;
             continue;
         };
 
@@ -560,7 +574,6 @@ fn run_bench(
         result.received += 1;
         result.bytes_received += n;
 
-        // Track latency via token matching.
         if (n >= 6 and (recv_buf[0] & 0x0F) >= 2) {
             const token: u16 = @as(u16, recv_buf[4]) << 8 | recv_buf[5];
             const slot = token % window;
@@ -568,17 +581,10 @@ fn run_bench(
             if (ts > 0) {
                 const latency = std.time.nanoTimestamp() - ts;
                 result.latency_sum_ns += latency;
-                if (latency < result.latency_min_ns) {
-                    result.latency_min_ns = latency;
-                }
-                if (latency > result.latency_max_ns) {
-                    result.latency_max_ns = latency;
-                }
-                if (collect_latencies and
-                    result.latency_count < count)
-                {
-                    result.latencies[result.latency_count] =
-                        @intCast(latency);
+                if (latency < result.latency_min_ns) result.latency_min_ns = latency;
+                if (latency > result.latency_max_ns) result.latency_max_ns = latency;
+                if (collect_latencies and result.latency_count < count) {
+                    result.latencies[result.latency_count] = @intCast(latency);
                     result.latency_count += 1;
                 }
             }
@@ -588,100 +594,127 @@ fn run_bench(
     return result;
 }
 
+// ── Helpers ────────────────────────────────────────────────────────────
+
+fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
+    const dest = try std.net.Address.parseIp(host, port);
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    errdefer posix.close(fd);
+    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+
+    const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &buf_size) catch {};
+
+    const timeout = posix.timeval{ .sec = 0, .usec = 100_000 };
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+
+    return fd;
+}
+
+fn echo_handler(request: coap.Request) ?coap.Response {
+    return coap.Response.ok(request.payload());
+}
+
+fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
+    const pid = try posix.fork();
+    if (pid == 0) {
+        var server = coap.Server.init(
+            std.heap.page_allocator,
+            .{
+                .port = port,
+                .buffer_count = 512,
+                .buffer_size = 1280,
+                .thread_count = thread_count,
+                .rate_limit_ip_count = 0,
+                .psk = psk,
+            },
+            echo_handler,
+        ) catch std.process.exit(1);
+        server.run() catch std.process.exit(1);
+        unreachable;
+    }
+    return pid;
+}
+
+fn kill_server(pid: *?posix.pid_t) void {
+    if (pid.*) |p| {
+        posix.kill(p, posix.SIG.TERM) catch {};
+        _ = posix.waitpid(p, 0);
+        pid.* = null;
+    }
+}
+
 fn percentile_us(sorted: []i64, p: f64) f64 {
     if (sorted.len == 0) return 0;
     const idx: usize = @min(
-        @as(usize, @intFromFloat(
-            @as(f64, @floatFromInt(sorted.len)) * p,
-        )),
+        @as(usize, @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * p)),
         sorted.len - 1,
     );
     return @as(f64, @floatFromInt(sorted[idx])) / 1000.0;
 }
 
-fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
-    const elapsed_ms: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e6;
-    const elapsed_s: f64 = elapsed_ms / 1000.0;
-    const rps: f64 = if (elapsed_s > 0)
-        @as(f64, @floatFromInt(result.sent)) / elapsed_s
-    else
-        0;
+fn format_label(template: []const u8, thread_count: u16) [21]u8 {
+    var buf: [21]u8 = .{' '} ** 21;
+    var out_i: usize = 0;
+    var in_i: usize = 0;
+    while (in_i < template.len and out_i < buf.len) {
+        if (in_i + 2 < template.len and template[in_i] == '#' and template[in_i + 1] == '#') {
+            // Replace ## with right-aligned thread count.
+            if (thread_count >= 10) {
+                buf[out_i] = '0' + @as(u8, @intCast(thread_count / 10 % 10));
+            }
+            out_i += 1;
+            buf[out_i] = '0' + @as(u8, @intCast(thread_count % 10));
+            out_i += 1;
+            in_i += 2;
+        } else {
+            buf[out_i] = template[in_i];
+            out_i += 1;
+            in_i += 1;
+        }
+    }
+    return buf;
+}
 
-    const avg_latency_us: f64 = if (result.received > 0)
-        @as(f64, @floatFromInt(result.latency_sum_ns)) /
-            @as(f64, @floatFromInt(result.received)) / 1000.0
-    else
-        0;
-    const min_us: f64 = if (result.received > 0)
-        @as(f64, @floatFromInt(result.latency_min_ns)) / 1000.0
-    else
-        0;
-    const max_us: f64 = if (result.received > 0)
-        @as(f64, @floatFromInt(result.latency_max_ns)) / 1000.0
-    else
-        0;
+// ── Output ─────────────────────────────────────────────────────────────
 
-    // Sort latencies for percentile computation.
-    const sorted = result.latencies[0..result.latency_count];
-    std.mem.sortUnstable(i64, sorted, {}, std.sort.asc(i64));
-
-    const p50 = percentile_us(sorted, 0.50);
-    const p99 = percentile_us(sorted, 0.99);
-    const p999 = percentile_us(sorted, 0.999);
-
-    const mode = if (config.use_dtls) "DTLS/CoAPs" else "CoAP";
-
+fn print_summary(
+    cpu_count: u16,
+    results: *const [scenario_templates.len]?ScenarioResult,
+    scenarios: *const [scenario_templates.len]?Scenario,
+) void {
     std.debug.print(
-        \\
-        \\── {s} benchmark results ──
-        \\  target:     {s}:{d}
-        \\  requests:   {d} sent, {d} received ({d:.1}% loss)
-        \\  throughput: {d:.0} req/s
-        \\  elapsed:    {d:.1} ms
-        \\  latency:    avg={d:.1}µs min={d:.1}µs max={d:.1}µs
-        \\  percentiles: p50={d:.1}µs p99={d:.1}µs p99.9={d:.1}µs
-        \\  bytes:      {d} sent, {d} received
-        \\
-    , .{
-        mode,
-        config.host,
-        if (config.use_dtls and config.port == 5683) @as(u16, 5684) else config.port,
-        result.sent,
-        result.received,
-        if (result.sent > 0)
-            (1.0 - @as(f64, @floatFromInt(result.received)) /
-                @as(f64, @floatFromInt(result.sent))) * 100.0
-        else
-            0.0,
-        rps,
-        elapsed_ms,
-        avg_latency_us,
-        min_us,
-        max_us,
-        p50,
-        p99,
-        p999,
-        result.bytes_sent,
-        result.bytes_received,
-    });
+        "── benchmark suite results ({d} CPUs) ──\n\n" ++
+            "  {s:<21}  {s:>12}  {s:>9}  {s:>9}  {s:>9}  {s:>6}\n" ++
+            "  ---------------------  ------------  ---------  ---------  ---------  ------\n",
+        .{
+            cpu_count,
+            "Scenario", "req/s", "p50 us", "p99 us", "p99.9 us", "errs",
+        },
+    );
 
-    if (result.handshake_ns) |hs_ns| {
-        std.debug.print("  handshake:  {d:.2} ms\n  window:     {d}\n", .{
-            @as(f64, @floatFromInt(hs_ns)) / 1e6,
-            config.window_size,
-        });
-    } else {
-        std.debug.print("  window:     {d}\n  threads:    {d} server, {d} client\n", .{
-            config.window_size,
-            config.thread_count,
-            config.thread_count,
+    for (scenarios, 0..) |maybe_s, i| {
+        const s = maybe_s orelse continue;
+        const r = results[i] orelse continue;
+        const label = format_label(s.label, if (s.multi_thread) cpu_count else 1);
+        std.debug.print("  {s}  {d:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {d:>6}\n", .{
+            &label,
+            @as(u64, @intFromFloat(r.rps)),
+            r.p50_us,
+            r.p99_us,
+            r.p999_us,
+            r.errors,
         });
     }
+
     std.debug.print("\n", .{});
 }
 
-fn parse_args() Config {
-    var config = Config{};
+// ── CLI ────────────────────────────────────────────────────────────────
+
+fn parse_args() SuiteConfig {
+    var config = SuiteConfig{};
     var args = std.process.args();
     _ = args.next();
 
@@ -693,45 +726,36 @@ fn parse_args() Config {
             config.port = std.fmt.parseInt(u16, val, 10) catch 5683;
         } else if (std.mem.eql(u8, arg, "--count")) {
             const val = args.next() orelse "100000";
-            config.request_count = std.fmt.parseInt(
-                u32,
-                val,
-                10,
-            ) catch 100_000;
-        } else if (std.mem.eql(u8, arg, "--payload")) {
-            const val = args.next() orelse "0";
-            config.payload_size = std.fmt.parseInt(
-                u16,
-                val,
-                10,
-            ) catch 0;
-        } else if (std.mem.eql(u8, arg, "--con")) {
-            config.use_confirmable = true;
+            config.count_override = std.fmt.parseInt(u32, val, 10) catch null;
         } else if (std.mem.eql(u8, arg, "--warmup")) {
             const val = args.next() orelse "1000";
-            config.warmup_count = std.fmt.parseInt(
-                u32,
-                val,
-                10,
-            ) catch 1_000;
+            config.warmup_count = std.fmt.parseInt(u32, val, 10) catch 1_000;
         } else if (std.mem.eql(u8, arg, "--window")) {
             const val = args.next() orelse "256";
-            config.window_size = std.fmt.parseInt(
-                u16,
-                val,
-                10,
-            ) catch 256;
+            config.window_size = std.fmt.parseInt(u16, val, 10) catch 256;
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            const val = args.next() orelse "0";
+            config.thread_count = std.fmt.parseInt(u16, val, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--no-server")) {
             config.embedded_server = false;
-        } else if (std.mem.eql(u8, arg, "--threads")) {
-            const val = args.next() orelse "1";
-            config.thread_count = std.fmt.parseInt(
-                u16,
-                val,
-                10,
-            ) catch 1;
-        } else if (std.mem.eql(u8, arg, "--dtls")) {
-            config.use_dtls = true;
+        } else if (std.mem.eql(u8, arg, "--plain-only")) {
+            config.filter_dtls = false;
+        } else if (std.mem.eql(u8, arg, "--dtls-only")) {
+            config.filter_plain = false;
+        } else if (std.mem.eql(u8, arg, "--con-only")) {
+            config.filter_non = false;
+        } else if (std.mem.eql(u8, arg, "--non-only")) {
+            config.filter_con = false;
+        } else if (std.mem.eql(u8, arg, "--single-only")) {
+            config.filter_multi = false;
+        } else if (std.mem.eql(u8, arg, "--multi-only")) {
+            config.filter_single = false;
+        } else if (std.mem.eql(u8, arg, "--payload") or
+            std.mem.eql(u8, arg, "--con") or
+            std.mem.eql(u8, arg, "--dtls"))
+        {
+            std.debug.print("error: {s} removed in suite mode, use filter flags\n", .{arg});
+            std.process.exit(1);
         }
     }
 
