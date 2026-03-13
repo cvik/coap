@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1] - 2026-03-13
+- Server auto-clamps `buffer_count` to fit RLIMIT_MEMLOCK at init
+- Bench: comma-separated large numbers in output, `--settings` and `--help` flags
+- Bench: use all CPUs for multi-thread scenarios (was capped at 16)
+- Bench: auto-scale server buffers and window per thread count
+
 ## [0.4.0] - 2026-03-13
 - Pipelined async client API: `submit()` / `poll()` for high-throughput workloads
 - `RequestHandle` and `Completion` types for non-blocking request/response
