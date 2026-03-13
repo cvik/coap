@@ -23,6 +23,7 @@ const SuiteConfig = struct {
     embedded_server: bool = true,
     thread_count: u16 = 0, // 0 = nproc
     count_override: ?u32 = null,
+    show_settings: bool = false,
     filter_plain: bool = true,
     filter_dtls: bool = true,
     filter_con: bool = true,
@@ -112,6 +113,36 @@ pub fn main() !void {
     }
 
     std.debug.print("── benchmark suite ({d} scenarios, {d} CPUs) ──\n\n", .{ total, cpu_count });
+
+    if (config.show_settings) {
+        var count_buf: [26]u8 = undefined;
+        const count_str = if (config.count_override) |c|
+            fmtInt(&count_buf, c)
+        else
+            "per-template default";
+        std.debug.print(
+            "  host:             {s}\n" ++
+                "  port:             {d}\n" ++
+                "  embedded server:  {s}\n" ++
+                "  server buffers:   {d} × {d}B\n" ++
+                "  server threads:   1 / {d} (single / multi)\n" ++
+                "  client threads:   1 / {d} (single / multi)\n" ++
+                "  client window:    {d} (per-thread: {d}/tc, min 32)\n" ++
+                "  warmup:           {d}\n" ++
+                "  requests/scen:    {s}\n\n",
+            .{
+                config.host,
+                config.port,
+                if (config.embedded_server) "yes" else "no (--no-server)",
+                @as(u16, 512), @as(u16, 1280),
+                server_threads,
+                cpu_count,
+                config.window_size, config.window_size,
+                config.warmup_count,
+                count_str,
+            },
+        );
+    }
 
     var results: [scenario_templates.len]?ScenarioResult = .{null} ** scenario_templates.len;
     var current_group: ?ServerGroup = null;
@@ -761,13 +792,41 @@ fn print_summary(
 
 // ── CLI ────────────────────────────────────────────────────────────────
 
+fn print_usage() void {
+    std.debug.print(
+        "Usage: bench [options]\n\n" ++
+            "Options:\n" ++
+            "  --host <addr>     Server address (default: 127.0.0.1)\n" ++
+            "  --port <port>     Server port (default: 5683)\n" ++
+            "  --count <n>       Override request count per scenario\n" ++
+            "  --warmup <n>      Warmup requests (default: 1000)\n" ++
+            "  --window <n>      Client sliding window size (default: 256)\n" ++
+            "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
+            "  --no-server       Don't fork embedded echo server\n" ++
+            "  --settings        Print scenario settings before running\n" ++
+            "\n" ++
+            "Filters:\n" ++
+            "  --plain-only      Skip DTLS scenarios\n" ++
+            "  --dtls-only       Skip plain UDP scenarios\n" ++
+            "  --con-only        Skip NON scenarios\n" ++
+            "  --non-only        Skip CON scenarios\n" ++
+            "  --single-only     Skip multi-threaded scenarios\n" ++
+            "  --multi-only      Skip single-threaded scenarios\n" ++
+            "\n" ++
+            "  -h, --help        Show this help\n"
+    , .{});
+}
+
 fn parse_args() SuiteConfig {
     var config = SuiteConfig{};
     var args = std.process.args();
     _ = args.next();
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            print_usage();
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--host")) {
             config.host = args.next() orelse "127.0.0.1";
         } else if (std.mem.eql(u8, arg, "--port")) {
             const val = args.next() orelse "5683";
@@ -786,6 +845,8 @@ fn parse_args() SuiteConfig {
             config.thread_count = std.fmt.parseInt(u16, val, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--no-server")) {
             config.embedded_server = false;
+        } else if (std.mem.eql(u8, arg, "--settings")) {
+            config.show_settings = true;
         } else if (std.mem.eql(u8, arg, "--plain-only")) {
             config.filter_dtls = false;
         } else if (std.mem.eql(u8, arg, "--dtls-only")) {
@@ -803,6 +864,10 @@ fn parse_args() SuiteConfig {
             std.mem.eql(u8, arg, "--dtls"))
         {
             std.debug.print("error: {s} removed in suite mode, use filter flags\n", .{arg});
+            std.process.exit(1);
+        } else {
+            std.debug.print("error: unknown flag: {s}\n\n", .{arg});
+            print_usage();
             std.process.exit(1);
         }
     }
