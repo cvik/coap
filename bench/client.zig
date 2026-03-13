@@ -87,10 +87,9 @@ pub fn main() !void {
     else
         @intCast(@min(std.Thread.getCpuCount() catch 1, std.math.maxInt(u16)));
     // Cap server threads to stay within RLIMIT_MEMLOCK (typically 8MB).
-    // Each io_uring worker ring costs ~2MB of kernel-locked memory;
-    // 4 threads × 256 buffers fits comfortably. The echo server doesn't
-    // need more — client threads (cpu_count) drive the load.
-    const server_threads: u16 = @min(cpu_count, 4);
+    // With buffer_count=512, ~17 workers fit in 8MB (~470KB per io_uring
+    // instance). 16 is a safe cap that maximizes server-side parallelism.
+    const server_threads: u16 = @min(cpu_count, 16);
 
     var scenarios: [scenario_templates.len]?Scenario = .{null} ** scenario_templates.len;
     var total: u16 = 0;
@@ -634,7 +633,7 @@ fn echo_handler(request: coap.Request) ?coap.Response {
 }
 
 fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
-    const buf_count: u16 = if (thread_count > 1) 256 else 512;
+    const buf_count: u16 = 512;
 
     const pid = try posix.fork();
     if (pid == 0) {
