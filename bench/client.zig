@@ -108,7 +108,7 @@ pub fn main() !void {
         return;
     }
 
-    std.debug.print("\x1b[1m── benchmark suite ({d} scenarios, {d} CPUs) ──\x1b[0m\n\n", .{ total, cpu_count });
+    std.debug.print("── benchmark suite ({d} scenarios, {d} CPUs) ──\n\n", .{ total, cpu_count });
 
     if (config.show_settings) {
         var count_buf: [26]u8 = undefined;
@@ -170,8 +170,7 @@ pub fn main() !void {
         const window: u16 = if (s.multi_thread) 64 else config.window_size;
 
         const label = format_label(s.label, client_tc);
-        // Overwrite progress line in-place.
-        std.debug.print("\x1b[2K\r  \x1b[33m[{d}/{d}]\x1b[0m {s} \x1b[2m...\x1b[0m", .{ scenario_num, total, &label });
+        std.debug.print("[{d:>2}/{d}] {s} ... ", .{ scenario_num, total, &label });
 
         const result = if (s.use_dtls)
             try run_scenario_dtls(allocator, config, s, client_tc, port, window)
@@ -179,10 +178,11 @@ pub fn main() !void {
             try run_scenario_plain(allocator, config, s, client_tc, port, window);
 
         results[i] = result;
+        var rps_buf: [26]u8 = undefined;
+        std.debug.print("{s:>10} req/s\n", .{fmtInt(&rps_buf, @as(u64, @intFromFloat(result.rps)))});
     }
 
-    // Clear progress line before printing summary.
-    std.debug.print("\x1b[2K\r", .{});
+    std.debug.print("\n", .{});
     print_summary(cpu_count, &results, &scenarios);
 }
 
@@ -658,13 +658,6 @@ fn echo_handler(request: coap.Request) ?coap.Response {
 fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
-        // Silence server log output (info/warn) so it doesn't break the
-        // single-line progress display. Errors still go to stderr via fd 2.
-        const devnull = posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch
-            std.process.exit(1);
-        posix.dup2(devnull, 2) catch {};
-        posix.close(devnull);
-
         var server = coap.Server.init(
             std.heap.page_allocator,
             .{
@@ -756,9 +749,9 @@ fn print_summary(
     scenarios: *const [scenario_templates.len]?Scenario,
 ) void {
     std.debug.print(
-        "\x1b[1m── benchmark suite results ({d} CPUs) ──\x1b[0m\n\n" ++
-            "  \x1b[2m{s:<24}  {s:>12}  {s:>9}  {s:>9}  {s:>9}  {s:>6}\x1b[0m\n" ++
-            "  \x1b[2m------------------------  ------------  ---------  ---------  ---------  ------\x1b[0m\n",
+        "── benchmark suite results ({d} CPUs) ──\n\n" ++
+            "  {s:<24}  {s:>12}  {s:>9}  {s:>9}  {s:>9}  {s:>6}\n" ++
+            "  ------------------------  ------------  ---------  ---------  ---------  ------\n",
         .{
             cpu_count,
             "Scenario", "req/s", "p50 µs", "p99 µs", "p99.9 µs", "errs",
@@ -773,14 +766,12 @@ fn print_summary(
         var err_buf: [26]u8 = undefined;
         const rps_str = fmtInt(&rps_buf, @as(u64, @intFromFloat(r.rps)));
         const err_str = fmtInt(&err_buf, r.errors);
-        const err_color: []const u8 = if (r.errors > 0) "\x1b[31m" else "\x1b[2m";
-        std.debug.print("  \x1b[2m{s}\x1b[0m  \x1b[1;32m{s:>12}\x1b[0m  {d:>9.1}  {d:>9.1}  {d:>9.1}  {s}{s:>6}\x1b[0m\n", .{
+        std.debug.print("  {s}  {s:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {s:>6}\n", .{
             &label,
             rps_str,
             r.p50_us,
             r.p99_us,
             r.p999_us,
-            err_color,
             err_str,
         });
     }
