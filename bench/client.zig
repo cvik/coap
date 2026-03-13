@@ -121,7 +121,7 @@ pub fn main() !void {
                 "  port:             {d}\n" ++
                 "  embedded server:  {s}\n" ++
                 "  threads:          {d} (single: 1, multi: {d})\n" ++
-                "  server bufs:      512 × 1280B (1T), {d} × 1280B ({d}T)\n" ++
+                "  server bufs:      512 × 1280B (auto-clamped by RLIMIT_MEMLOCK)\n" ++
                 "  client window:    {d} (1T), 64 (multi)\n" ++
                 "  warmup:           {d}\n" ++
                 "  requests/scen:    {s}\n\n",
@@ -130,7 +130,6 @@ pub fn main() !void {
                 config.port,
                 if (config.embedded_server) "yes" else "no (--no-server)",
                 cpu_count, cpu_count,
-                serverBufCount(cpu_count), cpu_count,
                 config.window_size,
                 config.warmup_count,
                 count_str,
@@ -162,7 +161,7 @@ pub fn main() !void {
             if (need_restart) {
                 kill_server(&server_pid);
                 const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
-                server_pid = try fork_server(port, srv_tc, psk, serverBufCount(srv_tc));
+                server_pid = try fork_server(port, srv_tc, psk);
                 std.Thread.sleep(150 * std.time.ns_per_ms);
                 current_group = group;
             }
@@ -656,28 +655,14 @@ fn echo_handler(request: coap.Request) ?coap.Response {
     return coap.Response.ok(request.payload());
 }
 
-/// Compute server buffer_count per thread to stay within RLIMIT_MEMLOCK
-/// (typically 8 MB). io_uring rounds ring entries to the next power of 2,
-/// so buffer_count snaps to 512 or 256 to avoid wasting locked memory on
-/// oversized rings.
-fn serverBufCount(thread_count: u16) u16 {
-    // Empirical per-thread cost at each buffer tier (bufs × 1280 + ring overhead):
-    //   512 bufs (ring 2048): ~744 KB → max ~11 threads in 8 MB
-    //   256 bufs (ring 1024): ~380 KB → max ~21 threads in 8 MB
-    const budget_kb: u32 = 8 * 1024;
-    const per_thread_kb = budget_kb / @as(u32, thread_count);
-    if (per_thread_kb >= 744) return 512;
-    return 256;
-}
-
-fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, buf_count: u16) !posix.pid_t {
+fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         var server = coap.Server.init(
             std.heap.page_allocator,
             .{
                 .port = port,
-                .buffer_count = buf_count,
+                .buffer_count = 512,
                 .buffer_size = 1280,
                 .thread_count = thread_count,
                 .rate_limit_ip_count = 0,
