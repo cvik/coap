@@ -2,9 +2,9 @@
 ///
 /// One client per peer — connects to a single server via `connect()`'d UDP.
 /// Supports NON fire-and-forget (`cast`), CON request/response with
-/// retransmission (`call`, `get`, `post`, `put`, `delete`), raw send/recv,
-/// RFC 7641 observe, RFC 7959 Block1 upload, and transparent Block2
-/// reassembly.
+/// retransmission (`call`, `get`, `post`, `put`, `delete`), pipelined
+/// async requests (`submit`, `poll`), raw send/recv, RFC 7641 observe,
+/// RFC 7959 Block1 upload, and transparent Block2 reassembly.
 ///
 /// Single-threaded, tick-driven. Not thread-safe.
 ///
