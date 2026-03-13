@@ -23,7 +23,6 @@ const SuiteConfig = struct {
     embedded_server: bool = true,
     thread_count: u16 = 0, // 0 = nproc
     count_override: ?u32 = null,
-    show_settings: bool = false,
     filter_plain: bool = true,
     filter_dtls: bool = true,
     filter_con: bool = true,
@@ -108,30 +107,28 @@ pub fn main() !void {
         return;
     }
 
-    std.debug.print("── benchmark suite ({d} scenarios, {d} CPUs) ──\n\n", .{ total, cpu_count });
+    std.debug.print("\x1b[1m── benchmark suite ──\x1b[0m\n\n", .{});
 
-    if (config.show_settings) {
+    {
         var count_buf: [26]u8 = undefined;
+        var warmup_buf: [26]u8 = undefined;
         const count_str = if (config.count_override) |c|
             fmtInt(&count_buf, c)
         else
             "per-template default";
         std.debug.print(
-            "  host:             {s}\n" ++
-                "  port:             {d}\n" ++
-                "  embedded server:  {s}\n" ++
-                "  threads:          {d} (single: 1, multi: {d})\n" ++
-                "  server bufs:      512 × 1280B (auto-clamped by RLIMIT_MEMLOCK)\n" ++
-                "  client window:    {d} (1T), 64 (multi)\n" ++
-                "  warmup:           {d}\n" ++
-                "  requests/scen:    {s}\n\n",
+            "  \x1b[2mhost\x1b[0m           {s}:{d}\n" ++
+                "  \x1b[2mthreads\x1b[0m        {d} \x1b[2m(single: 1, multi: {d})\x1b[0m\n" ++
+                "  \x1b[2mserver bufs\x1b[0m    512 × 1280B\n" ++
+                "  \x1b[2mclient window\x1b[0m  {d} \x1b[2m(1T)\x1b[0m, 64 \x1b[2m(multi)\x1b[0m\n" ++
+                "  \x1b[2mwarmup\x1b[0m         {s}\n" ++
+                "  \x1b[2mrequests\x1b[0m       {s}\n\n",
             .{
                 config.host,
                 config.port,
-                if (config.embedded_server) "yes" else "no (--no-server)",
                 cpu_count, cpu_count,
                 config.window_size,
-                config.warmup_count,
+                fmtInt(&warmup_buf, config.warmup_count),
                 count_str,
             },
         );
@@ -170,7 +167,8 @@ pub fn main() !void {
         const window: u16 = if (s.multi_thread) 64 else config.window_size;
 
         const label = format_label(s.label, client_tc);
-        std.debug.print("[{d:>2}/{d}] {s} ... ", .{ scenario_num, total, &label });
+        // Overwrite progress line in-place.
+        std.debug.print("\x1b[2K\r  \x1b[33m[{d}/{d}]\x1b[0m {s} \x1b[2m...\x1b[0m", .{ scenario_num, total, &label });
 
         const result = if (s.use_dtls)
             try run_scenario_dtls(allocator, config, s, client_tc, port, window)
@@ -178,12 +176,11 @@ pub fn main() !void {
             try run_scenario_plain(allocator, config, s, client_tc, port, window);
 
         results[i] = result;
-        var rps_buf: [26]u8 = undefined;
-        std.debug.print("{s:>10} req/s\n", .{fmtInt(&rps_buf, @as(u64, @intFromFloat(result.rps)))});
     }
 
-    std.debug.print("\n", .{});
-    print_summary(cpu_count, &results, &scenarios);
+    // Clear progress line and print results tree.
+    std.debug.print("\x1b[2K\r", .{});
+    print_scenario_tree(cpu_count, &scenarios, &results);
 }
 
 // ── Plain UDP scenario ─────────────────────────────────────────────────
@@ -658,6 +655,13 @@ fn echo_handler(request: coap.Request) ?coap.Response {
 fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
+        // Silence server log output (info/warn) so it doesn't break the
+        // single-line progress display. Errors still go to stderr via fd 2.
+        const devnull = posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch
+            std.process.exit(1);
+        posix.dup2(devnull, 2) catch {};
+        posix.close(devnull);
+
         var server = coap.Server.init(
             std.heap.page_allocator,
             .{
@@ -743,37 +747,141 @@ fn format_label(template: []const u8, thread_count: u16) [24]u8 {
 
 // ── Output ─────────────────────────────────────────────────────────────
 
-fn print_summary(
+/// Print scenarios as a tree grouped by transport → type → thread/payload.
+/// When `results` is non-null, prints result columns on each leaf line.
+fn print_scenario_tree(
     cpu_count: u16,
-    results: *const [scenario_templates.len]?ScenarioResult,
     scenarios: *const [scenario_templates.len]?Scenario,
+    results: ?*const [scenario_templates.len]?ScenarioResult,
 ) void {
-    std.debug.print(
-        "── benchmark suite results ({d} CPUs) ──\n\n" ++
-            "  {s:<24}  {s:>12}  {s:>9}  {s:>9}  {s:>9}  {s:>6}\n" ++
-            "  ------------------------  ------------  ---------  ---------  ---------  ------\n",
-        .{
-            cpu_count,
-            "Scenario", "req/s", "p50 µs", "p99 µs", "p99.9 µs", "errs",
-        },
-    );
+    const D = "\x1b[2m"; // dim
+    const B = "\x1b[1m"; // bold
+    const G = "\x1b[1;32m"; // green bold
+    const R = "\x1b[31m"; // red
+    const Z = "\x1b[0m"; // reset
 
-    for (scenarios, 0..) |maybe_s, i| {
-        const s = maybe_s orelse continue;
-        const r = results[i] orelse continue;
-        const label = format_label(s.label, if (s.multi_thread) cpu_count else 1);
-        var rps_buf: [26]u8 = undefined;
-        var err_buf: [26]u8 = undefined;
-        const rps_str = fmtInt(&rps_buf, @as(u64, @intFromFloat(r.rps)));
-        const err_str = fmtInt(&err_buf, r.errors);
-        std.debug.print("  {s}  {s:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {s:>6}\n", .{
-            &label,
-            rps_str,
-            r.p50_us,
-            r.p99_us,
-            r.p999_us,
-            err_str,
-        });
+    var header_printed = results == null; // skip header when no results
+
+    if (results != null) {
+        std.debug.print(B ++ "── results ({d} CPUs) ──" ++ Z ++ "\n\n", .{cpu_count});
+    }
+
+    const Transport = struct { dtls: bool, name: []const u8 };
+    const transports = [_]Transport{
+        .{ .dtls = false, .name = "Plain" },
+        .{ .dtls = true, .name = "DTLS" },
+    };
+
+    var last_transport_idx: usize = 0;
+    for (transports, 0..) |tr, ti| {
+        for (scenarios.*) |ms| {
+            if (ms) |s| if (s.use_dtls == tr.dtls) {
+                last_transport_idx = ti;
+                break;
+            };
+        }
+    }
+
+    std.debug.print("  " ++ B ++ "Scenarios" ++ Z ++ "\n", .{});
+
+    for (transports, 0..) |tr, ti| {
+        var has_transport = false;
+        for (scenarios.*) |ms| {
+            if (ms) |s| if (s.use_dtls == tr.dtls) {
+                has_transport = true;
+                break;
+            };
+        }
+        if (!has_transport) continue;
+
+        const tr_last = (ti >= last_transport_idx);
+        const tr_branch: []const u8 = if (tr_last) "└─" else "├─";
+        const tr_cont: []const u8 = if (tr_last) "   " else "│  ";
+
+        std.debug.print("  " ++ D ++ "{s}" ++ Z ++ " {s}\n", .{ tr_branch, tr.name });
+
+        // Find which types exist for this transport.
+        const Type = struct { con: bool, name: []const u8 };
+        const types = [_]Type{
+            .{ .con = false, .name = "NON" },
+            .{ .con = true, .name = "CON" },
+        };
+
+        var last_type_idx: usize = 0;
+        for (types, 0..) |ty, tyi| {
+            for (scenarios.*) |ms| {
+                if (ms) |s| if (s.use_dtls == tr.dtls and s.use_confirmable == ty.con) {
+                    last_type_idx = tyi;
+                    break;
+                };
+            }
+        }
+
+        for (types, 0..) |ty, tyi| {
+            var has_type = false;
+            for (scenarios.*) |ms| {
+                if (ms) |s| if (s.use_dtls == tr.dtls and s.use_confirmable == ty.con) {
+                    has_type = true;
+                    break;
+                };
+            }
+            if (!has_type) continue;
+
+            const ty_last = (tyi >= last_type_idx);
+            const ty_branch: []const u8 = if (ty_last) "└─" else "├─";
+            const ty_cont: []const u8 = if (ty_last) "   " else "│  ";
+
+            if (!header_printed) {
+                // Print column headers on the same line as the first type label.
+                // Type prefix: 2 + tr_cont(3) + ty_branch(2) + sp(1) + name(3) = 11 display cols.
+                // Leaf data starts at col 25, so pad 14 cols after the type name.
+                // µ is 2 bytes / 1 col → each latency header needs {s:>9} for 8 display cols.
+                std.debug.print("  " ++ D ++ "{s}{s}" ++ Z ++ " {s}" ++ D ++ "              {s:>10}  {s:>9}  {s:>9}  {s:>9}  {s:>6}" ++ Z ++ "\n", .{
+                    tr_cont, ty_branch, ty.name, "req/s", "p50 µs", "p99 µs", "p99.9 µs", "errs",
+                });
+                header_printed = true;
+            } else {
+                std.debug.print("  " ++ D ++ "{s}{s}" ++ Z ++ " {s}\n", .{ tr_cont, ty_branch, ty.name });
+            }
+
+            // Count + print leaves.
+            var leaf_count: u16 = 0;
+            for (scenarios.*) |ms| {
+                if (ms) |s| {
+                    if (s.use_dtls == tr.dtls and s.use_confirmable == ty.con)
+                        leaf_count += 1;
+                }
+            }
+
+            var leaf_idx: u16 = 0;
+            for (scenarios.*, 0..) |ms, i| {
+                const s = ms orelse continue;
+                if (s.use_dtls != tr.dtls or s.use_confirmable != ty.con) continue;
+                leaf_idx += 1;
+                const leaf_last = (leaf_idx == leaf_count);
+                const l_branch: []const u8 = if (leaf_last) "└─" else "├─";
+
+                const tc: u16 = if (s.multi_thread) cpu_count else 1;
+                var leaf_buf: [12]u8 = .{' '} ** 12;
+                _ = std.fmt.bufPrint(&leaf_buf, "{d:>2}T  {d:>4}B", .{ tc, s.payload_size }) catch {};
+
+                std.debug.print("  " ++ D ++ "{s}{s}{s}" ++ Z ++ " {s}", .{ tr_cont, ty_cont, l_branch, &leaf_buf });
+
+                if (results) |res| {
+                    if (res[i]) |r| {
+                        var rps_buf: [26]u8 = undefined;
+                        var err_buf: [26]u8 = undefined;
+                        const rps_str = fmtInt(&rps_buf, @as(u64, @intFromFloat(r.rps)));
+                        const err_str = fmtInt(&err_buf, r.errors);
+                        const err_color: []const u8 = if (r.errors > 0) R else D;
+                        std.debug.print("  " ++ G ++ "{s:>10}" ++ Z ++ "  {d:>8.1}  {d:>8.1}  {d:>8.1}  {s}{s:>6}" ++ Z ++ "", .{
+                            rps_str, r.p50_us, r.p99_us, r.p999_us, err_color, err_str,
+                        });
+                    }
+                }
+                std.debug.print("\n", .{});
+            }
+        }
     }
 
     std.debug.print("\n", .{});
@@ -792,7 +900,6 @@ fn print_usage() void {
             "  --window <n>      Client sliding window size (default: 256)\n" ++
             "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
             "  --no-server       Don't fork embedded echo server\n" ++
-            "  --settings        Print scenario settings before running\n" ++
             "\n" ++
             "Filters:\n" ++
             "  --plain-only      Skip DTLS scenarios\n" ++
@@ -834,8 +941,6 @@ fn parse_args() SuiteConfig {
             config.thread_count = std.fmt.parseInt(u16, val, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--no-server")) {
             config.embedded_server = false;
-        } else if (std.mem.eql(u8, arg, "--settings")) {
-            config.show_settings = true;
         } else if (std.mem.eql(u8, arg, "--plain-only")) {
             config.filter_dtls = false;
         } else if (std.mem.eql(u8, arg, "--dtls-only")) {
