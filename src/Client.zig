@@ -107,6 +107,12 @@ const InFlightSlot = struct {
     send_offset: u32,
     send_len: u16,
     next_free: u16,
+    // Async Block2 reassembly state.
+    block2_payload: std.ArrayListUnmanaged(u8),
+    doing_block2: bool,
+    original_code: coapz.Code,
+    original_options_buf: [16]coapz.Option,
+    original_options_len: u5,
 };
 
 // ─── Observe ─────────────────────────────────────────────────────
@@ -391,6 +397,11 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
                 @intCast(i + 1)
             else
                 empty_sentinel,
+            .block2_payload = .empty,
+            .doing_block2 = false,
+            .original_code = .empty,
+            .original_options_buf = undefined,
+            .original_options_len = 0,
         };
     }
 
@@ -1343,6 +1354,9 @@ fn allocSlot(client: *Client) !u16 {
 }
 
 fn freeSlot(client: *Client, idx: u16) void {
+    client.slots[idx].block2_payload.deinit(client.allocator);
+    client.slots[idx].block2_payload = .empty;
+    client.slots[idx].doing_block2 = false;
     client.slots[idx].state = .free;
     client.slots[idx].next_free = client.free_head;
     client.free_head = idx;
