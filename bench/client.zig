@@ -156,7 +156,8 @@ pub fn main() !void {
             try run_scenario_plain(allocator, config, s, client_tc, port, window);
 
         results[i] = result;
-        std.debug.print("{d:>10} req/s\n", .{@as(u64, @intFromFloat(result.rps))});
+        var rps_buf: [26]u8 = undefined;
+        std.debug.print("{s:>10} req/s\n", .{fmtInt(&rps_buf, @as(u64, @intFromFloat(result.rps)))});
     }
 
     std.debug.print("\n", .{});
@@ -665,6 +666,33 @@ fn kill_server(pid: *?posix.pid_t) void {
     }
 }
 
+/// Format integer with comma thousand separators: 1234567 → "1,234,567".
+/// Returns a slice into the provided buffer.
+fn fmtInt(buf: *[26]u8, value: u64) []const u8 {
+    var v = value;
+    var i: usize = buf.len;
+    var digits: u8 = 0;
+
+    if (v == 0) {
+        i -= 1;
+        buf[i] = '0';
+        return buf[i..];
+    }
+
+    while (v > 0) {
+        if (digits > 0 and digits % 3 == 0) {
+            i -= 1;
+            buf[i] = ',';
+        }
+        i -= 1;
+        buf[i] = @intCast('0' + (v % 10));
+        v /= 10;
+        digits += 1;
+    }
+
+    return buf[i..];
+}
+
 fn percentile_us(sorted: []i64, p: f64) f64 {
     if (sorted.len == 0) return 0;
     const idx: usize = @min(
@@ -714,13 +742,17 @@ fn print_summary(
         const s = maybe_s orelse continue;
         const r = results[i] orelse continue;
         const label = format_label(s.label, if (s.multi_thread) cpu_count else 1);
-        std.debug.print("  {s}  {d:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {d:>6}\n", .{
+        var rps_buf: [26]u8 = undefined;
+        var err_buf: [26]u8 = undefined;
+        const rps_str = fmtInt(&rps_buf, @as(u64, @intFromFloat(r.rps)));
+        const err_str = fmtInt(&err_buf, r.errors);
+        std.debug.print("  {s}  {s:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {s:>6}\n", .{
             &label,
-            @as(u64, @intFromFloat(r.rps)),
+            rps_str,
             r.p50_us,
             r.p99_us,
             r.p999_us,
-            r.errors,
+            err_str,
         });
     }
 
