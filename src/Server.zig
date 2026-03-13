@@ -189,6 +189,39 @@ pub fn initContext(
     return init_raw(allocator, config, gen.call, @ptrCast(@constCast(context)));
 }
 
+/// Clamp buffer_count so that all io_uring instances fit within
+/// RLIMIT_MEMLOCK. Only the ring structures are locked (provided buffers
+/// are not pinned). Each ring locks approximately:
+///   SQ: ring_entries × 64 bytes (io_uring_sqe)
+///   CQ: ring_entries × 2 × 16 bytes (io_uring_cqe)
+///   ring_entries = next_pow2(buffer_count × 4)
+/// When RLIMIT_MEMLOCK is unlimited (or getrlimit fails), the requested
+/// count is returned unchanged. Minimum returned value is 4.
+fn clampBufferCount(requested: u16, buffer_size: u32, thread_count: u16) u16 {
+    _ = buffer_size;
+    const rl = std.posix.getrlimit(.MEMLOCK) catch return requested;
+    if (rl.cur == linux.RLIM.INFINITY) return requested; // unlimited
+
+    const budget = rl.cur;
+    const tc: u64 = @max(1, thread_count);
+    const per_thread = budget / tc;
+
+    var candidate: u16 = requested;
+    while (candidate > 4) {
+        const ring_entries = std.math.ceilPowerOfTwo(u32, @as(u32, candidate) *| 4) catch break;
+        // SQE: 64 bytes each, CQE: 16 bytes each (2× ring_entries).
+        const locked: u64 = @as(u64, ring_entries) * 96;
+        if (locked <= per_thread) break;
+        candidate /= 2;
+    }
+    if (candidate < requested) {
+        log.info("buffer_count clamped {d} → {d} (RLIMIT_MEMLOCK {d}, {d} threads)", .{
+            requested, candidate, budget, tc,
+        });
+    }
+    return @max(candidate, 4);
+}
+
 fn init_raw(
     allocator: std.mem.Allocator,
     config_in: Config,
@@ -210,6 +243,8 @@ fn init_raw(
     if (config.cpu_affinity) |cores| {
         if (cores.len == 0) return error.InvalidConfig;
     }
+
+    config.buffer_count = clampBufferCount(config.buffer_count, config.buffer_size, config.thread_count);
 
     var io = try Io.init(
         allocator,
