@@ -91,6 +91,18 @@ pub const Result = struct {
     }
 };
 
+/// Opaque handle identifying a submitted async request.
+/// Valid until the corresponding Completion is returned by poll().
+pub const RequestHandle = u16;
+
+/// Completion returned by poll() when a submitted request finishes.
+pub const Completion = struct {
+    /// Handle matching the one returned by submit().
+    handle: RequestHandle,
+    /// The response. Caller must call result.deinit(allocator).
+    result: Result,
+};
+
 // ─── In-flight slot ──────────────────────────────────────────────
 
 const InFlightState = enum(u8) { free, pending };
@@ -698,6 +710,77 @@ pub fn call(
 
     // waitForResponse owns slot cleanup on all paths (success, timeout, reset).
     return client.waitForResponse(allocator, slot_idx, code, options);
+}
+
+// ─── Async API (submit / poll) ───────────────────────────────────
+
+/// Submit a CON request without blocking. Returns a handle that
+/// identifies this request in subsequent poll() completions.
+///
+/// The request is serialized, encrypted (if DTLS), and sent immediately.
+/// Use poll() to drive the event loop and receive completions.
+///
+/// Returns error.TooManyInFlight if max_in_flight slots are exhausted.
+pub fn submit(
+    client: *Client,
+    code: coapz.Code,
+    options: []const coapz.Option,
+    payload: []const u8,
+) !RequestHandle {
+    var token_buf: [8]u8 = undefined;
+    const token = client.makeToken(&token_buf);
+    const msg_id = client.nextMsgId();
+
+    const slot_idx = try client.allocSlot();
+    const slot = &client.slots[slot_idx];
+
+    const packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = code,
+        .msg_id = msg_id,
+        .token = token,
+        .options = options,
+        .payload = payload,
+        .data_buf = &.{},
+    };
+
+    const offset: u32 = @as(u32, slot_idx) * client.config.buffer_size;
+    const slot_buf = client.send_buf[offset..][0..client.config.buffer_size];
+    const wire = packet.writeBuf(slot_buf) catch |err| {
+        client.freeSlot(slot_idx);
+        return err;
+    };
+
+    @memcpy(slot.token[0..token.len], token);
+    slot.token_len = @intCast(token.len);
+    slot.msg_id = msg_id;
+    slot.retransmit_count = 0;
+    slot.send_offset = offset;
+    slot.send_len = @intCast(wire.len);
+    slot.state = .pending;
+
+    // Store original request info for Block2 continuation.
+    slot.original_code = code;
+    const opt_count: u5 = @intCast(@min(options.len, slot.original_options_buf.len));
+    for (0..opt_count) |i| {
+        slot.original_options_buf[i] = options[i];
+    }
+    slot.original_options_len = opt_count;
+    slot.doing_block2 = false;
+    slot.block2_payload = .empty;
+
+    const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
+    slot.timeout_ns = initial_timeout;
+    slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
+
+    client.insertTable(slot_idx, client.tokenKey(token));
+
+    client.sendCoap(wire) catch |err| {
+        client.freeSlotAndTable(slot_idx);
+        return err;
+    };
+
+    return slot_idx;
 }
 
 // ─── Path convenience methods ────────────────────────────────────
