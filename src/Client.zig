@@ -129,6 +129,8 @@ const InFlightSlot = struct {
     original_code: coapz.Code,
     original_options_buf: [16]coapz.Option,
     original_options_len: u5,
+    /// Handle returned to caller by submit(); stable across Block2 continuations.
+    original_handle: u16,
 };
 
 // ─── Observe ─────────────────────────────────────────────────────
@@ -418,6 +420,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
             .original_code = .empty,
             .original_options_buf = undefined,
             .original_options_len = 0,
+            .original_handle = 0,
         };
     }
 
@@ -484,6 +487,9 @@ pub fn deinit(client: *Client) void {
     posix.close(client.fd);
     client.allocator.free(client.send_buf);
     client.allocator.free(client.recv_buf);
+    for (client.slots) |*slot| {
+        slot.block2_payload.deinit(client.allocator);
+    }
     client.allocator.free(client.slots);
     client.allocator.free(client.slot_table);
 }
@@ -739,6 +745,7 @@ pub fn submit(
     slot.original_options_len = opt_count;
     slot.doing_block2 = false;
     slot.block2_payload = .empty;
+    slot.original_handle = slot_idx;
 
     const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
     slot.timeout_ns = initial_timeout;
@@ -779,8 +786,9 @@ pub fn poll(
         if (now >= slot.next_retransmit_ns) {
             if (slot.retransmit_count >= constants.max_retransmit) {
                 const idx: u16 = @intCast(i);
+                const orig_handle = slot.original_handle;
                 client.freeSlotAndTable(idx);
-                return .{ .handle = idx, .result = timeoutResult() };
+                return .{ .handle = orig_handle, .result = timeoutResult() };
             }
             const wire = client.send_buf[slot.send_offset..][0..slot.send_len];
             client.sendCoap(wire) catch {};
@@ -825,9 +833,10 @@ pub fn poll(
     const response = coapz.Packet.read(allocator, data) catch return null;
 
     if (response.kind == .reset) {
+        const orig_handle = slot.original_handle;
         response.deinit(allocator);
         client.freeSlotAndTable(slot_idx);
-        return .{ .handle = slot_idx, .result = resetResult() };
+        return .{ .handle = orig_handle, .result = resetResult() };
     }
 
     // Block2 handling.
@@ -846,6 +855,7 @@ pub fn poll(
                 var saved_b2 = slot.block2_payload;
                 const saved_code = slot.original_code;
                 const saved_olen = slot.original_options_len;
+                const saved_handle = slot.original_handle;
                 var saved_opts: [16]coapz.Option = undefined;
                 @memcpy(saved_opts[0..saved_olen], slot.original_options_buf[0..saved_olen]);
 
@@ -874,6 +884,7 @@ pub fn poll(
                 new_slot.original_code = saved_code;
                 @memcpy(new_slot.original_options_buf[0..saved_olen], saved_opts[0..saved_olen]);
                 new_slot.original_options_len = saved_olen;
+                new_slot.original_handle = saved_handle;
 
                 return null; // Not complete yet.
             }
@@ -883,6 +894,7 @@ pub fn poll(
     // Final response — may be last block of a Block2 sequence.
     const was_block2 = slot.doing_block2;
     var saved_b2 = slot.block2_payload;
+    const orig_handle = slot.original_handle;
     // Prevent freeSlot from deiniting payload we're using.
     slot.block2_payload = .empty;
     slot.doing_block2 = false;
@@ -912,7 +924,7 @@ pub fn poll(
         saved_b2.deinit(allocator);
 
         return .{
-            .handle = slot_idx,
+            .handle = orig_handle,
             .result = .{
                 .code = final_code,
                 .options = final_options,
@@ -933,7 +945,7 @@ pub fn poll(
     }
 
     return .{
-        .handle = slot_idx,
+        .handle = orig_handle,
         .result = .{
             .code = response.code,
             .options = response.options,
@@ -945,12 +957,12 @@ pub fn poll(
 
 fn timeoutResult() Result {
     return .{
-        .code = .internal_server_error,
+        .code = .empty,
         .options = &.{},
         .payload = &.{},
         .packet = .{
-            .kind = .acknowledgement,
-            .code = .internal_server_error,
+            .kind = .reset,
+            .code = .empty,
             .msg_id = 0,
             .token = &.{},
             .options = &.{},
@@ -963,7 +975,7 @@ fn timeoutResult() Result {
 
 fn resetResult() Result {
     return .{
-        .code = .internal_server_error,
+        .code = .empty,
         .options = &.{},
         .payload = &.{},
         .packet = .{
