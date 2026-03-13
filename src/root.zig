@@ -11,6 +11,7 @@
 //! DTLS 1.2 PSK security (RFC 6347).
 //!
 //! **Client:** CON request/response with retransmission (RFC 7252 §4.2),
+//! pipelined async requests (submit/poll) for high-throughput workloads,
 //! NON fire-and-forget, transparent Block2 reassembly, Block1 segmented
 //! upload (RFC 7959), observe subscriptions (RFC 7641), DTLS 1.2 PSK
 //! handshake and encrypted transport.

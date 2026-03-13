@@ -320,7 +320,7 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
     return pid;
 }
 
-/// DTLS benchmark: single coap.Client, sequential CON GET requests.
+/// DTLS benchmark: pipelined CON requests via submit/poll sliding window.
 /// Returns a BenchResult with handshake_ns populated.
 fn run_dtls_bench(
     allocator: std.mem.Allocator,
@@ -329,16 +329,18 @@ fn run_dtls_bench(
     const count = config.request_count;
     const warmup = config.warmup_count;
     const port: u16 = if (config.port == 5683) 5684 else config.port;
+    const window: u16 = config.window_size;
 
     std.debug.print(
-        "benchmarking DTLS: {d} requests (payload={d}B, CON, port={d})...\n",
-        .{ count, config.payload_size, port },
+        "benchmarking DTLS: {d} requests (payload={d}B, CON, window={d}, port={d})...\n",
+        .{ count, config.payload_size, window, port },
     );
 
     var client = try coap.Client.init(allocator, .{
         .host = config.host,
         .port = port,
         .psk = bench_psk,
+        .max_in_flight = window,
     });
     defer client.deinit();
 
@@ -355,7 +357,7 @@ fn run_dtls_bench(
     defer allocator.free(payload);
     @memset(payload, 'x');
 
-    // Warmup.
+    // Warmup (sequential).
     if (warmup > 0) {
         std.debug.print("  warming up ({d} requests)...\n", .{warmup});
         for (0..warmup) |_| {
@@ -364,9 +366,15 @@ fn run_dtls_bench(
         }
     }
 
-    // Timed benchmark.
+    // Per-handle timestamps for latency tracking.
+    const timestamps = try allocator.alloc(i128, window);
+    defer allocator.free(timestamps);
+    @memset(timestamps, 0);
+
+    // Timed benchmark — sliding window.
     const latencies = try allocator.alloc(i64, count);
     errdefer allocator.free(latencies);
+
     var result = BenchResult{
         .sent = 0,
         .received = 0,
@@ -382,27 +390,57 @@ fn run_dtls_bench(
     };
 
     const bench_start = std.time.nanoTimestamp();
+    var total_sent: u32 = 0;
+    var in_flight: u16 = 0;
 
-    for (0..count) |_| {
-        const req_start = std.time.nanoTimestamp();
-        const r = client.call(allocator, .get, &.{}, payload) catch {
-            result.errors += 1;
+    while (result.received + result.errors < count) {
+        // Fill the window.
+        while (in_flight < window and total_sent < count) {
+            const handle = client.submit(.get, &.{}, payload) catch {
+                result.errors += 1;
+                total_sent += 1;
+                continue;
+            };
+            timestamps[handle] = std.time.nanoTimestamp();
+            total_sent += 1;
+            in_flight += 1;
             result.sent += 1;
+            result.bytes_sent += 4 + payload.len;
+        }
+
+        if (in_flight == 0) break;
+
+        // Poll for completions.
+        const c = client.poll(allocator, 50) catch {
+            result.errors += 1;
+            if (in_flight > 0) in_flight -= 1;
             continue;
         };
-        const latency = std.time.nanoTimestamp() - req_start;
-        r.deinit(allocator);
+        const completion = c orelse continue;
 
-        result.sent += 1;
+        in_flight -|= 1;
+
+        if (completion.result._timeout or completion.result._reset) {
+            result.errors += 1;
+            continue;
+        }
+        defer completion.result.deinit(allocator);
+
         result.received += 1;
-        result.bytes_sent += 4 + payload.len;
         result.bytes_received += 4;
-        result.latency_sum_ns += latency;
-        if (latency < result.latency_min_ns) result.latency_min_ns = latency;
-        if (latency > result.latency_max_ns) result.latency_max_ns = latency;
-        if (result.latency_count < count) {
-            result.latencies[result.latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
-            result.latency_count += 1;
+
+        // Latency tracking.
+        const ts = timestamps[completion.handle];
+        if (ts > 0) {
+            const latency = std.time.nanoTimestamp() - ts;
+            result.latency_sum_ns += latency;
+            if (latency < result.latency_min_ns) result.latency_min_ns = latency;
+            if (latency > result.latency_max_ns) result.latency_max_ns = latency;
+            if (result.latency_count < count) {
+                result.latencies[result.latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
+                result.latency_count += 1;
+            }
+            timestamps[completion.handle] = 0;
         }
     }
 
@@ -628,8 +666,9 @@ fn report(config: Config, result: *BenchResult, elapsed_ns: i128) void {
     });
 
     if (result.handshake_ns) |hs_ns| {
-        std.debug.print("  handshake:  {d:.2} ms\n", .{
+        std.debug.print("  handshake:  {d:.2} ms\n  window:     {d}\n", .{
             @as(f64, @floatFromInt(hs_ns)) / 1e6,
+            config.window_size,
         });
     } else {
         std.debug.print("  window:     {d}\n  threads:    {d} server, {d} client\n", .{

@@ -2,9 +2,9 @@
 ///
 /// One client per peer — connects to a single server via `connect()`'d UDP.
 /// Supports NON fire-and-forget (`cast`), CON request/response with
-/// retransmission (`call`, `get`, `post`, `put`, `delete`), raw send/recv,
-/// RFC 7641 observe, RFC 7959 Block1 upload, and transparent Block2
-/// reassembly.
+/// retransmission (`call`, `get`, `post`, `put`, `delete`), pipelined
+/// async requests (`submit`, `poll`), raw send/recv, RFC 7641 observe,
+/// RFC 7959 Block1 upload, and transparent Block2 reassembly.
 ///
 /// Single-threaded, tick-driven. Not thread-safe.
 ///
@@ -76,10 +76,14 @@ pub const Result = struct {
     packet: coapz.Packet,
     _owns_payload: bool = false,
     _owns_options: bool = false,
+    _timeout: bool = false,
+    _reset: bool = false,
 
     /// Free all memory associated with this result. Must be called with
     /// the same allocator that was passed to `call`/`get`/`post`/etc.
+    /// Safe to call on timeout/reset sentinel results (no-op).
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
+        if (self._timeout or self._reset) return;
         if (self._owns_payload) {
             allocator.free(@constCast(self.payload));
         }
@@ -89,6 +93,18 @@ pub const Result = struct {
             self.packet.deinit(allocator);
         }
     }
+};
+
+/// Opaque handle identifying a submitted async request.
+/// Valid until the corresponding Completion is returned by poll().
+pub const RequestHandle = u16;
+
+/// Completion returned by poll() when a submitted request finishes.
+pub const Completion = struct {
+    /// Handle matching the one returned by submit().
+    handle: RequestHandle,
+    /// The response. Caller must call result.deinit(allocator).
+    result: Result,
 };
 
 // ─── In-flight slot ──────────────────────────────────────────────
@@ -107,6 +123,14 @@ const InFlightSlot = struct {
     send_offset: u32,
     send_len: u16,
     next_free: u16,
+    // Async Block2 reassembly state.
+    block2_payload: std.ArrayListUnmanaged(u8),
+    doing_block2: bool,
+    original_code: coapz.Code,
+    original_options_buf: [16]coapz.Option,
+    original_options_len: u5,
+    /// Handle returned to caller by submit(); stable across Block2 continuations.
+    original_handle: u16,
 };
 
 // ─── Observe ─────────────────────────────────────────────────────
@@ -391,6 +415,12 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
                 @intCast(i + 1)
             else
                 empty_sentinel,
+            .block2_payload = .empty,
+            .doing_block2 = false,
+            .original_code = .empty,
+            .original_options_buf = undefined,
+            .original_options_len = 0,
+            .original_handle = 0,
         };
     }
 
@@ -457,6 +487,9 @@ pub fn deinit(client: *Client) void {
     posix.close(client.fd);
     client.allocator.free(client.send_buf);
     client.allocator.free(client.recv_buf);
+    for (client.slots) |*slot| {
+        slot.block2_payload.deinit(client.allocator);
+    }
     client.allocator.free(client.slots);
     client.allocator.free(client.slot_table);
 }
@@ -521,8 +554,10 @@ pub fn handshake(client: *Client) !void {
         }
 
         // Poll until retransmit deadline or overall deadline.
-        const poll_deadline = @min(retransmit_deadline_ns, deadline_ns);
-        const data = client.recvUntil(poll_deadline) orelse continue;
+        const poll_deadline_ns = @min(retransmit_deadline_ns, deadline_ns);
+        const hs_remaining_ns = poll_deadline_ns - now;
+        const hs_timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(hs_remaining_ns, 100 * std.time.ns_per_ms), std.time.ns_per_ms)));
+        const data = client.pollRecv(hs_timeout_ms) orelse continue;
 
         // Must be a DTLS record.
         if (data.len < 1 or !dtls.types.isDtlsContentType(data[0])) continue;
@@ -639,12 +674,41 @@ pub fn call(
     options: []const coapz.Option,
     payload: []const u8,
 ) !Result {
+    const handle = try client.submit(code, options, payload);
+
+    while (true) {
+        const completion = try client.poll(allocator, 50) orelse continue;
+        if (completion.handle == handle) {
+            if (completion.result._timeout) return error.Timeout;
+            if (completion.result._reset) return error.Reset;
+            return completion.result;
+        }
+        // Completion for a different handle — discard.
+        // (Only happens if caller mixed call() with submit/poll.)
+        completion.result.deinit(allocator);
+    }
+}
+
+// ─── Async API (submit / poll) ───────────────────────────────────
+
+/// Submit a CON request without blocking. Returns a handle that
+/// identifies this request in subsequent poll() completions.
+///
+/// The request is serialized, encrypted (if DTLS), and sent immediately.
+/// Use poll() to drive the event loop and receive completions.
+///
+/// Returns error.TooManyInFlight if max_in_flight slots are exhausted.
+pub fn submit(
+    client: *Client,
+    code: coapz.Code,
+    options: []const coapz.Option,
+    payload: []const u8,
+) !RequestHandle {
     var token_buf: [8]u8 = undefined;
     const token = client.makeToken(&token_buf);
     const msg_id = client.nextMsgId();
 
     const slot_idx = try client.allocSlot();
-
     const slot = &client.slots[slot_idx];
 
     const packet = coapz.Packet{
@@ -672,6 +736,17 @@ pub fn call(
     slot.send_len = @intCast(wire.len);
     slot.state = .pending;
 
+    // Store original request info for Block2 continuation.
+    slot.original_code = code;
+    const opt_count: u5 = @intCast(@min(options.len, slot.original_options_buf.len));
+    for (0..opt_count) |i| {
+        slot.original_options_buf[i] = options[i];
+    }
+    slot.original_options_len = opt_count;
+    slot.doing_block2 = false;
+    slot.block2_payload = .empty;
+    slot.original_handle = slot_idx;
+
     const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
     slot.timeout_ns = initial_timeout;
     slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
@@ -683,8 +758,237 @@ pub fn call(
         return err;
     };
 
-    // waitForResponse owns slot cleanup on all paths (success, timeout, reset).
-    return client.waitForResponse(allocator, slot_idx, code, options);
+    return slot_idx;
+}
+
+/// Drive the event loop: receive, decrypt, match tokens, handle
+/// retransmissions, and process Block2 continuations.
+///
+/// Returns a Completion if any submitted request finished, null if
+/// nothing completed within timeout_ms (0 = non-blocking).
+///
+/// Caller must call completion.result.deinit(allocator) when done.
+///
+/// Multiple calls to poll() are needed to drain all pending completions
+/// when multiple requests are in flight.
+pub fn poll(
+    client: *Client,
+    allocator: std.mem.Allocator,
+    timeout_ms: i32,
+) !?Completion {
+    if (client.count_active == 0) return null;
+
+    // Check retransmissions for all active slots.
+    const now = std.time.nanoTimestamp();
+    var earliest_retransmit: i128 = now + 50 * std.time.ns_per_ms;
+    for (client.slots, 0..) |*slot, i| {
+        if (slot.state != .pending) continue;
+        if (now >= slot.next_retransmit_ns) {
+            if (slot.retransmit_count >= constants.max_retransmit) {
+                const idx: u16 = @intCast(i);
+                const orig_handle = slot.original_handle;
+                client.freeSlotAndTable(idx);
+                return .{ .handle = orig_handle, .result = timeoutResult() };
+            }
+            const wire = client.send_buf[slot.send_offset..][0..slot.send_len];
+            client.sendCoap(wire) catch {};
+            slot.retransmit_count += 1;
+            slot.timeout_ns *= 2;
+            slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
+        }
+        if (slot.next_retransmit_ns < earliest_retransmit) {
+            earliest_retransmit = slot.next_retransmit_ns;
+        }
+    }
+
+    // Compute effective timeout: min of caller's timeout and next retransmit.
+    const effective_timeout: i32 = blk: {
+        if (timeout_ms == 0) break :blk 0;
+        const retransmit_ms: i128 = @divTrunc(earliest_retransmit - now, std.time.ns_per_ms);
+        break :blk @intCast(@max(1, @min(timeout_ms, retransmit_ms)));
+    };
+
+    const raw_data = client.pollRecv(effective_timeout) orelse return null;
+    var pt_buf: [constants.buffer_size_default]u8 = undefined;
+    const data = client.decryptRecv(raw_data, &pt_buf) orelse return null;
+
+    if (data.len < 4) return null;
+
+    const tkl: u8 = data[0] & 0x0F;
+    if (data.len < 4 + tkl) return null;
+    const recv_token = data[4..][0..tkl];
+
+    // Route observe notifications.
+    if (client.routeObserve(recv_token, data)) return null;
+
+    // Find matching slot via token hash table.
+    const key = client.tokenKey(recv_token);
+    const slot_idx = client.findSlot(key) orelse return null;
+    const slot = &client.slots[slot_idx];
+
+    // Verify token matches exactly.
+    if (slot.token_len != tkl) return null;
+    if (!std.mem.eql(u8, slot.token[0..slot.token_len], recv_token)) return null;
+
+    const response = coapz.Packet.read(allocator, data) catch return null;
+
+    if (response.kind == .reset) {
+        const orig_handle = slot.original_handle;
+        response.deinit(allocator);
+        client.freeSlotAndTable(slot_idx);
+        return .{ .handle = orig_handle, .result = resetResult() };
+    }
+
+    // Block2 handling.
+    var blk2_it = response.find_options(.block2);
+    if (blk2_it.next()) |blk2_opt| {
+        if (blk2_opt.as_block()) |blk2| {
+            if (blk2.more) {
+                slot.block2_payload.appendSlice(allocator, response.payload) catch {
+                    response.deinit(allocator);
+                    client.freeSlotAndTable(slot_idx);
+                    return null;
+                };
+                slot.doing_block2 = true;
+
+                // Save Block2 state before freeing old slot.
+                var saved_b2 = slot.block2_payload;
+                const saved_code = slot.original_code;
+                const saved_olen = slot.original_options_len;
+                const saved_handle = slot.original_handle;
+                var saved_opts: [16]coapz.Option = undefined;
+                @memcpy(saved_opts[0..saved_olen], slot.original_options_buf[0..saved_olen]);
+
+                // Prevent freeSlot from deiniting the ArrayList we're migrating.
+                slot.block2_payload = .empty;
+                slot.doing_block2 = false;
+
+                response.deinit(allocator);
+                client.freeSlotAndTable(slot_idx);
+
+                // Send Block2 continuation, getting a new slot.
+                const new_idx = client.sendBlock2Request(
+                    blk2.num + 1,
+                    blk2.szx,
+                    saved_code,
+                    saved_opts[0..saved_olen],
+                ) catch {
+                    saved_b2.deinit(allocator);
+                    return null;
+                };
+
+                // Migrate Block2 state to new slot.
+                const new_slot = &client.slots[new_idx];
+                new_slot.block2_payload = saved_b2;
+                new_slot.doing_block2 = true;
+                new_slot.original_code = saved_code;
+                @memcpy(new_slot.original_options_buf[0..saved_olen], saved_opts[0..saved_olen]);
+                new_slot.original_options_len = saved_olen;
+                new_slot.original_handle = saved_handle;
+
+                return null; // Not complete yet.
+            }
+        }
+    }
+
+    // Final response — may be last block of a Block2 sequence.
+    const was_block2 = slot.doing_block2;
+    var saved_b2 = slot.block2_payload;
+    const orig_handle = slot.original_handle;
+    // Prevent freeSlot from deiniting payload we're using.
+    slot.block2_payload = .empty;
+    slot.doing_block2 = false;
+    client.freeSlotAndTable(slot_idx);
+
+    if (was_block2) {
+        saved_b2.appendSlice(allocator, response.payload) catch {
+            response.deinit(allocator);
+            saved_b2.deinit(allocator);
+            return null;
+        };
+
+        const final_code = response.code;
+        const final_options = allocator.dupe(coapz.Option, response.options) catch {
+            response.deinit(allocator);
+            saved_b2.deinit(allocator);
+            return null;
+        };
+        response.deinit(allocator);
+
+        const full_payload = allocator.alloc(u8, saved_b2.items.len) catch {
+            allocator.free(@constCast(final_options));
+            saved_b2.deinit(allocator);
+            return null;
+        };
+        @memcpy(full_payload, saved_b2.items);
+        saved_b2.deinit(allocator);
+
+        return .{
+            .handle = orig_handle,
+            .result = .{
+                .code = final_code,
+                .options = final_options,
+                .payload = full_payload,
+                .packet = .{
+                    .kind = .acknowledgement,
+                    .code = final_code,
+                    .msg_id = 0,
+                    .token = &.{},
+                    .options = final_options,
+                    .payload = full_payload,
+                    .data_buf = &.{},
+                },
+                ._owns_payload = true,
+                ._owns_options = true,
+            },
+        };
+    }
+
+    return .{
+        .handle = orig_handle,
+        .result = .{
+            .code = response.code,
+            .options = response.options,
+            .payload = response.payload,
+            .packet = response,
+        },
+    };
+}
+
+fn timeoutResult() Result {
+    return .{
+        .code = .empty,
+        .options = &.{},
+        .payload = &.{},
+        .packet = .{
+            .kind = .reset,
+            .code = .empty,
+            .msg_id = 0,
+            .token = &.{},
+            .options = &.{},
+            .payload = &.{},
+            .data_buf = &.{},
+        },
+        ._timeout = true,
+    };
+}
+
+fn resetResult() Result {
+    return .{
+        .code = .empty,
+        .options = &.{},
+        .payload = &.{},
+        .packet = .{
+            .kind = .reset,
+            .code = .empty,
+            .msg_id = 0,
+            .token = &.{},
+            .options = &.{},
+            .payload = &.{},
+            .data_buf = &.{},
+        },
+        ._reset = true,
+    };
 }
 
 // ─── Path convenience methods ────────────────────────────────────
@@ -763,10 +1067,8 @@ pub fn recvRaw(
         const now = std.time.nanoTimestamp();
         if (now >= deadline) return null;
 
-        const raw_data = client.tryRecv() orelse {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-            continue;
-        };
+        const remaining_ms: i32 = @intCast(@max(1, @divTrunc(deadline - now, std.time.ns_per_ms)));
+        const raw_data = client.pollRecv(remaining_ms) orelse continue;
         var pt_buf: [constants.buffer_size_default]u8 = undefined;
         const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
         const packet = coapz.Packet.read(allocator, data) catch continue;
@@ -1006,16 +1308,24 @@ fn tryRecv(client: *Client) ?[]const u8 {
     return client.recv_buf[0..n];
 }
 
-/// Poll for recv with deadline. Returns data or null on timeout.
-fn recvUntil(client: *Client, deadline_ns: i128) ?[]const u8 {
-    while (true) {
-        if (client.tryRecv()) |data| return data;
-        const now = std.time.nanoTimestamp();
-        if (now >= deadline_ns) return null;
-        // Brief sleep to avoid busy-loop; 500µs is short enough for
-        // CoAP retransmission granularity (seconds).
-        std.Thread.sleep(500 * std.time.ns_per_us);
+/// Poll for recv with timeout in milliseconds. Returns data or null on timeout.
+/// Uses poll() syscall instead of sleep-loop for minimal latency.
+fn pollRecv(client: *Client, timeout_ms: i32) ?[]const u8 {
+    // Try non-blocking recv first (avoids syscall if data already queued).
+    if (client.tryRecv()) |data| return data;
+    if (timeout_ms == 0) return null;
+
+    var pfd = [1]posix.pollfd{.{
+        .fd = client.fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    _ = posix.poll(&pfd, timeout_ms) catch return null;
+
+    if (pfd[0].revents & posix.POLL.IN != 0) {
+        return client.tryRecv();
     }
+    return null;
 }
 
 /// Decrypt a DTLS record if DTLS is active, returning the plaintext CoAP data.
@@ -1042,8 +1352,7 @@ fn decryptRecv(client: *Client, data: []const u8, pt_buf: []u8) ?[]const u8 {
 
 /// Process one recv cycle. Returns true if data was received and dispatched.
 fn tickOnce(client: *Client) !bool {
-    const deadline = std.time.nanoTimestamp() + 50 * std.time.ns_per_ms;
-    const raw_data = client.recvUntil(deadline) orelse return false;
+    const raw_data = client.pollRecv(50) orelse return false;
     var pt_buf: [constants.buffer_size_default]u8 = undefined;
     const data = client.decryptRecv(raw_data, &pt_buf) orelse return false;
     client.dispatchRecv(data);
@@ -1115,11 +1424,9 @@ fn waitForResponse(
         }
 
         // Wait until next retransmit deadline or a short poll interval.
-        const poll_deadline = @min(
-            slot.next_retransmit_ns,
-            now + 50 * std.time.ns_per_ms,
-        );
-        const raw_data = client.recvUntil(poll_deadline) orelse continue;
+        const retransmit_remaining_ns = slot.next_retransmit_ns - now;
+        const timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(retransmit_remaining_ns, 50 * std.time.ns_per_ms), std.time.ns_per_ms)));
+        const raw_data = client.pollRecv(timeout_ms) orelse continue;
         var pt_buf: [constants.buffer_size_default]u8 = undefined;
         const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
 
@@ -1290,11 +1597,9 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
         }
 
-        const poll_deadline = @min(
-            slot.next_retransmit_ns,
-            now + 50 * std.time.ns_per_ms,
-        );
-        const raw_data = client.recvUntil(poll_deadline) orelse continue;
+        const retransmit_remaining_ns = slot.next_retransmit_ns - now;
+        const ack_timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(retransmit_remaining_ns, 50 * std.time.ns_per_ms), std.time.ns_per_ms)));
+        const raw_data = client.pollRecv(ack_timeout_ms) orelse continue;
         var pt_buf_ack: [constants.buffer_size_default]u8 = undefined;
         const data = client.decryptRecv(raw_data, &pt_buf_ack) orelse continue;
 
@@ -1343,6 +1648,9 @@ fn allocSlot(client: *Client) !u16 {
 }
 
 fn freeSlot(client: *Client, idx: u16) void {
+    client.slots[idx].block2_payload.deinit(client.allocator);
+    client.slots[idx].block2_payload = .empty;
+    client.slots[idx].doing_block2 = false;
     client.slots[idx].state = .free;
     client.slots[idx].next_free = client.free_head;
     client.free_head = idx;
@@ -1665,4 +1973,85 @@ test "get convenience calls call with path options" {
     const result = try client.get(testing.allocator, "/hello");
     defer result.deinit(testing.allocator);
     try testing.expectEqual(coapz.Code.content, result.code);
+}
+
+test "submit returns handle without blocking" {
+    const port: u16 = 29710;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    const start = std.time.nanoTimestamp();
+    const handle = try client.submit(.get, &.{}, "hello");
+    const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, std.time.ns_per_us);
+
+    try testing.expect(elapsed_us < 5000);
+    try testing.expect(handle < 4);
+}
+
+test "submit and poll round-trip" {
+    const port: u16 = 29711;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 8,
+    });
+    defer client.deinit();
+
+    const h = try client.submit(.get, &.{}, "async-hello");
+
+    var completion: ?Completion = null;
+    for (0..100) |_| {
+        completion = try client.poll(testing.allocator, 50);
+        if (completion != null) break;
+    }
+
+    const c = completion orelse return error.NoCompletion;
+    defer c.result.deinit(testing.allocator);
+
+    try testing.expectEqual(h, c.handle);
+    try testing.expectEqual(.content, c.result.code);
+    try testing.expectEqualSlices(u8, "async-hello", c.result.payload);
+}
+
+test "multiple concurrent submits" {
+    const port: u16 = 29712;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 8,
+    });
+    defer client.deinit();
+
+    _ = try client.submit(.get, &.{}, "req-0");
+    _ = try client.submit(.get, &.{}, "req-1");
+    _ = try client.submit(.get, &.{}, "req-2");
+    _ = try client.submit(.get, &.{}, "req-3");
+
+    var completed: u8 = 0;
+    for (0..200) |_| {
+        const c = try client.poll(testing.allocator, 50) orelse continue;
+        defer c.result.deinit(testing.allocator);
+        try testing.expectEqual(.content, c.result.code);
+        completed += 1;
+        if (completed == 4) break;
+    }
+    try testing.expectEqual(@as(u8, 4), completed);
 }
