@@ -144,13 +144,17 @@ pub fn main() !void {
             }
         }
 
+        // Scale per-thread window down with thread count so total
+        // concurrency stays reasonable (threads provide the parallelism).
+        const window: u16 = @max(config.window_size / client_tc, 32);
+
         const label = format_label(s.label, client_tc);
         std.debug.print("[{d:>2}/{d}] {s} ... ", .{ scenario_num, total, &label });
 
         const result = if (s.use_dtls)
-            try run_scenario_dtls(allocator, config, s, client_tc, port)
+            try run_scenario_dtls(allocator, config, s, client_tc, port, window)
         else
-            try run_scenario_plain(allocator, config, s, client_tc, port);
+            try run_scenario_plain(allocator, config, s, client_tc, port, window);
 
         results[i] = result;
         std.debug.print("{d:>10} req/s\n", .{@as(u64, @intFromFloat(result.rps))});
@@ -168,6 +172,7 @@ fn run_scenario_plain(
     s: Scenario,
     tc: u16,
     port: u16,
+    window: u16,
 ) !ScenarioResult {
     const count = s.request_count;
 
@@ -192,7 +197,7 @@ fn run_scenario_plain(
     if (config.warmup_count > 0) {
         const fd = try make_client_socket(config.host, port);
         defer posix.close(fd);
-        _ = try run_bench(allocator, fd, template_wire, config.warmup_count, config.window_size, false);
+        _ = try run_bench(allocator, fd, template_wire, config.warmup_count, window, false);
     }
 
     const extra: u16 = tc -| 1;
@@ -217,13 +222,13 @@ fn run_scenario_plain(
     for (0..extra) |j| {
         worker_results[j] = .{};
         threads[j] = try std.Thread.spawn(.{}, plain_worker, .{
-            allocator, config.host, port, template_wire, per_thread, config.window_size, &worker_results[j],
+            allocator, config.host, port, template_wire, per_thread, window, &worker_results[j],
         });
     }
 
     const main_fd = try make_client_socket(config.host, port);
     defer posix.close(main_fd);
-    const main_result = try run_bench(allocator, main_fd, template_wire, per_thread + remainder, config.window_size, true);
+    const main_result = try run_bench(allocator, main_fd, template_wire, per_thread + remainder, window, true);
     worker_results[extra] = .{ .result = main_result };
 
     for (threads) |t| t.join();
@@ -299,6 +304,7 @@ fn run_scenario_dtls(
     s: Scenario,
     tc: u16,
     port: u16,
+    window: u16,
 ) !ScenarioResult {
     const count = s.request_count;
     const extra: u16 = tc -| 1;
@@ -319,14 +325,14 @@ fn run_scenario_dtls(
     for (0..extra) |j| {
         worker_results[j] = .{};
         threads[j] = try std.Thread.spawn(.{}, dtls_worker, .{
-            allocator, config.host, port, config.window_size, s.payload_size,
+            allocator, config.host, port, window, s.payload_size,
             per_thread, config.warmup_count, &worker_results[j],
         });
     }
 
     worker_results[extra] = .{};
     dtls_worker(
-        allocator, config.host, port, config.window_size, s.payload_size,
+        allocator, config.host, port, window, s.payload_size,
         per_thread + remainder, config.warmup_count, &worker_results[extra],
     );
 
