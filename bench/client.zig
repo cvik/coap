@@ -310,8 +310,6 @@ fn run_scenario_dtls(
         allocator.free(worker_results);
     }
 
-    const start = std.time.nanoTimestamp();
-
     for (0..extra) |j| {
         worker_results[j] = .{};
         threads[j] = try std.Thread.spawn(.{}, dtls_worker, .{
@@ -328,8 +326,7 @@ fn run_scenario_dtls(
 
     for (threads) |t| t.join();
 
-    const elapsed_ns = std.time.nanoTimestamp() - start;
-    return aggregate_dtls(allocator, worker_results, elapsed_ns);
+    return aggregate_dtls(allocator, worker_results);
 }
 
 const DtlsWorkerResult = struct {
@@ -337,6 +334,7 @@ const DtlsWorkerResult = struct {
     errors: u64 = 0,
     latencies: ?[]i64 = null,
     latency_count: u32 = 0,
+    bench_elapsed_ns: i128 = 0,
 };
 
 fn dtls_worker(
@@ -363,6 +361,7 @@ fn dtls_worker(
     defer allocator.free(payload);
     @memset(payload, 'x');
 
+    // Warmup (not timed).
     for (0..warmup_count) |_| {
         const r = client.call(allocator, .get, &.{}, payload) catch continue;
         r.deinit(allocator);
@@ -380,6 +379,9 @@ fn dtls_worker(
     var latency_count: u32 = 0;
     var total_sent: u32 = 0;
     var in_flight: u16 = 0;
+
+    // Timed benchmark phase only.
+    const bench_start = std.time.nanoTimestamp();
 
     while (received + errors < count) {
         while (in_flight < window and total_sent < count) {
@@ -424,19 +426,22 @@ fn dtls_worker(
         }
     }
 
+    out.bench_elapsed_ns = std.time.nanoTimestamp() - bench_start;
     out.sent = sent;
     out.errors = errors;
     out.latencies = latencies;
     out.latency_count = latency_count;
 }
 
-fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResult, elapsed_ns: i128) !ScenarioResult {
+fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResult) !ScenarioResult {
     var total_sent: u64 = 0;
     var total_errors: u64 = 0;
     var total_lat_count: u64 = 0;
+    var max_elapsed_ns: i128 = 0;
 
     for (worker_results) |wr| {
         total_sent += wr.sent;
+        if (wr.bench_elapsed_ns > max_elapsed_ns) max_elapsed_ns = wr.bench_elapsed_ns;
         total_errors += wr.errors;
         total_lat_count += wr.latency_count;
     }
@@ -459,7 +464,7 @@ fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResu
 
     std.mem.sortUnstable(i64, merged, {}, std.sort.asc(i64));
 
-    const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    const elapsed_s: f64 = @as(f64, @floatFromInt(max_elapsed_ns)) / 1e9;
     return .{
         .rps = if (elapsed_s > 0) @as(f64, @floatFromInt(total_sent)) / elapsed_s else 0,
         .p50_us = percentile_us(merged, 0.50),
@@ -654,19 +659,15 @@ fn percentile_us(sorted: []i64, p: f64) f64 {
     return @as(f64, @floatFromInt(sorted[idx])) / 1000.0;
 }
 
-fn format_label(template: []const u8, thread_count: u16) [21]u8 {
-    var buf: [21]u8 = .{' '} ** 21;
+fn format_label(template: []const u8, thread_count: u16) [24]u8 {
+    var buf: [24]u8 = .{' '} ** 24;
     var out_i: usize = 0;
     var in_i: usize = 0;
     while (in_i < template.len and out_i < buf.len) {
-        if (in_i + 2 < template.len and template[in_i] == '#' and template[in_i + 1] == '#') {
-            // Replace ## with right-aligned thread count.
-            if (thread_count >= 10) {
-                buf[out_i] = '0' + @as(u8, @intCast(thread_count / 10 % 10));
-            }
-            out_i += 1;
-            buf[out_i] = '0' + @as(u8, @intCast(thread_count % 10));
-            out_i += 1;
+        if (in_i + 1 < template.len and template[in_i] == '#' and template[in_i + 1] == '#') {
+            // Replace ## with thread count (up to 5 digits).
+            const tc_str = std.fmt.bufPrint(buf[out_i..], "{d}", .{thread_count}) catch break;
+            out_i += tc_str.len;
             in_i += 2;
         } else {
             buf[out_i] = template[in_i];
@@ -686,8 +687,8 @@ fn print_summary(
 ) void {
     std.debug.print(
         "── benchmark suite results ({d} CPUs) ──\n\n" ++
-            "  {s:<21}  {s:>12}  {s:>9}  {s:>9}  {s:>9}  {s:>6}\n" ++
-            "  ---------------------  ------------  ---------  ---------  ---------  ------\n",
+            "  {s:<24}  {s:>12}  {s:>9}  {s:>9}  {s:>9}  {s:>6}\n" ++
+            "  ------------------------  ------------  ---------  ---------  ---------  ------\n",
         .{
             cpu_count,
             "Scenario", "req/s", "p50 us", "p99 us", "p99.9 us", "errs",
