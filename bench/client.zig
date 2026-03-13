@@ -86,6 +86,11 @@ pub fn main() !void {
         config.thread_count
     else
         @intCast(@min(std.Thread.getCpuCount() catch 1, std.math.maxInt(u16)));
+    // Cap server threads to stay within RLIMIT_MEMLOCK (typically 8MB).
+    // Each io_uring worker ring costs ~2MB of kernel-locked memory;
+    // 4 threads × 256 buffers fits comfortably. The echo server doesn't
+    // need more — client threads (cpu_count) drive the load.
+    const server_threads: u16 = @min(cpu_count, 4);
 
     var scenarios: [scenario_templates.len]?Scenario = .{null} ** scenario_templates.len;
     var total: u16 = 0;
@@ -119,8 +124,9 @@ pub fn main() !void {
     for (scenarios, 0..) |maybe_scenario, i| {
         const s = maybe_scenario orelse continue;
         scenario_num += 1;
-        const tc = if (s.multi_thread) cpu_count else 1;
-        const group = ServerGroup{ .use_dtls = s.use_dtls, .thread_count = tc };
+        const client_tc = if (s.multi_thread) cpu_count else 1;
+        const srv_tc = if (s.multi_thread) server_threads else 1;
+        const group = ServerGroup{ .use_dtls = s.use_dtls, .thread_count = srv_tc };
         const port = if (s.use_dtls and config.port == 5683) @as(u16, 5684) else config.port;
 
         if (config.embedded_server) {
@@ -132,19 +138,19 @@ pub fn main() !void {
             if (need_restart) {
                 kill_server(&server_pid);
                 const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
-                server_pid = try fork_server(port, tc, psk);
+                server_pid = try fork_server(port, srv_tc, psk);
                 std.Thread.sleep(150 * std.time.ns_per_ms);
                 current_group = group;
             }
         }
 
-        const label = format_label(s.label, tc);
+        const label = format_label(s.label, client_tc);
         std.debug.print("[{d:>2}/{d}] {s} ... ", .{ scenario_num, total, &label });
 
         const result = if (s.use_dtls)
-            try run_scenario_dtls(allocator, config, s, tc, port)
+            try run_scenario_dtls(allocator, config, s, client_tc, port)
         else
-            try run_scenario_plain(allocator, config, s, tc, port);
+            try run_scenario_plain(allocator, config, s, client_tc, port);
 
         results[i] = result;
         std.debug.print("{d:>10} req/s\n", .{@as(u64, @intFromFloat(result.rps))});
@@ -622,13 +628,15 @@ fn echo_handler(request: coap.Request) ?coap.Response {
 }
 
 fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
+    const buf_count: u16 = if (thread_count > 1) 256 else 512;
+
     const pid = try posix.fork();
     if (pid == 0) {
         var server = coap.Server.init(
             std.heap.page_allocator,
             .{
                 .port = port,
-                .buffer_count = 512,
+                .buffer_count = buf_count,
                 .buffer_size = 1280,
                 .thread_count = thread_count,
                 .rate_limit_ip_count = 0,
@@ -647,6 +655,8 @@ fn kill_server(pid: *?posix.pid_t) void {
         posix.kill(p, posix.SIG.TERM) catch {};
         _ = posix.waitpid(p, 0);
         pid.* = null;
+        // Let kernel fully reclaim io_uring ring memory before next server.
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }
 
