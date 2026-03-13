@@ -23,6 +23,7 @@ const SuiteConfig = struct {
     embedded_server: bool = true,
     thread_count: u16 = 0, // 0 = nproc
     count_override: ?u32 = null,
+    show_settings: bool = false,
     filter_plain: bool = true,
     filter_dtls: bool = true,
     filter_con: bool = true,
@@ -86,10 +87,6 @@ pub fn main() !void {
         config.thread_count
     else
         @intCast(@min(std.Thread.getCpuCount() catch 1, std.math.maxInt(u16)));
-    // Cap server threads to stay within RLIMIT_MEMLOCK (typically 8MB).
-    // With buffer_count=512, ~17 workers fit in 8MB (~470KB per io_uring
-    // instance). 16 is a safe cap that maximizes server-side parallelism.
-    const server_threads: u16 = @min(cpu_count, 16);
 
     var scenarios: [scenario_templates.len]?Scenario = .{null} ** scenario_templates.len;
     var total: u16 = 0;
@@ -113,6 +110,34 @@ pub fn main() !void {
 
     std.debug.print("── benchmark suite ({d} scenarios, {d} CPUs) ──\n\n", .{ total, cpu_count });
 
+    if (config.show_settings) {
+        var count_buf: [26]u8 = undefined;
+        const count_str = if (config.count_override) |c|
+            fmtInt(&count_buf, c)
+        else
+            "per-template default";
+        std.debug.print(
+            "  host:             {s}\n" ++
+                "  port:             {d}\n" ++
+                "  embedded server:  {s}\n" ++
+                "  threads:          {d} (single: 1, multi: {d})\n" ++
+                "  server bufs:      512 × 1280B (1T), {d} × 1280B ({d}T)\n" ++
+                "  client window:    {d} (1T), 64 (multi)\n" ++
+                "  warmup:           {d}\n" ++
+                "  requests/scen:    {s}\n\n",
+            .{
+                config.host,
+                config.port,
+                if (config.embedded_server) "yes" else "no (--no-server)",
+                cpu_count, cpu_count,
+                serverBufCount(cpu_count), cpu_count,
+                config.window_size,
+                config.warmup_count,
+                count_str,
+            },
+        );
+    }
+
     var results: [scenario_templates.len]?ScenarioResult = .{null} ** scenario_templates.len;
     var current_group: ?ServerGroup = null;
     var server_pid: ?posix.pid_t = null;
@@ -124,7 +149,7 @@ pub fn main() !void {
         const s = maybe_scenario orelse continue;
         scenario_num += 1;
         const client_tc = if (s.multi_thread) cpu_count else 1;
-        const srv_tc = if (s.multi_thread) server_threads else 1;
+        const srv_tc = if (s.multi_thread) cpu_count else 1;
         const group = ServerGroup{ .use_dtls = s.use_dtls, .thread_count = srv_tc };
         const port = if (s.use_dtls and config.port == 5683) @as(u16, 5684) else config.port;
 
@@ -137,15 +162,13 @@ pub fn main() !void {
             if (need_restart) {
                 kill_server(&server_pid);
                 const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
-                server_pid = try fork_server(port, srv_tc, psk);
+                server_pid = try fork_server(port, srv_tc, psk, serverBufCount(srv_tc));
                 std.Thread.sleep(150 * std.time.ns_per_ms);
                 current_group = group;
             }
         }
 
-        // Scale per-thread window down with thread count so total
-        // concurrency stays reasonable (threads provide the parallelism).
-        const window: u16 = @max(config.window_size / client_tc, 32);
+        const window: u16 = if (s.multi_thread) 64 else config.window_size;
 
         const label = format_label(s.label, client_tc);
         std.debug.print("[{d:>2}/{d}] {s} ... ", .{ scenario_num, total, &label });
@@ -156,7 +179,8 @@ pub fn main() !void {
             try run_scenario_plain(allocator, config, s, client_tc, port, window);
 
         results[i] = result;
-        std.debug.print("{d:>10} req/s\n", .{@as(u64, @intFromFloat(result.rps))});
+        var rps_buf: [26]u8 = undefined;
+        std.debug.print("{s:>10} req/s\n", .{fmtInt(&rps_buf, @as(u64, @intFromFloat(result.rps)))});
     }
 
     std.debug.print("\n", .{});
@@ -632,9 +656,21 @@ fn echo_handler(request: coap.Request) ?coap.Response {
     return coap.Response.ok(request.payload());
 }
 
-fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
-    const buf_count: u16 = 512;
+/// Compute server buffer_count per thread to stay within RLIMIT_MEMLOCK
+/// (typically 8 MB). io_uring rounds ring entries to the next power of 2,
+/// so buffer_count snaps to 512 or 256 to avoid wasting locked memory on
+/// oversized rings.
+fn serverBufCount(thread_count: u16) u16 {
+    // Empirical per-thread cost at each buffer tier (bufs × 1280 + ring overhead):
+    //   512 bufs (ring 2048): ~744 KB → max ~11 threads in 8 MB
+    //   256 bufs (ring 1024): ~380 KB → max ~21 threads in 8 MB
+    const budget_kb: u32 = 8 * 1024;
+    const per_thread_kb = budget_kb / @as(u32, thread_count);
+    if (per_thread_kb >= 744) return 512;
+    return 256;
+}
 
+fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, buf_count: u16) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         var server = coap.Server.init(
@@ -663,6 +699,33 @@ fn kill_server(pid: *?posix.pid_t) void {
         // Let kernel fully reclaim io_uring ring memory before next server.
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
+}
+
+/// Format integer with comma thousand separators: 1234567 → "1,234,567".
+/// Returns a slice into the provided buffer.
+fn fmtInt(buf: *[26]u8, value: u64) []const u8 {
+    var v = value;
+    var i: usize = buf.len;
+    var digits: u8 = 0;
+
+    if (v == 0) {
+        i -= 1;
+        buf[i] = '0';
+        return buf[i..];
+    }
+
+    while (v > 0) {
+        if (digits > 0 and digits % 3 == 0) {
+            i -= 1;
+            buf[i] = ',';
+        }
+        i -= 1;
+        buf[i] = @intCast('0' + (v % 10));
+        v /= 10;
+        digits += 1;
+    }
+
+    return buf[i..];
 }
 
 fn percentile_us(sorted: []i64, p: f64) f64 {
@@ -714,13 +777,17 @@ fn print_summary(
         const s = maybe_s orelse continue;
         const r = results[i] orelse continue;
         const label = format_label(s.label, if (s.multi_thread) cpu_count else 1);
-        std.debug.print("  {s}  {d:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {d:>6}\n", .{
+        var rps_buf: [26]u8 = undefined;
+        var err_buf: [26]u8 = undefined;
+        const rps_str = fmtInt(&rps_buf, @as(u64, @intFromFloat(r.rps)));
+        const err_str = fmtInt(&err_buf, r.errors);
+        std.debug.print("  {s}  {s:>12}  {d:>9.1}  {d:>9.1}  {d:>9.1}  {s:>6}\n", .{
             &label,
-            @as(u64, @intFromFloat(r.rps)),
+            rps_str,
             r.p50_us,
             r.p99_us,
             r.p999_us,
-            r.errors,
+            err_str,
         });
     }
 
@@ -729,13 +796,41 @@ fn print_summary(
 
 // ── CLI ────────────────────────────────────────────────────────────────
 
+fn print_usage() void {
+    std.debug.print(
+        "Usage: bench [options]\n\n" ++
+            "Options:\n" ++
+            "  --host <addr>     Server address (default: 127.0.0.1)\n" ++
+            "  --port <port>     Server port (default: 5683)\n" ++
+            "  --count <n>       Override request count per scenario\n" ++
+            "  --warmup <n>      Warmup requests (default: 1000)\n" ++
+            "  --window <n>      Client sliding window size (default: 256)\n" ++
+            "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
+            "  --no-server       Don't fork embedded echo server\n" ++
+            "  --settings        Print scenario settings before running\n" ++
+            "\n" ++
+            "Filters:\n" ++
+            "  --plain-only      Skip DTLS scenarios\n" ++
+            "  --dtls-only       Skip plain UDP scenarios\n" ++
+            "  --con-only        Skip NON scenarios\n" ++
+            "  --non-only        Skip CON scenarios\n" ++
+            "  --single-only     Skip multi-threaded scenarios\n" ++
+            "  --multi-only      Skip single-threaded scenarios\n" ++
+            "\n" ++
+            "  -h, --help        Show this help\n"
+    , .{});
+}
+
 fn parse_args() SuiteConfig {
     var config = SuiteConfig{};
     var args = std.process.args();
     _ = args.next();
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            print_usage();
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--host")) {
             config.host = args.next() orelse "127.0.0.1";
         } else if (std.mem.eql(u8, arg, "--port")) {
             const val = args.next() orelse "5683";
@@ -754,6 +849,8 @@ fn parse_args() SuiteConfig {
             config.thread_count = std.fmt.parseInt(u16, val, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--no-server")) {
             config.embedded_server = false;
+        } else if (std.mem.eql(u8, arg, "--settings")) {
+            config.show_settings = true;
         } else if (std.mem.eql(u8, arg, "--plain-only")) {
             config.filter_dtls = false;
         } else if (std.mem.eql(u8, arg, "--dtls-only")) {
@@ -771,6 +868,10 @@ fn parse_args() SuiteConfig {
             std.mem.eql(u8, arg, "--dtls"))
         {
             std.debug.print("error: {s} removed in suite mode, use filter flags\n", .{arg});
+            std.process.exit(1);
+        } else {
+            std.debug.print("error: unknown flag: {s}\n\n", .{arg});
+            print_usage();
             std.process.exit(1);
         }
     }
