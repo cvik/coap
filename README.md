@@ -15,6 +15,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 
 **Client:**
 - CON request/response with retransmission (RFC 7252 §4.2)
+- Pipelined async requests (`submit`/`poll`) for high-throughput workloads
 - NON fire-and-forget requests
 - Transparent Block2 response reassembly
 - Block1 segmented upload (RFC 7959)
@@ -335,6 +336,46 @@ const result = try client.call(allocator, .get, &.{
 defer result.deinit(allocator);
 ```
 
+### submit / poll — pipelined async
+
+For high-throughput workloads, use `submit` to send CON requests without
+blocking, then `poll` to drive the event loop and collect completions:
+
+```zig
+var client = try coap.Client.init(allocator, .{
+    .host = "10.0.0.1",
+    .max_in_flight = 64,
+});
+defer client.deinit();
+
+// Submit multiple requests — returns immediately.
+const h1 = try client.submit(.get, &.{
+    .{ .kind = .uri_path, .value = "temperature" },
+}, &.{});
+const h2 = try client.submit(.get, &.{
+    .{ .kind = .uri_path, .value = "humidity" },
+}, &.{});
+
+// Poll for completions (handles retransmission, Block2 reassembly).
+while (try client.poll(allocator, 100)) |completion| {
+    defer completion.result.deinit(allocator);
+    if (completion.handle == h1) {
+        std.debug.print("temp: {s}\n", .{completion.result.payload});
+    } else if (completion.handle == h2) {
+        std.debug.print("humidity: {s}\n", .{completion.result.payload});
+    }
+}
+```
+
+`poll` returns `null` when the timeout expires with no completion. Check
+`completion.result._timeout` or `._reset` for error conditions. Option
+`value` memory passed to `submit` must remain valid until the corresponding
+completion.
+
+The blocking `call`/`get`/`post`/`put`/`delete` methods are implemented as
+`submit` + `poll` internally — both APIs share the same slot infrastructure
+and can be mixed freely.
+
 ### sendRaw / recvRaw — low-level
 
 Send and receive raw CoAP packets without protocol automation:
@@ -652,18 +693,17 @@ Echo server on loopback, minimal CoAP NON GET (6 bytes):
 | p50 / p99 / p99.9 | 286µs / 750µs / 1766µs |
 | Packet loss | 0% |
 
-**DTLS** (`--dtls --count 1000 --warmup 100`):
+**DTLS** (`--dtls --count 100000 --window 64`):
 
 | Metric | Value |
 |--------|-------|
-| Handshake | ~1.8ms |
-| Throughput | ~1,800 req/s |
-| Avg latency | ~558µs |
-| p50 / p99 / p99.9 | ~559µs / ~586µs / ~612µs |
+| Handshake | ~0.3ms |
+| Throughput | ~139K req/s |
+| Avg latency | ~458µs |
+| p50 / p99 / p99.9 | ~473µs / ~670µs / ~1044µs |
 
-DTLS uses sequential CON requests through `coap.Client` (no pipelining),
-so throughput reflects per-request encryption overhead. The handshake
-completes in a single round-trip on loopback.
+DTLS uses pipelined CON requests through `coap.Client.submit`/`poll` with
+a sliding window. The handshake completes in a single round-trip on loopback.
 
 Loopback numbers are bottlenecked by the kernel's UDP stack. With a real
 NIC and RSS distributing across queues, throughput scales further with
@@ -687,6 +727,7 @@ Benchmark options: `--count`, `--window`, `--payload`, `--con`,
 - [x] Per-IP rate limiting and load shedding
 - [x] Client library (cast, call, observe, block transfer)
 - [x] DTLS 1.2 PSK security (RFC 6347)
+- [x] Pipelined async client API (submit/poll)
 - [ ] Routing
 
 ## License

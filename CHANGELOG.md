@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0] - 2026-03-13
+- Pipelined async client API: `submit()` / `poll()` for high-throughput workloads
+- `RequestHandle` and `Completion` types for non-blocking request/response
+- Replace sleep-polling with `posix.poll()` syscall (eliminates 500µs latency floor)
+- `call()` refactored as `submit` + `poll` wrapper (no API change)
+- Transparent Block2 reassembly in async mode with stable handle tracking
+- DTLS benchmark: pipelined sliding window (~1.8K → ~139K req/s)
+
 ## [0.3.0] - 2026-03-12
 - DTLS 1.2 PSK security (RFC 6347) for server and client
 - TLS_PSK_WITH_AES_128_CCM_8 cipher suite (RFC 7252 §9 mandatory)
