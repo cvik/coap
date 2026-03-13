@@ -668,52 +668,19 @@ pub fn call(
     options: []const coapz.Option,
     payload: []const u8,
 ) !Result {
-    var token_buf: [8]u8 = undefined;
-    const token = client.makeToken(&token_buf);
-    const msg_id = client.nextMsgId();
+    const handle = try client.submit(code, options, payload);
 
-    const slot_idx = try client.allocSlot();
-
-    const slot = &client.slots[slot_idx];
-
-    const packet = coapz.Packet{
-        .kind = .confirmable,
-        .code = code,
-        .msg_id = msg_id,
-        .token = token,
-        .options = options,
-        .payload = payload,
-        .data_buf = &.{},
-    };
-
-    const offset: u32 = @as(u32, slot_idx) * client.config.buffer_size;
-    const slot_buf = client.send_buf[offset..][0..client.config.buffer_size];
-    const wire = packet.writeBuf(slot_buf) catch |err| {
-        client.freeSlot(slot_idx);
-        return err;
-    };
-
-    @memcpy(slot.token[0..token.len], token);
-    slot.token_len = @intCast(token.len);
-    slot.msg_id = msg_id;
-    slot.retransmit_count = 0;
-    slot.send_offset = offset;
-    slot.send_len = @intCast(wire.len);
-    slot.state = .pending;
-
-    const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
-    slot.timeout_ns = initial_timeout;
-    slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
-
-    client.insertTable(slot_idx, client.tokenKey(token));
-
-    client.sendCoap(wire) catch |err| {
-        client.freeSlotAndTable(slot_idx);
-        return err;
-    };
-
-    // waitForResponse owns slot cleanup on all paths (success, timeout, reset).
-    return client.waitForResponse(allocator, slot_idx, code, options);
+    while (true) {
+        const completion = try client.poll(allocator, 50) orelse continue;
+        if (completion.handle == handle) {
+            if (completion.result._timeout) return error.Timeout;
+            if (completion.result._reset) return error.Reset;
+            return completion.result;
+        }
+        // Completion for a different handle — discard.
+        // (Only happens if caller mixed call() with submit/poll.)
+        completion.result.deinit(allocator);
+    }
 }
 
 // ─── Async API (submit / poll) ───────────────────────────────────
