@@ -532,8 +532,10 @@ pub fn handshake(client: *Client) !void {
         }
 
         // Poll until retransmit deadline or overall deadline.
-        const poll_deadline = @min(retransmit_deadline_ns, deadline_ns);
-        const data = client.recvUntil(poll_deadline) orelse continue;
+        const poll_deadline_ns = @min(retransmit_deadline_ns, deadline_ns);
+        const hs_remaining_ns = poll_deadline_ns - now;
+        const hs_timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(hs_remaining_ns, 100 * std.time.ns_per_ms), std.time.ns_per_ms)));
+        const data = client.pollRecv(hs_timeout_ms) orelse continue;
 
         // Must be a DTLS record.
         if (data.len < 1 or !dtls.types.isDtlsContentType(data[0])) continue;
@@ -774,10 +776,8 @@ pub fn recvRaw(
         const now = std.time.nanoTimestamp();
         if (now >= deadline) return null;
 
-        const raw_data = client.tryRecv() orelse {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-            continue;
-        };
+        const remaining_ms: i32 = @intCast(@max(1, @divTrunc(deadline - now, std.time.ns_per_ms)));
+        const raw_data = client.pollRecv(remaining_ms) orelse continue;
         var pt_buf: [constants.buffer_size_default]u8 = undefined;
         const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
         const packet = coapz.Packet.read(allocator, data) catch continue;
@@ -1017,16 +1017,24 @@ fn tryRecv(client: *Client) ?[]const u8 {
     return client.recv_buf[0..n];
 }
 
-/// Poll for recv with deadline. Returns data or null on timeout.
-fn recvUntil(client: *Client, deadline_ns: i128) ?[]const u8 {
-    while (true) {
-        if (client.tryRecv()) |data| return data;
-        const now = std.time.nanoTimestamp();
-        if (now >= deadline_ns) return null;
-        // Brief sleep to avoid busy-loop; 500µs is short enough for
-        // CoAP retransmission granularity (seconds).
-        std.Thread.sleep(500 * std.time.ns_per_us);
+/// Poll for recv with timeout in milliseconds. Returns data or null on timeout.
+/// Uses poll() syscall instead of sleep-loop for minimal latency.
+fn pollRecv(client: *Client, timeout_ms: i32) ?[]const u8 {
+    // Try non-blocking recv first (avoids syscall if data already queued).
+    if (client.tryRecv()) |data| return data;
+    if (timeout_ms == 0) return null;
+
+    var pfd = [1]posix.pollfd{.{
+        .fd = client.fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    _ = posix.poll(&pfd, timeout_ms) catch return null;
+
+    if (pfd[0].revents & posix.POLL.IN != 0) {
+        return client.tryRecv();
     }
+    return null;
 }
 
 /// Decrypt a DTLS record if DTLS is active, returning the plaintext CoAP data.
@@ -1053,8 +1061,7 @@ fn decryptRecv(client: *Client, data: []const u8, pt_buf: []u8) ?[]const u8 {
 
 /// Process one recv cycle. Returns true if data was received and dispatched.
 fn tickOnce(client: *Client) !bool {
-    const deadline = std.time.nanoTimestamp() + 50 * std.time.ns_per_ms;
-    const raw_data = client.recvUntil(deadline) orelse return false;
+    const raw_data = client.pollRecv(50) orelse return false;
     var pt_buf: [constants.buffer_size_default]u8 = undefined;
     const data = client.decryptRecv(raw_data, &pt_buf) orelse return false;
     client.dispatchRecv(data);
@@ -1126,11 +1133,9 @@ fn waitForResponse(
         }
 
         // Wait until next retransmit deadline or a short poll interval.
-        const poll_deadline = @min(
-            slot.next_retransmit_ns,
-            now + 50 * std.time.ns_per_ms,
-        );
-        const raw_data = client.recvUntil(poll_deadline) orelse continue;
+        const retransmit_remaining_ns = slot.next_retransmit_ns - now;
+        const timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(retransmit_remaining_ns, 50 * std.time.ns_per_ms), std.time.ns_per_ms)));
+        const raw_data = client.pollRecv(timeout_ms) orelse continue;
         var pt_buf: [constants.buffer_size_default]u8 = undefined;
         const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
 
@@ -1301,11 +1306,9 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
         }
 
-        const poll_deadline = @min(
-            slot.next_retransmit_ns,
-            now + 50 * std.time.ns_per_ms,
-        );
-        const raw_data = client.recvUntil(poll_deadline) orelse continue;
+        const retransmit_remaining_ns = slot.next_retransmit_ns - now;
+        const ack_timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(retransmit_remaining_ns, 50 * std.time.ns_per_ms), std.time.ns_per_ms)));
+        const raw_data = client.pollRecv(ack_timeout_ms) orelse continue;
         var pt_buf_ack: [constants.buffer_size_default]u8 = undefined;
         const data = client.decryptRecv(raw_data, &pt_buf_ack) orelse continue;
 
