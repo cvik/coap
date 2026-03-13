@@ -706,7 +706,7 @@ fn print_summary(
             "  ------------------------  ------------  ---------  ---------  ---------  ------\n",
         .{
             cpu_count,
-            "Scenario", "req/s", "p50 us", "p99 us", "p99.9 us", "errs",
+            "Scenario", "req/s", "p50 µs", "p99 µs", "p99.9 µs", "errs",
         },
     );
 
