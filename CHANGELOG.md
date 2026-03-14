@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.2] - 2026-03-14
+- DTLS: parallelize AES-CTR in CCM using `xorWide` (AES-NI pipelining)
+- Bench: tree-structured output grouped by transport → type → thread/payload
+- Bench: colored output, single-line progress, suppress server logs
+
 ## [0.4.1] - 2026-03-13
 - Server auto-clamps `buffer_count` to fit RLIMIT_MEMLOCK at init
 - Bench: comma-separated large numbers in output, `--settings` and `--help` flags
