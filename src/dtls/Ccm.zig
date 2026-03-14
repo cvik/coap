@@ -101,19 +101,39 @@ fn makeCtrBlock(nonce: [nonce_len]u8, counter: u24) [block_len]u8 {
 
 /// AES-CTR encryption/decryption (symmetric operation).
 /// Counter starts at 1. Writes to dst which must be same length as src.
+/// Uses wide (parallel) AES-NI operations when available, processing
+/// multiple counter blocks per round to exploit instruction pipelining.
 fn ctrEncrypt(aes: AesEncryptCtx(Aes128), nonce: [nonce_len]u8, src: []const u8, dst: []u8) void {
     std.debug.assert(dst.len == src.len);
     var counter: u24 = 1;
     var offset: usize = 0;
-    while (offset < src.len) : (offset += block_len) {
-        const ctr_block = makeCtrBlock(nonce, counter);
-        var keystream: [block_len]u8 = undefined;
-        aes.encrypt(&keystream, &ctr_block);
-        const chunk_len = @min(block_len, src.len - offset);
-        for (0..chunk_len) |i| {
-            dst[offset + i] = src[offset + i] ^ keystream[i];
+
+    // Process blocks in parallel batches using xorWide.
+    const par = comptime AesEncryptCtx(Aes128).block.parallel.optimal_parallel_blocks;
+    const wide_len = par * block_len;
+
+    while (offset + wide_len <= src.len) : (offset += wide_len) {
+        var counters: [wide_len]u8 = undefined;
+        inline for (0..par) |j| {
+            counters[j * block_len ..][0..block_len].* = makeCtrBlock(nonce, counter +% @as(u24, @intCast(j)));
         }
+        aes.xorWide(par, dst[offset..][0..wide_len], src[offset..][0..wide_len], counters);
+        counter +%= par;
+    }
+
+    // Remaining full blocks, one at a time.
+    while (offset + block_len <= src.len) : (offset += block_len) {
+        aes.xor(dst[offset..][0..block_len], src[offset..][0..block_len], makeCtrBlock(nonce, counter));
         counter += 1;
+    }
+
+    // Final partial block.
+    if (offset < src.len) {
+        var pad: [block_len]u8 = .{0} ** block_len;
+        const tail = src.len - offset;
+        @memcpy(pad[0..tail], src[offset..][0..tail]);
+        aes.xor(&pad, &pad, makeCtrBlock(nonce, counter));
+        @memcpy(dst[offset..][0..tail], pad[0..tail]);
     }
 }
 
