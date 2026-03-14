@@ -66,6 +66,12 @@ const scenario_templates = [_]Scenario{
     .{ .label = "Plain CON ##T     0B", .use_dtls = false, .use_confirmable = true, .multi_thread = true, .payload_size = 0, .request_count = 100_000 },
     .{ .label = "Plain CON ##T   100B", .use_dtls = false, .use_confirmable = true, .multi_thread = true, .payload_size = 100, .request_count = 100_000 },
     .{ .label = "Plain CON ##T  1000B", .use_dtls = false, .use_confirmable = true, .multi_thread = true, .payload_size = 1000, .request_count = 100_000 },
+    .{ .label = "DTLS  NON  1T     0B", .use_dtls = true, .use_confirmable = false, .multi_thread = false, .payload_size = 0, .request_count = 100_000 },
+    .{ .label = "DTLS  NON  1T   100B", .use_dtls = true, .use_confirmable = false, .multi_thread = false, .payload_size = 100, .request_count = 100_000 },
+    .{ .label = "DTLS  NON  1T  1000B", .use_dtls = true, .use_confirmable = false, .multi_thread = false, .payload_size = 1000, .request_count = 100_000 },
+    .{ .label = "DTLS  NON ##T     0B", .use_dtls = true, .use_confirmable = false, .multi_thread = true, .payload_size = 0, .request_count = 100_000 },
+    .{ .label = "DTLS  NON ##T   100B", .use_dtls = true, .use_confirmable = false, .multi_thread = true, .payload_size = 100, .request_count = 100_000 },
+    .{ .label = "DTLS  NON ##T  1000B", .use_dtls = true, .use_confirmable = false, .multi_thread = true, .payload_size = 1000, .request_count = 100_000 },
     .{ .label = "DTLS  CON  1T     0B", .use_dtls = true, .use_confirmable = true, .multi_thread = false, .payload_size = 0, .request_count = 25_000 },
     .{ .label = "DTLS  CON  1T   100B", .use_dtls = true, .use_confirmable = true, .multi_thread = false, .payload_size = 100, .request_count = 25_000 },
     .{ .label = "DTLS  CON  1T  1000B", .use_dtls = true, .use_confirmable = true, .multi_thread = false, .payload_size = 1000, .request_count = 25_000 },
@@ -134,6 +140,7 @@ pub fn main() !void {
         );
     }
 
+    const counters = try alloc_shared_counters();
     var results: [scenario_templates.len]?ScenarioResult = .{null} ** scenario_templates.len;
     var current_group: ?ServerGroup = null;
     var server_pid: ?posix.pid_t = null;
@@ -158,11 +165,14 @@ pub fn main() !void {
             if (need_restart) {
                 kill_server(&server_pid);
                 const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
-                server_pid = try fork_server(port, srv_tc, psk);
+                server_pid = try fork_server(port, srv_tc, psk, counters);
                 std.Thread.sleep(150 * std.time.ns_per_ms);
                 current_group = group;
             }
         }
+
+        // Reset server counters before each scenario.
+        counters.reset();
 
         const window: u16 = if (s.multi_thread) 64 else config.window_size;
 
@@ -175,6 +185,22 @@ pub fn main() !void {
         else
             try run_scenario_plain(allocator, config, s, client_tc, port, window);
 
+        // For NON scenarios, use server-side throughput measurement.
+        if (!s.use_confirmable) {
+            const srv_count = counters.count.load(.acquire);
+            const srv_elapsed = counters.elapsed_ns();
+            if (srv_count > 0 and srv_elapsed > 0) {
+                const srv_s: f64 = @as(f64, @floatFromInt(srv_elapsed)) / 1e9;
+                results[i] = .{
+                    .rps = @as(f64, @floatFromInt(srv_count)) / srv_s,
+                    .p50_us = 0,
+                    .p99_us = 0,
+                    .p999_us = 0,
+                    .errors = result.errors,
+                };
+                continue;
+            }
+        }
         results[i] = result;
     }
 
@@ -193,15 +219,128 @@ fn run_scenario_plain(
     port: u16,
     window: u16,
 ) !ScenarioResult {
+    if (s.use_confirmable) {
+        return run_scenario_plain_con(allocator, config, s, tc, port, window);
+    } else {
+        return run_scenario_plain_non(allocator, config, s, tc, port);
+    }
+}
+
+/// Plain NON: fire-and-forget send. Server counters provide throughput.
+fn run_scenario_plain_non(
+    allocator: std.mem.Allocator,
+    config: SuiteConfig,
+    s: Scenario,
+    tc: u16,
+    port: u16,
+) !ScenarioResult {
+    const count = s.request_count;
+    const payload = try allocator.alloc(u8, s.payload_size);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    const template = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0,
+        .token = &.{ 0x00, 0x00 },
+        .options = &.{},
+        .payload = payload,
+        .data_buf = &.{},
+    };
+    const template_wire = try template.write(allocator);
+    defer allocator.free(template_wire);
+
+    // Warmup.
+    if (config.warmup_count > 0) {
+        const fd = try make_client_socket(config.host, port);
+        defer posix.close(fd);
+        for (0..config.warmup_count) |_| {
+            _ = posix.send(fd, template_wire, 0) catch continue;
+        }
+        posix.close(fd);
+    }
+
+    const extra: u16 = tc -| 1;
+    const threads = try allocator.alloc(std.Thread, extra);
+    defer allocator.free(threads);
+    const per_thread = count / tc;
+    const remainder = count % tc;
+
+    var send_errors: [256]u64 = .{0} ** 256;
+
+    for (0..extra) |j| {
+        threads[j] = try std.Thread.spawn(.{}, plain_non_worker, .{
+            config.host, port, template_wire, per_thread, &send_errors[j],
+        });
+    }
+
+    // Main thread.
+    const fd = try make_client_socket(config.host, port);
+    var main_errors: u64 = 0;
+    var send_buf: [1280]u8 = undefined;
+    @memcpy(send_buf[0..template_wire.len], template_wire);
+    var msg_id: u16 = 0;
+    for (0..per_thread + remainder) |_| {
+        send_buf[2] = @intCast(msg_id >> 8);
+        send_buf[3] = @intCast(msg_id & 0xFF);
+        _ = posix.send(fd, send_buf[0..template_wire.len], 0) catch {
+            main_errors += 1;
+            msg_id +%= 1;
+            continue;
+        };
+        msg_id +%= 1;
+    }
+    posix.close(fd);
+
+    for (threads) |t| t.join();
+
+    // Small drain delay so server processes remaining packets.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    var total_errors: u64 = main_errors;
+    for (send_errors[0..extra]) |e| total_errors += e;
+
+    // Server counters provide the actual throughput (filled by caller).
+    return .{ .rps = 0, .p50_us = 0, .p99_us = 0, .p999_us = 0, .errors = total_errors };
+}
+
+fn plain_non_worker(host: []const u8, port: u16, wire: []const u8, count: u32, errors_out: *u64) void {
+    const fd = make_client_socket(host, port) catch return;
+    var send_buf: [1280]u8 = undefined;
+    @memcpy(send_buf[0..wire.len], wire);
+    var errors: u64 = 0;
+    var msg_id: u16 = 0;
+    for (0..count) |_| {
+        send_buf[2] = @intCast(msg_id >> 8);
+        send_buf[3] = @intCast(msg_id & 0xFF);
+        _ = posix.send(fd, send_buf[0..wire.len], 0) catch {
+            errors += 1;
+            msg_id +%= 1;
+            continue;
+        };
+        msg_id +%= 1;
+    }
+    posix.close(fd);
+    errors_out.* = errors;
+}
+
+fn run_scenario_plain_con(
+    allocator: std.mem.Allocator,
+    config: SuiteConfig,
+    s: Scenario,
+    tc: u16,
+    port: u16,
+    window: u16,
+) !ScenarioResult {
     const count = s.request_count;
 
     const payload = try allocator.alloc(u8, s.payload_size);
     defer allocator.free(payload);
     @memset(payload, 'x');
 
-    const kind: coapz.MessageKind = if (s.use_confirmable) .confirmable else .non_confirmable;
     const template = coapz.Packet{
-        .kind = kind,
+        .kind = .confirmable,
         .code = .get,
         .msg_id = 0,
         .token = &.{ 0x00, 0x00 },
@@ -345,14 +484,14 @@ fn run_scenario_dtls(
         worker_results[j] = .{};
         threads[j] = try std.Thread.spawn(.{}, dtls_worker, .{
             allocator, config.host, port, window, s.payload_size,
-            per_thread, config.warmup_count, &worker_results[j],
+            s.use_confirmable, per_thread, config.warmup_count, &worker_results[j],
         });
     }
 
     worker_results[extra] = .{};
     dtls_worker(
         allocator, config.host, port, window, s.payload_size,
-        per_thread + remainder, config.warmup_count, &worker_results[extra],
+        s.use_confirmable, per_thread + remainder, config.warmup_count, &worker_results[extra],
     );
 
     for (threads) |t| t.join();
@@ -374,6 +513,7 @@ fn dtls_worker(
     port: u16,
     window: u16,
     payload_size: u16,
+    use_confirmable: bool,
     count: u32,
     warmup_count: u32,
     out: *DtlsWorkerResult,
@@ -393,11 +533,32 @@ fn dtls_worker(
     @memset(payload, 'x');
 
     // Warmup (not timed).
-    for (0..warmup_count) |_| {
-        const r = client.call(allocator, .get, &.{}, payload) catch continue;
-        r.deinit(allocator);
+    if (use_confirmable) {
+        for (0..warmup_count) |_| {
+            const r = client.call(allocator, .get, &.{}, payload) catch continue;
+            r.deinit(allocator);
+        }
+    } else {
+        for (0..warmup_count) |_| {
+            client.cast(.get, &.{}, payload) catch continue;
+        }
     }
 
+    if (use_confirmable) {
+        dtls_worker_con(&client, allocator, window, payload, count, out);
+    } else {
+        dtls_worker_non(&client, payload, count, out);
+    }
+}
+
+fn dtls_worker_con(
+    client: *coap.Client,
+    allocator: std.mem.Allocator,
+    window: u16,
+    payload: []const u8,
+    count: u32,
+    out: *DtlsWorkerResult,
+) void {
     const timestamps = allocator.alloc(i128, window) catch return;
     defer allocator.free(timestamps);
     @memset(timestamps, 0);
@@ -411,7 +572,6 @@ fn dtls_worker(
     var total_sent: u32 = 0;
     var in_flight: u16 = 0;
 
-    // Timed benchmark phase only.
     const bench_start = std.time.nanoTimestamp();
 
     while (received + errors < count) {
@@ -462,6 +622,30 @@ fn dtls_worker(
     out.errors = errors;
     out.latencies = latencies;
     out.latency_count = latency_count;
+}
+
+fn dtls_worker_non(
+    client: *coap.Client,
+    payload: []const u8,
+    count: u32,
+    out: *DtlsWorkerResult,
+) void {
+    var sent: u64 = 0;
+    var errors: u64 = 0;
+
+    const bench_start = std.time.nanoTimestamp();
+
+    for (0..count) |_| {
+        client.cast(.get, &.{}, payload) catch {
+            errors += 1;
+            continue;
+        };
+        sent += 1;
+    }
+
+    out.bench_elapsed_ns = std.time.nanoTimestamp() - bench_start;
+    out.sent = sent;
+    out.errors = errors;
 }
 
 fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResult) !ScenarioResult {
@@ -652,7 +836,47 @@ fn echo_handler(request: coap.Request) ?coap.Response {
     return coap.Response.ok(request.payload());
 }
 
-fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
+/// Shared counters for server-side throughput measurement (mmap'd MAP_SHARED).
+const ServerCounters = struct {
+    count: std.atomic.Value(u64) align(64) = std.atomic.Value(u64).init(0),
+    first_ns: std.atomic.Value(i64) align(64) = std.atomic.Value(i64).init(0),
+    last_ns: std.atomic.Value(i64) align(64) = std.atomic.Value(i64).init(0),
+
+    fn reset(self: *ServerCounters) void {
+        self.count.store(0, .release);
+        self.first_ns.store(0, .release);
+        self.last_ns.store(0, .release);
+    }
+
+    fn elapsed_ns(self: *ServerCounters) i64 {
+        return self.last_ns.load(.acquire) - self.first_ns.load(.acquire);
+    }
+};
+
+fn counting_handler(counters: *ServerCounters, request: coap.Request) ?coap.Response {
+    const now: i64 = @truncate(std.time.nanoTimestamp());
+    _ = @atomicRmw(u64, &counters.count.raw, .Add, 1, .monotonic);
+    // Set first_ns only on the first request (CAS from 0).
+    _ = @cmpxchgWeak(i64, &counters.first_ns.raw, 0, now, .monotonic, .monotonic);
+    counters.last_ns.store(now, .monotonic);
+    return coap.Response.ok(request.payload());
+}
+
+fn alloc_shared_counters() !*ServerCounters {
+    const page = try posix.mmap(
+        null,
+        @max(@sizeOf(ServerCounters), 4096),
+        posix.PROT.READ | posix.PROT.WRITE,
+        .{ .TYPE = .SHARED, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    const ptr: *ServerCounters = @ptrCast(@alignCast(page.ptr));
+    ptr.* = .{};
+    return ptr;
+}
+
+fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerCounters) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // Silence server log output (info/warn) so it doesn't break the
@@ -662,19 +886,36 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk) !posix.pid_t {
         posix.dup2(devnull, 2) catch {};
         posix.close(devnull);
 
-        var server = coap.Server.init(
-            std.heap.page_allocator,
-            .{
-                .port = port,
-                .buffer_count = 512,
-                .buffer_size = 1280,
-                .thread_count = thread_count,
-                .rate_limit_ip_count = 0,
-                .psk = psk,
-            },
-            echo_handler,
-        ) catch std.process.exit(1);
-        server.run() catch std.process.exit(1);
+        if (counters) |ctx| {
+            var server = coap.Server.initContext(
+                std.heap.page_allocator,
+                .{
+                    .port = port,
+                    .buffer_count = 512,
+                    .buffer_size = 1280,
+                    .thread_count = thread_count,
+                    .rate_limit_ip_count = 0,
+                    .psk = psk,
+                },
+                counting_handler,
+                ctx,
+            ) catch std.process.exit(1);
+            server.run() catch std.process.exit(1);
+        } else {
+            var server = coap.Server.init(
+                std.heap.page_allocator,
+                .{
+                    .port = port,
+                    .buffer_count = 512,
+                    .buffer_size = 1280,
+                    .thread_count = thread_count,
+                    .rate_limit_ip_count = 0,
+                    .psk = psk,
+                },
+                echo_handler,
+            ) catch std.process.exit(1);
+            server.run() catch std.process.exit(1);
+        }
         unreachable;
     }
     return pid;
