@@ -11,7 +11,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - DTLS 1.2 PSK security (RFC 6347) with AES-128-CCM-8
 - Simple handler interface: `fn(Request) ?Response`
 - Context handlers and error-handling wrappers (`safeWrap`)
-- ~840K req/s single-threaded, ~2.8M req/s multi-threaded on loopback
+- ~840K req/s single-threaded, ~5M req/s multi-threaded on loopback
 
 **Client:**
 - CON request/response with retransmission (RFC 7252 §4.2)
@@ -111,7 +111,7 @@ Add to your `build.zig.zon`:
 
 ```zig
 .coap = .{
-    .url = "git+https://github.com/cvik/coap#v0.2.0",
+    .url = "git+https://github.com/cvik/coap#v0.4.2",
     .hash = "...",  // zig build will tell you the expected hash
 },
 ```
@@ -673,44 +673,37 @@ Log messages:
 
 ## Benchmarks
 
-Echo server on loopback, minimal CoAP NON GET (6 bytes):
+Echo server on loopback (32 CPUs). The bench suite groups scenarios by
+transport (Plain/DTLS) × type (NON/CON) × threads × payload size.
+NON throughput is measured server-side via shared-memory atomic counters.
+CON throughput is measured client-side (echo round-trip).
 
-**Single-threaded** (`--count 1000000 --warmup 10000 --window 256`):
+**Plain UDP:**
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 841K req/s |
-| Avg latency | 304µs |
-| p50 / p99 / p99.9 | 291µs / 496µs / 874µs |
-| Packet loss | 0% |
+| Scenario | req/s | p50 µs | p99 µs | p99.9 µs |
+|----------|------:|-------:|-------:|---------:|
+| NON 1T 0B | 840K | — | — | — |
+| NON 32T 0B | 3.3M | — | — | — |
+| CON 1T 0B | 840K | 310 | 340 | 530 |
+| CON 32T 0B | 5.0M | 210 | 1,480 | 2,580 |
 
-**Multi-threaded** (`--count 1000000 --warmup 10000 --threads 20 --window 64`):
+**DTLS (TLS_PSK_WITH_AES_128_CCM_8):**
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 2.79M req/s |
-| Avg latency | 292µs |
-| p50 / p99 / p99.9 | 286µs / 750µs / 1766µs |
-| Packet loss | 0% |
-
-**DTLS** (`--dtls --count 100000 --window 64`):
-
-| Metric | Value |
-|--------|-------|
-| Handshake | ~0.3ms |
-| Throughput | ~139K req/s |
-| Avg latency | ~458µs |
-| p50 / p99 / p99.9 | ~473µs / ~670µs / ~1044µs |
-
-DTLS uses pipelined CON requests through `coap.Client.submit`/`poll` with
-a sliding window. The handshake completes in a single round-trip on loopback.
+| Scenario | req/s | p50 µs | p99 µs | p99.9 µs |
+|----------|------:|-------:|-------:|---------:|
+| NON 1T 0B | 700K | — | — | — |
+| NON 32T 0B | 3.5M | — | — | — |
+| CON 1T 0B | 185K | 1,340 | 1,580 | 1,870 |
+| CON 32T 0B | 1.1M | 1,500 | 3,690 | 6,410 |
 
 Loopback numbers are bottlenecked by the kernel's UDP stack. With a real
 NIC and RSS distributing across queues, throughput scales further with
 core count.
 
-Benchmark options: `--count`, `--window`, `--payload`, `--con`,
-`--threads`, `--warmup`, `--no-server`, `--host`, `--port`, `--dtls`.
+Run benchmarks: `zig build bench -Doptimize=ReleaseFast`
+
+Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
+`--single-only`, `--multi-only`. Use `--help` for all options.
 
 ## Requirements
 
@@ -728,7 +721,14 @@ Benchmark options: `--count`, `--window`, `--payload`, `--con`,
 - [x] Client library (cast, call, observe, block transfer)
 - [x] DTLS 1.2 PSK security (RFC 6347)
 - [x] Pipelined async client API (submit/poll)
-- [ ] Routing
+- [x] Auto-clamp buffer_count to fit RLIMIT_MEMLOCK
+- [x] Parallel AES-CTR via AES-NI xorWide
+- [ ] IPv6
+- [ ] Separate (delayed) responses
+- [ ] Server-side Observe (RFC 7641)
+- [ ] Server-side Block1/Block2 (RFC 7959)
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full protocol compliance roadmap.
 
 ## License
 
