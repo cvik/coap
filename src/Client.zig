@@ -704,21 +704,23 @@ pub fn call(
 /// Use poll() to drive the event loop and receive completions.
 ///
 /// Returns error.TooManyInFlight if max_in_flight slots are exhausted.
+/// Returns error.NstartExceeded if peer is unconfirmed and NSTART
+/// outstanding CONs are already in flight (RFC 7252 §4.7).
 pub fn submit(
     client: *Client,
     code: coapz.Code,
     options: []const coapz.Option,
     payload: []const u8,
 ) !RequestHandle {
-    var token_buf: [8]u8 = undefined;
-    const token = client.makeToken(&token_buf);
-    const msg_id = client.nextMsgId();
-
     // NSTART enforcement (RFC 7252 §4.7): limit outstanding CONs
     // to nstart until the first successful response from this peer.
     if (!client.peer_confirmed and client.count_active >= constants.nstart) {
         return error.NstartExceeded;
     }
+
+    var token_buf: [8]u8 = undefined;
+    const token = client.makeToken(&token_buf);
+    const msg_id = client.nextMsgId();
 
     const slot_idx = try client.allocSlot();
     const slot = &client.slots[slot_idx];
