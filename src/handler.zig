@@ -161,6 +161,11 @@ pub const Response = struct {
         return .{ .code = .forbidden };
     }
 
+    /// 4.02 Bad Option.
+    pub inline fn badOption() Response {
+        return .{ .code = .bad_option };
+    }
+
     /// Response with an arbitrary code and no payload.
     pub inline fn withCode(code: coapz.Code) Response {
         return .{ .code = code };

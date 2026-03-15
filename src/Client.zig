@@ -346,6 +346,11 @@ table_mask: u16,
 free_head: u16,
 count_active: u16,
 
+/// True after receiving the first valid response from the peer.
+/// When false, only `nstart` (default 1) CON requests are allowed
+/// in-flight per RFC 7252 §4.7.
+peer_confirmed: bool,
+
 observes: [max_observes]ObserveSub,
 
 next_msg_id_val: u16,
@@ -464,6 +469,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         .table_mask = table_size - 1,
         .free_head = 0,
         .count_active = 0,
+        .peer_confirmed = false,
         .observes = observes,
         .next_msg_id_val = initial_msg_id,
         .next_token_val = std.crypto.random.int(u64),
@@ -698,12 +704,20 @@ pub fn call(
 /// Use poll() to drive the event loop and receive completions.
 ///
 /// Returns error.TooManyInFlight if max_in_flight slots are exhausted.
+/// Returns error.NstartExceeded if peer is unconfirmed and NSTART
+/// outstanding CONs are already in flight (RFC 7252 §4.7).
 pub fn submit(
     client: *Client,
     code: coapz.Code,
     options: []const coapz.Option,
     payload: []const u8,
 ) !RequestHandle {
+    // NSTART enforcement (RFC 7252 §4.7): limit outstanding CONs
+    // to nstart until the first successful response from this peer.
+    if (!client.peer_confirmed and client.count_active >= constants.nstart) {
+        return error.NstartExceeded;
+    }
+
     var token_buf: [8]u8 = undefined;
     const token = client.makeToken(&token_buf);
     const msg_id = client.nextMsgId();
@@ -829,6 +843,8 @@ pub fn poll(
     // Verify token matches exactly.
     if (slot.token_len != tkl) return null;
     if (!std.mem.eql(u8, slot.token[0..slot.token_len], recv_token)) return null;
+
+    client.peer_confirmed = true;
 
     const response = coapz.Packet.read(allocator, data) catch return null;
 
@@ -1092,6 +1108,11 @@ pub fn observe(
     client: *Client,
     options: []const coapz.Option,
 ) !ObserveStream {
+    // NSTART enforcement (RFC 7252 §4.7).
+    if (!client.peer_confirmed and client.count_active >= constants.nstart) {
+        return error.NstartExceeded;
+    }
+
     const sub_idx = for (0..max_observes) |i| {
         if (!client.observes[i].active) break @as(u8, @intCast(i));
     } else return error.TooManyObserves;
@@ -1375,6 +1396,8 @@ fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
         if (obs.token_len != token.len) continue;
         if (!std.mem.eql(u8, obs.token[0..obs.token_len], token)) continue;
 
+        client.peer_confirmed = true;
+
         if (obs.pending_count < max_pending_notifications) {
             const copy = client.allocator.alloc(u8, data.len) catch return true;
             @memcpy(copy, data);
@@ -1442,6 +1465,8 @@ fn waitForResponse(
         // Check if token matches our slot.
         if (slot.token_len != tkl) continue;
         if (!std.mem.eql(u8, slot.token[0..slot.token_len], recv_token)) continue;
+
+        client.peer_confirmed = true;
 
         const response = coapz.Packet.read(allocator, data) catch continue;
 
@@ -1632,6 +1657,7 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             break;
         }
 
+        client.peer_confirmed = true;
         client.freeSlotAndTable(slot_idx);
         return;
     }
@@ -2040,6 +2066,10 @@ test "multiple concurrent submits" {
     });
     defer client.deinit();
 
+    // Confirm peer first (NSTART enforcement).
+    const warmup = try client.call(testing.allocator, .get, &.{}, "warmup");
+    warmup.deinit(testing.allocator);
+
     _ = try client.submit(.get, &.{}, "req-0");
     _ = try client.submit(.get, &.{}, "req-1");
     _ = try client.submit(.get, &.{}, "req-2");
@@ -2054,4 +2084,88 @@ test "multiple concurrent submits" {
         if (completed == 4) break;
     }
     try testing.expectEqual(@as(u8, 4), completed);
+}
+
+test "NSTART: second submit rejected before first response" {
+    const port: u16 = 29720;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 8,
+    });
+    defer client.deinit();
+
+    // First submit should succeed (count_active=0 < nstart=1).
+    _ = try client.submit(.get, &.{}, "first");
+
+    // Second submit should fail — peer not confirmed, count_active=1 >= nstart.
+    try testing.expectError(
+        error.NstartExceeded,
+        client.submit(.get, &.{}, "second"),
+    );
+}
+
+test "NSTART: submit allowed after peer confirmed via poll" {
+    const port: u16 = 29721;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 8,
+    });
+    defer client.deinit();
+
+    // First submit — should work.
+    _ = try client.submit(.get, &.{}, "first");
+
+    // Poll until first response arrives — confirms peer.
+    var confirmed = false;
+    for (0..100) |_| {
+        const c = try client.poll(testing.allocator, 50) orelse continue;
+        c.result.deinit(testing.allocator);
+        confirmed = true;
+        break;
+    }
+    try testing.expect(confirmed);
+    try testing.expect(client.peer_confirmed);
+
+    // Now submit should succeed — peer is confirmed.
+    _ = try client.submit(.get, &.{}, "second");
+    _ = try client.submit(.get, &.{}, "third");
+}
+
+test "NSTART: call confirms peer, subsequent submits work" {
+    const port: u16 = 29722;
+    var server = try startTestServer(port, echoHandler);
+    defer server.deinit();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .port = port,
+        .max_in_flight = 8,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.peer_confirmed);
+
+    // call() does submit+poll internally — should confirm peer.
+    const result = try client.call(testing.allocator, .get, &.{}, "hello");
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(client.peer_confirmed);
+
+    // Multiple concurrent submits now work.
+    _ = try client.submit(.get, &.{}, "a");
+    _ = try client.submit(.get, &.{}, "b");
+    _ = try client.submit(.get, &.{}, "c");
 }
