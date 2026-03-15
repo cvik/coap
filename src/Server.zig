@@ -2240,6 +2240,7 @@ test "CON with unknown critical option returns 4.02 Bad Option" {
     try testing.expectEqual(.acknowledgement, response.kind);
     try testing.expectEqual(.bad_option, response.code);
     try testing.expectEqual(@as(u16, 0xCC01), response.msg_id);
+    try testing.expectEqualSlices(u8, &.{0x01}, response.token);
 }
 
 test "NON with unknown critical option returns 4.02 Bad Option" {
@@ -2277,6 +2278,7 @@ test "NON with unknown critical option returns 4.02 Bad Option" {
 
     try testing.expectEqual(.non_confirmable, response.kind);
     try testing.expectEqual(.bad_option, response.code);
+    try testing.expectEqualSlices(u8, &.{0x02}, response.token);
 }
 
 test "known critical options pass through to handler" {

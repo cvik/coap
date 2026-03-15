@@ -1108,6 +1108,11 @@ pub fn observe(
     client: *Client,
     options: []const coapz.Option,
 ) !ObserveStream {
+    // NSTART enforcement (RFC 7252 §4.7).
+    if (!client.peer_confirmed and client.count_active >= constants.nstart) {
+        return error.NstartExceeded;
+    }
+
     const sub_idx = for (0..max_observes) |i| {
         if (!client.observes[i].active) break @as(u8, @intCast(i));
     } else return error.TooManyObserves;
@@ -1652,6 +1657,7 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             break;
         }
 
+        client.peer_confirmed = true;
         client.freeSlotAndTable(slot_idx);
         return;
     }
