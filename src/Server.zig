@@ -89,6 +89,10 @@ pub const Config = struct {
     /// CPU core IDs for thread pinning. Thread i pins to
     /// cpu_affinity[i % len]. null = no pinning (default).
     cpu_affinity: ?[]const u16 = null,
+    /// Additional option numbers the application recognizes as critical.
+    /// Options listed here (plus all standard coapz options) will NOT
+    /// trigger 4.02 Bad Option rejection.
+    recognized_options: []const u16 = &.{},
     /// PSK credentials for DTLS. null = plain UDP only.
     psk: ?dtls.types.Psk = null,
     /// Maximum concurrent DTLS sessions.
@@ -855,6 +859,41 @@ fn handle_recv(
         _ = server.exchanges.evict_peer(addr_key);
     }
 
+    // Critical option rejection (RFC 7252 §5.4.1).
+    if (server.hasUnrecognizedCriticalOption(packet.options)) {
+        const bad_opt_response = coapz.Packet{
+            .kind = if (is_con) .acknowledgement else .non_confirmable,
+            .code = .bad_option,
+            .msg_id = if (is_con) packet.msg_id else server.nextMsgId(),
+            .token = packet.token,
+            .options = &.{},
+            .payload = &.{},
+            .data_buf = &.{},
+        };
+
+        const data_wire = server.send_packet(bad_opt_response, recv.peer_address, index) catch |err| {
+            switch (err) {
+                error.OutOfMemory, error.BufferTooSmall => {
+                    if (is_con) server.send_emergency_ack(&raw_header, recv.peer_address, index);
+                },
+                else => log.err("bad option response send failed: {}", .{err}),
+            }
+            return;
+        };
+
+        if (is_con) {
+            const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
+            if (server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns) == null) {
+                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                if (evicted > 0) {
+                    server.last_eviction_ns = server.tick_now_ns;
+                    _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
+                }
+            }
+        }
+        return;
+    }
+
     const request = handler.Request{
         .packet = packet,
         .peer_address = recv.peer_address,
@@ -1255,6 +1294,36 @@ fn process_dtls_coap(
         _ = server.exchanges.evict_peer(addr_key);
     }
 
+    // Critical option rejection (RFC 7252 §5.4.1).
+    if (server.hasUnrecognizedCriticalOption(packet.options)) {
+        const bad_opt_response = coapz.Packet{
+            .kind = if (is_con) .acknowledgement else .non_confirmable,
+            .code = .bad_option,
+            .msg_id = if (is_con) packet.msg_id else server.nextMsgId(),
+            .token = packet.token,
+            .options = &.{},
+            .payload = &.{},
+            .data_buf = &.{},
+        };
+
+        const wire = server.send_dtls_packet(session, bad_opt_response, peer, index) catch |err| {
+            log.warn("DTLS bad option response failed: {}", .{err});
+            return;
+        };
+
+        if (is_con) {
+            const key = Exchange.peer_key(peer, packet.msg_id);
+            if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
+                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                if (evicted > 0) {
+                    server.last_eviction_ns = server.tick_now_ns;
+                    _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
+                }
+            }
+        }
+        return;
+    }
+
     const request = handler.Request{
         .packet = packet,
         .peer_address = peer,
@@ -1610,6 +1679,35 @@ fn is_well_known_core(packet: coapz.Packet) bool {
     if (!std.mem.eql(u8, seg2.value, "core")) return false;
     // Must be exactly two segments.
     return it.next() == null;
+}
+
+/// Returns true if the option kind matches a named coapz standard option.
+fn isRecognizedOption(kind: coapz.OptionKind) bool {
+    return switch (kind) {
+        .unknown => false,
+        .if_match, .uri_host, .etag, .if_none_match, .observe,
+        .uri_port, .location_path, .oscore, .uri_path,
+        .content_format, .max_age, .uri_query, .accept,
+        .location_query, .block2, .block1, .size2,
+        .proxy_uri, .proxy_scheme, .size1, .no_response,
+        => true,
+        _ => false,
+    };
+}
+
+/// Check if any option in the packet is an unrecognized critical option.
+fn hasUnrecognizedCriticalOption(
+    server: *const Server,
+    options: []const coapz.Option,
+) bool {
+    for (options) |opt| {
+        const num = @intFromEnum(opt.kind);
+        if (num & 1 == 0) continue; // elective
+        if (isRecognizedOption(opt.kind)) continue;
+        if (std.mem.indexOfScalar(u16, server.config.recognized_options, num) != null) continue;
+        return true;
+    }
+    return false;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -2103,4 +2201,193 @@ test "cpu_affinity rejects empty list" {
         .{ .port = 19701, .buffer_count = 4, .buffer_size = 256, .cpu_affinity = empty },
         echo_handler,
     ));
+}
+
+test "CON with unknown critical option returns 4.02 Bad Option" {
+    const port: u16 = 19710;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    // Option number 99 is odd (critical) and not in coapz.OptionKind.
+    const request_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0xCC01,
+        .token = &.{0x01},
+        .options = &.{
+            .{ .kind = @enumFromInt(99), .value = "x" },
+        },
+        .payload = "hello",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.acknowledgement, response.kind);
+    try testing.expectEqual(.bad_option, response.code);
+    try testing.expectEqual(@as(u16, 0xCC01), response.msg_id);
+}
+
+test "NON with unknown critical option returns 4.02 Bad Option" {
+    const port: u16 = 19711;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0xCC02,
+        .token = &.{0x02},
+        .options = &.{
+            .{ .kind = @enumFromInt(99), .value = "x" },
+        },
+        .payload = "hello",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.non_confirmable, response.kind);
+    try testing.expectEqual(.bad_option, response.code);
+}
+
+test "known critical options pass through to handler" {
+    const port: u16 = 19712;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0xCC03,
+        .token = &.{0x03},
+        .options = &.{
+            .{ .kind = .uri_path, .value = "test" },
+        },
+        .payload = "body",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, "body", response.payload);
+}
+
+test "unknown elective option passes through to handler" {
+    const port: u16 = 19713;
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0xCC04,
+        .token = &.{0x04},
+        .options = &.{
+            .{ .kind = @enumFromInt(100), .value = "ignored" },
+        },
+        .payload = "data",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, "data", response.payload);
+}
+
+test "recognized_options allows custom critical options" {
+    const port: u16 = 19714;
+    const recognized: []const u16 = &.{99};
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .recognized_options = recognized,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0xCC05,
+        .token = &.{0x05},
+        .options = &.{
+            .{ .kind = @enumFromInt(99), .value = "custom" },
+        },
+        .payload = "ok",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = try test_client(port);
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, "ok", response.payload);
 }
