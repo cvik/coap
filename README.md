@@ -7,6 +7,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - CON/ACK reliability with duplicate detection and RST handling
 - Multi-threaded via SO_REUSEPORT (no shared state between threads)
 - Per-IP rate limiting with token bucket and three-level load shedding
+- Critical option rejection with 4.02 Bad Option (RFC 7252 §5.4.1)
 - .well-known/core resource discovery (RFC 6690)
 - DTLS 1.2 PSK security (RFC 6347) with AES-128-CCM-8
 - Simple handler interface: `fn(Request) ?Response`
@@ -15,6 +16,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 
 **Client:**
 - CON request/response with retransmission (RFC 7252 §4.2)
+- NSTART congestion control for new peers (RFC 7252 §4.7)
 - Pipelined async requests (`submit`/`poll`) for high-throughput workloads
 - NON fire-and-forget requests
 - Transparent Block2 response reassembly
@@ -162,6 +164,7 @@ Response.badRequest()                        // 4.00 Bad Request
 Response.methodNotAllowed()                  // 4.05 Method Not Allowed
 Response.unauthorized()                      // 4.01 Unauthorized
 Response.forbidden()                         // 4.03 Forbidden
+Response.badOption()                         // 4.02 Bad Option
 Response.withCode(.gateway_timeout)          // arbitrary code
 ```
 
@@ -441,6 +444,7 @@ var server = try coap.Server.init(allocator, .{
     .buffer_size = 1280,              // max UDP datagram size (bytes)
     .exchange_count = 256,            // max concurrent CON exchanges
     .well_known_core = null,          // RFC 6690 discovery payload
+    .recognized_options = &.{},       // extra critical options to allow
     .thread_count = 1,                // server threads (SO_REUSEPORT)
     .max_arena_size = 256 * 1024,     // arena trim threshold (bytes)
     .rate_limit_ip_count = 1024,      // max tracked IPs (0 = disabled)
@@ -511,6 +515,21 @@ var server = try coap.Server.init(allocator, .{
 
 When `null` (default), `/.well-known/core` requests pass through to the
 handler like any other request.
+
+### `recognized_options`
+
+Additional critical option numbers the application understands. The server
+automatically rejects unrecognized critical options (odd-numbered) with 4.02
+Bad Option per RFC 7252 §5.4.1. All standard CoAP options are recognized by
+default. Use this field to whitelist application-specific critical options:
+
+```zig
+var server = try coap.Server.init(allocator, .{
+    .recognized_options = &.{ 2049, 2051 },  // application-specific critical options
+}, handler);
+```
+
+Default: `&.{}` (only standard options recognized).
 
 ### `thread_count`
 
@@ -723,6 +742,8 @@ Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
 - [x] Pipelined async client API (submit/poll)
 - [x] Auto-clamp buffer_count to fit RLIMIT_MEMLOCK
 - [x] Parallel AES-CTR via AES-NI xorWide
+- [x] Critical option rejection (RFC 7252 §5.4.1)
+- [x] NSTART congestion control (RFC 7252 §4.7)
 - [ ] IPv6
 - [ ] Separate (delayed) responses
 - [ ] Server-side Observe (RFC 7641)
