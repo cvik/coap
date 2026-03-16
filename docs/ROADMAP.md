@@ -1,6 +1,6 @@
 # Protocol Compliance Roadmap
 
-Status as of v0.5.0 (2026-03-15). Items ordered by priority within each tier.
+Status as of v0.5.0 (2026-03-16). Items ordered by priority within each tier.
 
 Legend: `[x]` done, `[-]` partial, `[ ]` not started
 
@@ -273,15 +273,15 @@ Any work on the above must preserve these properties:
 
 ## Suggested Implementation Order
 
-A practical sequence that builds on prior work:
+Items 1-4 are done. Remaining sequence:
 
-1. **1.1** Critical option rejection — quick win, pure compliance
-2. **1.5** Option order validation — quick win, in coapz
-3. **2.4** Observe sequence check — quick win, client fix
-4. **1.3** NSTART enforcement — small, client-only
-5. **3.4** Size1/Size2 — small, server pre-check
-6. **1.4** IPv6 — foundational, unblocks real deployments
-7. **1.2** Separate responses — unblocks async handlers, prerequisite for 2.1
+1. ~~**1.1** Critical option rejection~~ ✓
+2. ~~**1.5** Option order validation~~ ✓
+3. ~~**1.3** NSTART enforcement~~ ✓
+4. ~~**1.4** IPv6~~ ✓
+5. **1.2** Separate responses — unblocks async handlers, prerequisite for 2.1
+6. **2.4** Observe sequence check — quick win, client fix
+7. **3.4** Size1/Size2 — small, server pre-check
 8. **2.2** Server Block2 — unblocks large responses
 9. **2.3** Server Block1 — unblocks large uploads
 10. **2.1** Server Observe — builds on separate responses + exchange pool
