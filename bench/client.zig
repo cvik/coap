@@ -17,6 +17,7 @@ const bench_psk: coap.Psk = .{
 
 const SuiteConfig = struct {
     host: []const u8 = "127.0.0.1",
+    bind_address: []const u8 = "0.0.0.0",
     port: u16 = 5683,
     warmup_count: u32 = 1_000,
     window_size: u16 = 256,
@@ -165,7 +166,7 @@ pub fn main() !void {
             if (need_restart) {
                 kill_server(&server_pid);
                 const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
-                server_pid = try fork_server(port, srv_tc, psk, counters);
+                server_pid = try fork_server(port, srv_tc, psk, counters, config.bind_address);
                 std.Thread.sleep(150 * std.time.ns_per_ms);
                 current_group = group;
             }
@@ -818,7 +819,7 @@ fn run_bench(
 
 fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
     const dest = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM, 0);
     errdefer posix.close(fd);
     try posix.connect(fd, &dest.any, dest.getOsSockLen());
 
@@ -876,7 +877,7 @@ fn alloc_shared_counters() !*ServerCounters {
     return ptr;
 }
 
-fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerCounters) !posix.pid_t {
+fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerCounters, bind_address: []const u8) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // Silence server log output (info/warn) so it doesn't break the
@@ -891,6 +892,7 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerC
                 std.heap.page_allocator,
                 .{
                     .port = port,
+                    .bind_address = bind_address,
                     .buffer_count = 512,
                     .buffer_size = 1280,
                     .thread_count = thread_count,
@@ -906,6 +908,7 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerC
                 std.heap.page_allocator,
                 .{
                     .port = port,
+                    .bind_address = bind_address,
                     .buffer_count = 512,
                     .buffer_size = 1280,
                     .thread_count = thread_count,
@@ -1141,6 +1144,7 @@ fn print_usage() void {
             "  --window <n>      Client sliding window size (default: 256)\n" ++
             "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
             "  --no-server       Don't fork embedded echo server\n" ++
+            "  --ipv6            Use IPv6 loopback (::1) instead of IPv4\n" ++
             "\n" ++
             "Filters:\n" ++
             "  --plain-only      Skip DTLS scenarios\n" ++
@@ -1182,6 +1186,9 @@ fn parse_args() SuiteConfig {
             config.thread_count = std.fmt.parseInt(u16, val, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--no-server")) {
             config.embedded_server = false;
+        } else if (std.mem.eql(u8, arg, "--ipv6")) {
+            config.host = "::1";
+            config.bind_address = "::";
         } else if (std.mem.eql(u8, arg, "--plain-only")) {
             config.filter_dtls = false;
         } else if (std.mem.eql(u8, arg, "--dtls-only")) {
