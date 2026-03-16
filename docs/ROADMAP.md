@@ -52,18 +52,13 @@ These are protocol violations or mandatory omissions in the base CoAP spec.
   on first response via `poll()`, `waitForResponse()`, or `routeObserve()`.
 
 ### 1.4 IPv6 support (§1)
-- **Status:** `[ ]` hardcoded IPv4
+- **Status:** `[x]` done
 - **Issue:** AF_INET hardcoded in Io.zig, Client.zig, Server.zig. `sockaddr.in`
   cast in `decode_recv()` would overflow for `sockaddr_in6`. RFC 7252 treats
   IPv6 as essential.
-- **Impact:** Cannot deploy on IPv6-only networks (increasingly common in IoT).
-- **Effort:** Medium. Requires:
-  - sockaddr union (in/in6) throughout
-  - Buffer sizing for 28-byte sockaddr_in6
-  - Address hashing changes in exchange.zig, rate_limiter.zig, Session.zig
-  - Dual-stack or family-specific socket creation
-- **Perf note:** Larger sockaddr means more cache pressure in address hashing.
-  Use a compact address representation internally (hash, not raw sockaddr).
+- **Resolution:** Family auto-detected from bind/host address. Dual-stack via
+  `IPV6_V6ONLY=0` when binding `"::"`. Family-aware address hashing in exchange,
+  rate_limiter, DTLS Cookie, and DTLS Session. Bench supports `--ipv6` flag.
 
 ### 1.5 Option order validation on decode (§5.4.6)
 - **Status:** `[x]` done — structurally enforced by delta encoding

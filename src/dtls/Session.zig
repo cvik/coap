@@ -3,6 +3,7 @@
 /// Pre-allocated open-addressed hash table with intrusive LRU doubly-linked
 /// list and free list. Provides O(1) lookup, allocation, and eviction.
 const std = @import("std");
+const posix = std.posix;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const State = enum(u8) {
@@ -347,9 +348,13 @@ pub const SessionTable = struct {
 };
 
 fn addrHash(addr: std.net.Address) u64 {
-    const addr_bytes: [16]u8 = @bitCast(addr.any);
+    const bytes = switch (addr.any.family) {
+        posix.AF.INET => std.mem.asBytes(&addr.in),
+        posix.AF.INET6 => std.mem.asBytes(&addr.in6),
+        else => std.mem.asBytes(&addr.in),
+    };
     var hash: u64 = 0xcbf29ce484222325; // FNV-1a 64-bit offset basis
-    for (addr_bytes) |b| {
+    for (bytes) |b| {
         hash ^= b;
         hash *%= 0x100000001b3; // FNV-1a 64-bit prime
     }
@@ -357,9 +362,12 @@ fn addrHash(addr: std.net.Address) u64 {
 }
 
 fn addrEqual(a: std.net.Address, b: std.net.Address) bool {
-    const ab: [16]u8 = @bitCast(a.any);
-    const bb: [16]u8 = @bitCast(b.any);
-    return std.mem.eql(u8, &ab, &bb);
+    if (a.any.family != b.any.family) return false;
+    return switch (a.any.family) {
+        posix.AF.INET => std.mem.eql(u8, std.mem.asBytes(&a.in), std.mem.asBytes(&b.in)),
+        posix.AF.INET6 => std.mem.eql(u8, std.mem.asBytes(&a.in6), std.mem.asBytes(&b.in6)),
+        else => false,
+    };
 }
 
 fn wrappingDistance(from: u32, to: u32, mask: u32) u32 {

@@ -3,6 +3,7 @@
 /// Pattern follows exchange.zig: linear probing, backward-shift deletion,
 /// intrusive free list. Clock-hand eviction when the table is full.
 const std = @import("std");
+const posix = std.posix;
 
 const RateLimiter = @This();
 
@@ -15,10 +16,56 @@ pub const Config = struct {
     burst: u16 = 200,
 };
 
+/// Family-aware address key for IPv4/IPv6-agnostic rate limiting.
+/// Port is excluded — multiple connections from the same IP share a bucket.
+pub const AddrKey = struct {
+    family: u16,
+    addr: [16]u8,
+
+    pub const zero: AddrKey = .{ .family = 0, .addr = .{0} ** 16 };
+
+    pub fn fromAddress(address: std.net.Address) AddrKey {
+        return switch (address.any.family) {
+            posix.AF.INET => .{
+                .family = posix.AF.INET,
+                .addr = blk: {
+                    var a: [16]u8 = .{0} ** 16;
+                    const src: [4]u8 = @bitCast(address.in.sa.addr);
+                    @memcpy(a[0..4], &src);
+                    break :blk a;
+                },
+            },
+            posix.AF.INET6 => .{
+                .family = posix.AF.INET6,
+                .addr = address.in6.sa.addr,
+            },
+            else => zero,
+        };
+    }
+
+    pub fn eql(a: AddrKey, b: AddrKey) bool {
+        return a.family == b.family and std.mem.eql(u8, &a.addr, &b.addr);
+    }
+
+    pub fn hash(self: AddrKey) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        const fam_bytes: [2]u8 = @bitCast(self.family);
+        for (fam_bytes) |b| {
+            h ^= b;
+            h *%= 0x100000001b3;
+        }
+        for (self.addr) |b| {
+            h ^= b;
+            h *%= 0x100000001b3;
+        }
+        return h;
+    }
+};
+
 const State = enum(u8) { free, active };
 
 const Slot = struct {
-    ip_addr: u32,
+    addr_key: AddrKey,
     tokens: u16,
     last_refill_ns: i64,
     state: State,
@@ -56,7 +103,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !RateLimiter {
 
     for (slots, 0..) |*slot, i| {
         slot.* = .{
-            .ip_addr = 0,
+            .addr_key = AddrKey.zero,
             .tokens = 0,
             .last_refill_ns = 0,
             .state = .free,
@@ -84,13 +131,13 @@ pub fn deinit(self: *RateLimiter, allocator: std.mem.Allocator) void {
     allocator.free(self.table);
 }
 
-/// Check if a packet from `ip_addr` is allowed. Deducts one token.
+/// Check if a packet from `addr_key` is allowed. Deducts one token.
 /// Returns true if allowed, false if rate-limited.
-pub fn allow(self: *RateLimiter, ip_addr: u32, now_ns: i64) bool {
-    const key = hash_ip(ip_addr);
+pub fn allow(self: *RateLimiter, addr_key: AddrKey, now_ns: i64) bool {
+    const key = addr_key.hash();
 
     // Look up existing entry.
-    if (self.find_slot(key, ip_addr)) |slot_idx| {
+    if (self.find_slot(key, addr_key)) |slot_idx| {
         const slot = &self.slots[slot_idx];
         self.refill(slot, now_ns);
         if (slot.tokens == 0) return false;
@@ -99,7 +146,7 @@ pub fn allow(self: *RateLimiter, ip_addr: u32, now_ns: i64) bool {
     }
 
     // New IP — allocate a slot.
-    const slot_idx = self.allocate_slot(key, ip_addr, now_ns) orelse {
+    const slot_idx = self.allocate_slot(key, addr_key, now_ns) orelse {
         // Table completely full with no eviction candidate.
         // Fail open: allow the packet rather than DoS everyone.
         return true;
@@ -113,7 +160,7 @@ pub fn allow(self: *RateLimiter, ip_addr: u32, now_ns: i64) bool {
 pub fn reset(self: *RateLimiter) void {
     for (self.slots) |*slot| {
         slot.state = .free;
-        slot.ip_addr = 0;
+        slot.addr_key = AddrKey.zero;
         slot.tokens = 0;
         slot.last_refill_ns = 0;
     }
@@ -131,24 +178,13 @@ pub fn reset(self: *RateLimiter) void {
 
 // ── Internal ──
 
-fn hash_ip(ip: u32) u64 {
-    // FNV-1a on 4 bytes.
-    var h: u64 = 0xcbf29ce484222325;
-    const bytes: [4]u8 = @bitCast(ip);
-    for (bytes) |b| {
-        h ^= b;
-        h *%= 0x100000001b3;
-    }
-    return h;
-}
-
-fn find_slot(self: *const RateLimiter, key: u64, ip_addr: u32) ?u16 {
+fn find_slot(self: *const RateLimiter, key: u64, addr_key: AddrKey) ?u16 {
     var idx: u16 = @intCast(@as(u32, @truncate(key)) & self.table_mask);
     var probes: u16 = 0;
     while (probes <= self.table_mask) : (probes += 1) {
         const slot_idx = self.table[idx];
         if (slot_idx == empty_sentinel) return null;
-        if (self.slots[slot_idx].ip_addr == ip_addr and self.slots[slot_idx].state == .active) {
+        if (self.slots[slot_idx].addr_key.eql(addr_key) and self.slots[slot_idx].state == .active) {
             return slot_idx;
         }
         idx = (idx + 1) & self.table_mask;
@@ -170,7 +206,7 @@ fn refill(self: *const RateLimiter, slot: *Slot, now_ns: i64) void {
     }
 }
 
-fn allocate_slot(self: *RateLimiter, key: u64, ip_addr: u32, now_ns: i64) ?u16 {
+fn allocate_slot(self: *RateLimiter, key: u64, addr_key: AddrKey, now_ns: i64) ?u16 {
     var slot_idx: u16 = undefined;
 
     if (self.free_head != empty_sentinel) {
@@ -184,7 +220,7 @@ fn allocate_slot(self: *RateLimiter, key: u64, ip_addr: u32, now_ns: i64) ?u16 {
 
     const slot = &self.slots[slot_idx];
     slot.* = .{
-        .ip_addr = ip_addr,
+        .addr_key = addr_key,
         .tokens = 0,
         .last_refill_ns = now_ns,
         .state = .active,
@@ -237,7 +273,7 @@ fn evict(self: *RateLimiter) ?u16 {
 
 fn remove_slot(self: *RateLimiter, slot_idx: u16) void {
     const slot = &self.slots[slot_idx];
-    const key = hash_ip(slot.ip_addr);
+    const key = slot.addr_key.hash();
     slot.state = .free;
 
     // Remove from hash table with backward-shift deletion.
@@ -258,7 +294,7 @@ fn rehash_after_remove(self: *RateLimiter, removed_idx: u16) void {
     while (self.table[idx] != empty_sentinel) {
         const si = self.table[idx];
         const desired: u16 = @intCast(
-            @as(u32, @truncate(hash_ip(self.slots[si].ip_addr))) & self.table_mask,
+            @as(u32, @truncate(self.slots[si].addr_key.hash())) & self.table_mask,
         );
         if (wrapping_distance(desired, idx, self.table_mask) >=
             wrapping_distance(desired, gap, self.table_mask))
@@ -279,6 +315,17 @@ fn wrapping_distance(from: u16, to: u16, mask: u16) u16 {
 
 const testing = std.testing;
 
+fn ipv4Key(comptime ip: u32) AddrKey {
+    return .{
+        .family = posix.AF.INET,
+        .addr = blk: {
+            var a: [16]u8 = .{0} ** 16;
+            a[0..4].* = @bitCast(ip);
+            break :blk a;
+        },
+    };
+}
+
 test "init and deinit" {
     var rl = try RateLimiter.init(testing.allocator, .{
         .ip_count = 8,
@@ -296,8 +343,8 @@ test "allow basic" {
     });
     defer rl.deinit(testing.allocator);
 
-    const ip: u32 = 0x7F000001; // 127.0.0.1
-    const now: i64 = 1_000_000_000; // 1 second
+    const ip = ipv4Key(0x7F000001);
+    const now: i64 = 1_000_000_000;
 
     // First 5 requests should succeed (burst=5).
     for (0..5) |_| {
@@ -315,7 +362,7 @@ test "token refill over time" {
     });
     defer rl.deinit(testing.allocator);
 
-    const ip: u32 = 0x7F000001;
+    const ip = ipv4Key(0x7F000001);
     var now: i64 = 1_000_000_000;
 
     // Exhaust tokens.
@@ -340,8 +387,8 @@ test "multiple IPs independent" {
     });
     defer rl.deinit(testing.allocator);
 
-    const ip1: u32 = 0x01020304;
-    const ip2: u32 = 0x05060708;
+    const ip1 = ipv4Key(0x01020304);
+    const ip2 = ipv4Key(0x05060708);
     const now: i64 = 1_000_000_000;
 
     // Each IP gets its own bucket.
@@ -365,11 +412,11 @@ test "eviction on table full" {
     const now: i64 = 1_000_000_000;
 
     // Fill the table with 2 IPs.
-    try testing.expect(rl.allow(0x01020301, now));
-    try testing.expect(rl.allow(0x01020302, now));
+    try testing.expect(rl.allow(ipv4Key(0x01020301), now));
+    try testing.expect(rl.allow(ipv4Key(0x01020302), now));
 
     // Third IP should trigger eviction and still succeed.
-    try testing.expect(rl.allow(0x01020303, now));
+    try testing.expect(rl.allow(ipv4Key(0x01020303), now));
 }
 
 test "reset clears all state" {
@@ -380,7 +427,7 @@ test "reset clears all state" {
     });
     defer rl.deinit(testing.allocator);
 
-    const ip: u32 = 0x7F000001;
+    const ip = ipv4Key(0x7F000001);
     const now: i64 = 1_000_000_000;
 
     try testing.expect(rl.allow(ip, now));
@@ -400,4 +447,26 @@ test "disabled config returns error" {
         testing.allocator,
         .{ .ip_count = 0, .tokens_per_sec = 10, .burst = 20 },
     ));
+}
+
+test "IPv6 addresses independent from IPv4" {
+    var rl = try RateLimiter.init(testing.allocator, .{
+        .ip_count = 8,
+        .tokens_per_sec = 10,
+        .burst = 2,
+    });
+    defer rl.deinit(testing.allocator);
+
+    const v4 = AddrKey.fromAddress(try std.net.Address.parseIp("127.0.0.1", 5683));
+    const v6 = AddrKey.fromAddress(try std.net.Address.parseIp("::1", 5683));
+    const now: i64 = 1_000_000_000;
+
+    try testing.expect(rl.allow(v4, now));
+    try testing.expect(rl.allow(v4, now));
+    try testing.expect(!rl.allow(v4, now)); // exhausted
+
+    // IPv6 has its own bucket
+    try testing.expect(rl.allow(v6, now));
+    try testing.expect(rl.allow(v6, now));
+    try testing.expect(!rl.allow(v6, now));
 }

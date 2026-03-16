@@ -112,7 +112,7 @@ exchange_lifetime_ms: u32,
 running: std.atomic.Value(bool),
 
 // Pre-allocated per-CQE response state.
-addrs_response: []linux.sockaddr,
+addrs_response: []std.net.Address,
 msgs_response: []linux.msghdr_const,
 iovs_response: []posix.iovec,
 buffer_response: []u8,
@@ -122,7 +122,7 @@ buffer_response: []u8,
 emergency_ack: []u8,
 
 // Recv state.
-addr_recv: linux.sockaddr,
+addr_recv: linux.sockaddr.in6,
 msg_recv: linux.msghdr,
 
 // Eviction timer.
@@ -268,7 +268,7 @@ fn init_raw(
     );
 
     const addrs_response = try allocator.alloc(
-        linux.sockaddr,
+        std.net.Address,
         batch,
     );
     errdefer allocator.free(addrs_response);
@@ -338,7 +338,7 @@ fn init_raw(
         .iovs_response = iovs_response,
         .buffer_response = buffer_response,
         .emergency_ack = emergency_ack,
-        .addr_recv = std.mem.zeroes(linux.sockaddr),
+        .addr_recv = std.mem.zeroes(linux.sockaddr.in6),
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
         .tick_count = 0,
@@ -387,8 +387,10 @@ pub fn deinit(server: *Server) void {
 pub fn listen(server: *Server) !void {
     try server.io.setup(server.config.port, server.config.bind_address);
 
-    server.msg_recv.name = &server.addr_recv;
-    server.msg_recv.namelen = @sizeOf(linux.sockaddr);
+    server.msg_recv.name = @ptrCast(&server.addr_recv);
+    // Set name buffer size based on actual socket family.
+    const bind_addr = try std.net.Address.parseIp(server.config.bind_address, server.config.port);
+    server.msg_recv.namelen = bind_addr.getOsSockLen();
     server.msg_recv.controllen = 0;
 
     try server.io.recv_multishot(&server.msg_recv);
@@ -802,8 +804,8 @@ fn handle_recv(
     // Rate limiting in throttled mode.
     if (server.load_level == .throttled) {
         if (server.rate_limiter) |*rl| {
-            const ip = recv.peer_address.in.sa.addr;
-            if (!rl.allow(ip, server.tick_now_ns)) {
+            const addr_key = RateLimiter.AddrKey.fromAddress(recv.peer_address);
+            if (!rl.allow(addr_key, server.tick_now_ns)) {
                 const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
                 release_buffer_robust(&server.io, recv.buffer_id);
                 server.buffers_outstanding -|= 1;
@@ -1632,7 +1634,7 @@ fn send_raw(
     peer_address: std.net.Address,
     index: usize,
 ) !void {
-    server.addrs_response[index] = peer_address.any;
+    server.addrs_response[index] = peer_address;
 
     server.iovs_response[index] = .{
         .base = @ptrCast(@constCast(data.ptr)),
@@ -1641,7 +1643,7 @@ fn send_raw(
 
     server.msgs_response[index] = .{
         .name = @ptrCast(&server.addrs_response[index]),
-        .namelen = @sizeOf(linux.sockaddr),
+        .namelen = peer_address.getOsSockLen(),
         .iov = @ptrCast(&server.iovs_response[index]),
         .iovlen = 1,
         .control = null,
@@ -2392,4 +2394,51 @@ test "recognized_options allows custom critical options" {
 
     try testing.expectEqual(.content, response.code);
     try testing.expectEqualSlices(u8, "ok", response.payload);
+}
+
+fn test_client_ip(host: []const u8, port: u16) !posix.socket_t {
+    const dest = try std.net.Address.parseIp(host, port);
+    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM, 0);
+    const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    return fd;
+}
+
+test "round-trip: NON echo via IPv6 loopback" {
+    const port: u16 = 19715;
+
+    var server = Server.init(testing.allocator, .{
+        .port = port,
+        .bind_address = "::1",
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .rate_limit_ip_count = 0,
+    }, echo_handler) catch return;
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x1234,
+        .token = &.{ 0xAA, 0xBB },
+        .options = &.{},
+        .payload = "ipv6",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = test_client_ip("::1", port) catch return;
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, "ipv6", response.payload);
 }

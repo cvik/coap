@@ -34,7 +34,7 @@ const Client = @This();
 
 /// Client configuration. All fields have sensible defaults.
 pub const Config = struct {
-    /// Server IPv4 address. Default: `"127.0.0.1"`.
+    /// Server address (IPv4 or IPv6). Default: `"127.0.0.1"`.
     host: []const u8 = "127.0.0.1",
     /// Server UDP port. Default: 5683 (CoAP standard).
     port: u16 = constants.port_default,
@@ -369,7 +369,7 @@ const empty_sentinel: u16 = 0xFFFF;
 /// by the client and freed in `deinit()`.
 ///
 /// Returns `error.InvalidConfig` if `max_in_flight` is 0 or `buffer_size` < 64.
-/// Returns `error.UnsupportedAddressFamily` for non-IPv4 addresses.
+/// Supports both IPv4 and IPv6 addresses.
 pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     if (config.max_in_flight == 0) return error.InvalidConfig;
     if (config.buffer_size < 64) return error.InvalidConfig;
@@ -383,9 +383,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     }
 
     const dest = try std.net.Address.parseIp(effective_config.host, effective_config.port);
-    if (dest.any.family != posix.AF.INET) return error.UnsupportedAddressFamily;
 
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(fd);
     try posix.connect(fd, &dest.any, dest.getOsSockLen());
 

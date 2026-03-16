@@ -25,6 +25,8 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - DTLS 1.2 PSK handshake and encrypted transport
 - Pre-allocated in-flight tracking, zero hot-path allocations
 
+See the [protocol compliance roadmap](docs/ROADMAP.md) for planned features.
+
 ## Quick Start
 
 ### Server

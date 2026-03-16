@@ -5,6 +5,7 @@
 /// table keyed on (peer_address, message_id) for O(1) lookups and an
 /// intrusive free list for O(1) slot allocation.
 const std = @import("std");
+const posix = std.posix;
 const constants = @import("constants.zig");
 
 const Exchange = @This();
@@ -112,9 +113,8 @@ pub fn deinit(exchange: *Exchange, allocator: std.mem.Allocator) void {
 
 /// Hash peer address only (no message ID) for peer-based eviction.
 pub fn addr_hash(address: std.net.Address) u32 {
-    const addr_bytes: [16]u8 = @bitCast(address.any);
     var hash: u32 = 0x811c9dc5; // FNV-1a 32-bit offset basis
-    for (addr_bytes) |b| {
+    for (addrBytes(&address)) |b| {
         hash ^= b;
         hash *%= 0x01000193; // FNV-1a 32-bit prime
     }
@@ -123,16 +123,23 @@ pub fn addr_hash(address: std.net.Address) u32 {
 
 /// Compute a hash key from peer address and message ID.
 pub fn peer_key(address: std.net.Address, message_id: u16) u64 {
-    // Use the raw sockaddr bytes for hashing.
-    const addr_bytes: [16]u8 = @bitCast(address.any);
     var hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-    for (addr_bytes) |b| {
+    for (addrBytes(&address)) |b| {
         hash ^= b;
         hash *%= 0x100000001b3; // FNV-1a prime
     }
     hash ^= @as(u64, message_id);
     hash *%= 0x100000001b3;
     return hash;
+}
+
+/// Extract the relevant address bytes for hashing (family-aware).
+fn addrBytes(address: *const std.net.Address) []const u8 {
+    return switch (address.any.family) {
+        posix.AF.INET => std.mem.asBytes(&address.in),
+        posix.AF.INET6 => std.mem.asBytes(&address.in6),
+        else => std.mem.asBytes(&address.in),
+    };
 }
 
 /// Look up an exchange by peer address and message ID.
@@ -545,4 +552,22 @@ test "evict_peer removes all exchanges for a peer" {
     try testing.expectEqual(@as(u16, 2), evicted);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
     try testing.expect(pool.find(Exchange.peer_key(addr_b, 3)) != null);
+}
+
+test "addr_hash differentiates IPv4 and IPv6" {
+    const v4 = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const v6 = try std.net.Address.parseIp("::1", 5683);
+    try testing.expect(Exchange.addr_hash(v4) != Exchange.addr_hash(v6));
+}
+
+test "peer_key differentiates IPv4 and IPv6" {
+    const v4 = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const v6 = try std.net.Address.parseIp("::1", 5683);
+    try testing.expect(Exchange.peer_key(v4, 0x1234) != Exchange.peer_key(v6, 0x1234));
+}
+
+test "addr_hash different IPv6 addresses produce different hashes" {
+    const a = try std.net.Address.parseIp("::1", 5683);
+    const b = try std.net.Address.parseIp("fe80::1", 5683);
+    try testing.expect(Exchange.addr_hash(a) != Exchange.addr_hash(b));
 }

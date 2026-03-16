@@ -2,14 +2,20 @@
 ///
 /// Cookie = HMAC-SHA256(server_secret, client_addr_bytes || client_random)
 const std = @import("std");
+const posix = std.posix;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Generate a stateless DTLS cookie.
 pub fn generate(server_secret: [32]u8, client_addr: std.net.Address, client_random: [32]u8) [32]u8 {
-    const addr_bytes: [16]u8 = @bitCast(client_addr.any);
     var mac: [32]u8 = undefined;
     var h = HmacSha256.init(&server_secret);
-    h.update(&addr_bytes);
+    // Hash the full sockaddr for the active family. Use pointer to
+    // client_addr directly (not a copy) to avoid dangling slice.
+    switch (client_addr.any.family) {
+        posix.AF.INET => h.update(std.mem.asBytes(&client_addr.in)),
+        posix.AF.INET6 => h.update(std.mem.asBytes(&client_addr.in6)),
+        else => h.update(std.mem.asBytes(&client_addr.in)),
+    }
     h.update(&client_random);
     h.final(&mac);
     return mac;
