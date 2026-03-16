@@ -24,19 +24,16 @@ These are protocol violations or mandatory omissions in the base CoAP spec.
   Users can extend via `Config.recognized_options`.
 
 ### 1.2 Separate (delayed) responses (§5.2.2)
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** Server always piggybacks response in ACK. No way for a handler to
   say "I need more time" — the server blocks until the handler returns. Slow
   handlers cause client retransmissions and timeouts.
-- **Impact:** Blocks any handler that does I/O (sensor reads, database queries,
-  inter-service calls).
-- **Effort:** Medium-large. Requires:
-  - Handler signaling mechanism (return sentinel or callback)
-  - Server sends empty ACK immediately
-  - Deferred response queue with CON retransmission for the later response
-  - Exchange must track pending separate responses
-- **Perf note:** Must not add overhead to fast synchronous handlers. The common
-  case (piggybacked) should remain zero-cost. Only separate-response path pays.
+- **Resolution:** Handler calls `request.deferResponse()` to get a
+  `DeferredResponse` handle. Server sends empty ACK immediately. Handler
+  delivers the response later (from any thread) via `handle.respond()`.
+  Response sent as separate CON with exponential-backoff retransmission.
+  Pre-allocated pending pool (`Config.max_deferred`, default 16) with
+  lock-free MPSC queue. Zero overhead for synchronous handlers.
 
 ### 1.3 NSTART / congestion control (§4.7)
 - **Status:** `[x]` done
