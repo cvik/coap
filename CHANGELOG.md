@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0] - 2026-03-16
+- IPv6 support: server, client, DTLS, bench `--ipv6` flag
+- Dual-stack via `IPV6_V6ONLY=0` when binding `::`
+- Critical option rejection with 4.02 Bad Option (RFC 7252 §5.4.1)
+- NSTART congestion control for new peers (RFC 7252 §4.7)
+- Bench: DTLS NON scenarios with server-side throughput measurement
+- Bench: shared-memory `ServerCounters` for NON req/s accuracy
+
 ## [0.4.2] - 2026-03-14
 - DTLS: parallelize AES-CTR in CCM using `xorWide` (AES-NI pipelining)
 - Bench: tree-structured output grouped by transport → type → thread/payload
