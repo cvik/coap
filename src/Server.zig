@@ -802,8 +802,8 @@ fn handle_recv(
     // Rate limiting in throttled mode.
     if (server.load_level == .throttled) {
         if (server.rate_limiter) |*rl| {
-            const ip = recv.peer_address.in.sa.addr;
-            if (!rl.allow(ip, server.tick_now_ns)) {
+            const addr_key = RateLimiter.AddrKey.fromAddress(recv.peer_address);
+            if (!rl.allow(addr_key, server.tick_now_ns)) {
                 const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
                 release_buffer_robust(&server.io, recv.buffer_id);
                 server.buffers_outstanding -|= 1;
