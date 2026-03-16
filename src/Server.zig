@@ -2395,3 +2395,50 @@ test "recognized_options allows custom critical options" {
     try testing.expectEqual(.content, response.code);
     try testing.expectEqualSlices(u8, "ok", response.payload);
 }
+
+fn test_client_ip(host: []const u8, port: u16) !posix.socket_t {
+    const dest = try std.net.Address.parseIp(host, port);
+    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM, 0);
+    const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    return fd;
+}
+
+test "round-trip: NON echo via IPv6 loopback" {
+    const port: u16 = 19715;
+
+    var server = Server.init(testing.allocator, .{
+        .port = port,
+        .bind_address = "::1",
+        .buffer_count = 8,
+        .buffer_size = 1280,
+        .rate_limit_ip_count = 0,
+    }, echo_handler) catch return;
+    defer server.deinit();
+    try setup_for_test(&server);
+
+    const request_packet = coapz.Packet{
+        .kind = .non_confirmable,
+        .code = .get,
+        .msg_id = 0x1234,
+        .token = &.{ 0xAA, 0xBB },
+        .options = &.{},
+        .payload = "ipv6",
+        .data_buf = &.{},
+    };
+    const wire = try request_packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const client_fd = test_client_ip("::1", port) catch return;
+    defer posix.close(client_fd);
+
+    const raw = try send_tick_recv(&server, client_fd, wire);
+    defer testing.allocator.free(raw);
+
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqualSlices(u8, "ipv6", response.payload);
+}
