@@ -118,6 +118,10 @@ const constants = @import("constants.zig");
 const Io = @import("Io.zig");
 const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
+const Deferred = @import("deferred.zig");
+
+/// Handle for a deferred (separate) response. See `Request.defer()`.
+pub const DeferredResponse = Deferred.DeferredResponse;
 
 test {
     _ = handler;
@@ -127,5 +131,6 @@ test {
     _ = Client;
     _ = Exchange;
     _ = RateLimiter;
+    _ = Deferred;
     _ = dtls;
 }

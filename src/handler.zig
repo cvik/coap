@@ -1,5 +1,6 @@
 const std = @import("std");
 const coapz = @import("coapz");
+const Deferred = @import("deferred.zig");
 const log = std.log.scoped(.coap);
 
 /// Incoming CoAP request passed to the handler function.
@@ -36,6 +37,41 @@ pub const Request = struct {
     arena: std.mem.Allocator,
     /// True when the request arrived over a DTLS-secured transport (CoAPs).
     is_secure: bool = false,
+    /// Deferred response context. Non-null when the server has a deferred
+    /// pool configured (`Config.max_deferred > 0`) and the request is CON.
+    defer_ctx: ?DeferContext = null,
+
+    /// Context for `defer()`. Provided by the server; not user-constructible.
+    pub const DeferContext = struct {
+        pool: *Deferred,
+        next_msg_id: u16,
+    };
+
+    /// Request a deferred (separate) response. The server immediately sends
+    /// an empty ACK and the returned handle allows delivering the actual
+    /// response later — from any thread.
+    ///
+    /// Returns `null` if the deferred pool is full or the request is NON.
+    ///
+    /// ```zig
+    /// fn handler(req: coap.Request) ?coap.Response {
+    ///     const deferred = req.deferResponse() orelse return coap.Response.ok("sync fallback");
+    ///     my_worker.submit(deferred, req.payload());
+    ///     return null; // server sends empty ACK
+    /// }
+    /// // Later, from worker thread:
+    /// deferred.respond(coap.Response.ok(result));
+    /// ```
+    pub fn deferResponse(self: Request) ?Deferred.DeferredResponse {
+        const ctx = self.defer_ctx orelse return null;
+        const idx = ctx.pool.allocate(
+            self.packet.token,
+            self.peer_address,
+            ctx.next_msg_id,
+            @truncate(std.time.nanoTimestamp()),
+        ) orelse return null;
+        return .{ .pool = ctx.pool, .slot_idx = idx };
+    }
 
     /// Request method (`.get`, `.post`, `.put`, `.delete`, …).
     pub inline fn method(self: Request) coapz.Code {

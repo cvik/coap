@@ -28,6 +28,7 @@ const coapz = @import("coapz");
 const Io = @import("Io.zig");
 const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
+const Deferred = @import("deferred.zig");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
 const dtls = @import("dtls/dtls.zig");
@@ -53,6 +54,8 @@ pub const Config = struct {
     buffer_size: u32 = constants.buffer_size_default,
     /// Maximum concurrent CON exchanges for duplicate detection.
     exchange_count: u16 = 256,
+    /// Maximum concurrent deferred (separate) responses. 0 = disabled.
+    max_deferred: u16 = 16,
     /// Link-format payload for GET /.well-known/core (RFC 6690).
     /// If null, requests pass through to the handler.
     well_known_core: ?[]const u8 = null,
@@ -108,6 +111,7 @@ handler_context: ?*anyopaque,
 arena: std.heap.ArenaAllocator,
 config: Config,
 exchanges: Exchange,
+deferred: ?Deferred,
 exchange_lifetime_ms: u32,
 running: std.atomic.Value(bool),
 
@@ -262,6 +266,15 @@ fn init_raw(
     });
     errdefer exchanges.deinit(allocator);
 
+    var deferred: ?Deferred = null;
+    if (config.max_deferred > 0) {
+        deferred = try Deferred.init(allocator, .{
+            .max_deferred = config.max_deferred,
+            .buffer_size = @intCast(config.buffer_size),
+        });
+    }
+    errdefer if (deferred) |*d| d.deinit(allocator);
+
     const batch: usize = @min(
         constants.completion_batch_max,
         config.buffer_count,
@@ -328,6 +341,7 @@ fn init_raw(
         .arena = std.heap.ArenaAllocator.init(allocator),
         .config = config,
         .exchanges = exchanges,
+        .deferred = deferred,
         .exchange_lifetime_ms = if (config.exchange_lifetime_ms > 0)
             config.exchange_lifetime_ms
         else
@@ -362,6 +376,7 @@ fn init_raw(
 pub fn deinit(server: *Server) void {
     server.arena.deinit();
     server.exchanges.deinit(server.allocator);
+    if (server.deferred) |*d| d.deinit(server.allocator);
     server.io.deinit(server.allocator);
     server.allocator.free(server.addrs_response);
     server.allocator.free(server.msgs_response);
@@ -720,6 +735,9 @@ pub fn tick(server: *Server) !void {
         // fully spec-compliant (RFC 6347 §4.2.4).
     }
 
+    // Drain deferred response queue and retransmit pending CONs.
+    server.drainDeferred();
+
     // Compute load level based on buffer/exchange pool utilization.
     server.update_load_level();
 
@@ -840,6 +858,22 @@ fn handle_recv(
         if (server.exchanges.find(key)) |slot_idx| {
             server.exchanges.remove(slot_idx);
         }
+        // Also cancel any deferred response the client RST'd.
+        if (server.deferred) |*pool| {
+            if (pool.findByMsgId(packet.msg_id, recv.peer_address)) |idx| {
+                pool.release(idx);
+            }
+        }
+        return;
+    }
+
+    // ACK for a deferred (separate) CON response — release the slot.
+    if (packet.kind == .acknowledgement) {
+        if (server.deferred) |*pool| {
+            if (pool.findByMsgId(packet.msg_id, recv.peer_address)) |idx| {
+                pool.release(idx);
+            }
+        }
         return;
     }
 
@@ -896,10 +930,23 @@ fn handle_recv(
         return;
     }
 
+    // For CON requests, provide deferred response context so the handler
+    // can call request.deferResponse() for separate (delayed) responses.
+    var defer_ctx: ?handler.Request.DeferContext = null;
+    if (is_con) {
+        if (server.deferred) |*d| {
+            defer_ctx = .{
+                .pool = d,
+                .next_msg_id = server.nextMsgId(),
+            };
+        }
+    }
+
     const request = handler.Request{
         .packet = packet,
         .peer_address = recv.peer_address,
         .arena = arena,
+        .defer_ctx = defer_ctx,
     };
 
     const maybe_response = blk: {
@@ -1326,11 +1373,22 @@ fn process_dtls_coap(
         return;
     }
 
+    var dtls_defer_ctx: ?handler.Request.DeferContext = null;
+    if (is_con) {
+        if (server.deferred) |*d| {
+            dtls_defer_ctx = .{
+                .pool = d,
+                .next_msg_id = server.nextMsgId(),
+            };
+        }
+    }
+
     const request = handler.Request{
         .packet = packet,
         .peer_address = peer,
         .arena = arena,
         .is_secure = true,
+        .defer_ctx = dtls_defer_ctx,
     };
 
     const maybe_response = blk: {
@@ -1530,6 +1588,49 @@ fn send_rst(
 
     const rst_data = server.rate_limit_rst[slot..][0..4];
     server.send_data(rst_data, peer_address, index) catch {};
+}
+
+/// Drain deferred response queue and retransmit pending separate CONs.
+fn drainDeferred(server: *Server) void {
+    const pool = &(server.deferred orelse return);
+    if (pool.count_active == 0) return;
+
+    const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
+
+    // 1. Drain response queue — send new CON responses.
+    var drain_buf: [64]u16 = undefined;
+    const drained = pool.drainQueue(&drain_buf);
+    for (drained) |slot_idx| {
+        const slot = &pool.slots[slot_idx];
+        const data = pool.responseBuf(slot_idx)[0..slot.response_length];
+        server.send_data(data, slot.peer_address, @as(usize, slot_idx) % batch) catch {
+            pool.release(slot_idx);
+            continue;
+        };
+        slot.state.store(.sent, .release);
+        const timeout_ms: i64 = @intCast(constants.ack_timeout_ms);
+        slot.retransmit_deadline_ns = server.tick_now_ns + timeout_ms * std.time.ns_per_ms;
+        slot.retransmit_count = 0;
+    }
+
+    // 2. Scan for retransmit deadlines on already-sent responses.
+    for (pool.slots, 0..) |*slot, i| {
+        if (slot.state.load(.acquire) != .sent) continue;
+        if (server.tick_now_ns < slot.retransmit_deadline_ns) continue;
+
+        slot.retransmit_count += 1;
+        if (slot.retransmit_count > constants.max_retransmit) {
+            pool.release(@intCast(i));
+            continue;
+        }
+
+        const data = pool.responseBuf(@intCast(i))[0..slot.response_length];
+        server.send_data(data, slot.peer_address, i % batch) catch continue;
+
+        const backoff: u5 = @intCast(@min(slot.retransmit_count, 16));
+        const timeout_ms: i64 = @as(i64, constants.ack_timeout_ms) << backoff;
+        slot.retransmit_deadline_ns = server.tick_now_ns + timeout_ms * std.time.ns_per_ms;
+    }
 }
 
 /// Recompute load level based on pool utilization.
