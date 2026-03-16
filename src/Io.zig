@@ -74,20 +74,20 @@ pub fn deinit(io: *Io, allocator: std.mem.Allocator) void {
 /// Bind a UDP socket and provide buffers to the kernel pool.
 pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
     const address = try std.net.Address.parseIp(bind_address, port);
+    const family = address.any.family;
 
-    // Only IPv4 is supported; IPv6 requires larger sockaddr buffers
-    // throughout the recv/send paths.
-    if (address.any.family != posix.AF.INET) return error.UnsupportedAddressFamily;
-
-    const fd = try posix.socket(
-        posix.AF.INET,
-        posix.SOCK.DGRAM,
-        0,
-    );
+    const fd = try posix.socket(family, posix.SOCK.DGRAM, 0);
     io.fd_socket = fd;
 
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+
+    // Enable dual-stack for IPv6 sockets (accept both v4 and v6 clients).
+    if (family == posix.AF.INET6) {
+        posix.setsockopt(fd, linux.IPPROTO.IPV6, linux.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0))) catch |err| {
+            log.debug("IPV6_V6ONLY: {}", .{err});
+        };
+    }
 
     // Increase socket buffers for throughput.
     const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
@@ -202,14 +202,15 @@ pub fn decode_recv(io: *const Io, cqe: *const Cqe) !RecvResult {
         return error.PayloadOutOfBounds;
     }
 
-    const peer_addr: *linux.sockaddr.in =
-        @ptrCast(@alignCast(io.buffers.ptr + name_offset));
+    // Determine address family from the first 2 bytes of the name area.
+    const peer_family = std.mem.readInt(u16, io.buffers[name_offset..][0..2], .little);
 
-    // Port from sockaddr is in network byte order; initIp4 expects host order.
-    const net_address = std.net.Address.initIp4(
-        @bitCast(peer_addr.addr),
-        std.mem.bigToNative(u16, peer_addr.port),
-    );
+    const net_address: std.net.Address = if (peer_family == posix.AF.INET)
+        .{ .in = .{ .sa = @as(*const linux.sockaddr.in, @ptrCast(@alignCast(io.buffers.ptr + name_offset))).* } }
+    else if (peer_family == posix.AF.INET6)
+        .{ .in6 = .{ .sa = @as(*const linux.sockaddr.in6, @ptrCast(@alignCast(io.buffers.ptr + name_offset))).* } }
+    else
+        return error.UnsupportedAddressFamily;
 
     return .{
         .peer_address = net_address,
