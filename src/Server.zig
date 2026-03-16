@@ -112,7 +112,7 @@ exchange_lifetime_ms: u32,
 running: std.atomic.Value(bool),
 
 // Pre-allocated per-CQE response state.
-addrs_response: []linux.sockaddr,
+addrs_response: []std.net.Address,
 msgs_response: []linux.msghdr_const,
 iovs_response: []posix.iovec,
 buffer_response: []u8,
@@ -122,7 +122,7 @@ buffer_response: []u8,
 emergency_ack: []u8,
 
 // Recv state.
-addr_recv: linux.sockaddr,
+addr_recv: linux.sockaddr.in6,
 msg_recv: linux.msghdr,
 
 // Eviction timer.
@@ -268,7 +268,7 @@ fn init_raw(
     );
 
     const addrs_response = try allocator.alloc(
-        linux.sockaddr,
+        std.net.Address,
         batch,
     );
     errdefer allocator.free(addrs_response);
@@ -338,7 +338,7 @@ fn init_raw(
         .iovs_response = iovs_response,
         .buffer_response = buffer_response,
         .emergency_ack = emergency_ack,
-        .addr_recv = std.mem.zeroes(linux.sockaddr),
+        .addr_recv = std.mem.zeroes(linux.sockaddr.in6),
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
         .tick_count = 0,
@@ -387,8 +387,10 @@ pub fn deinit(server: *Server) void {
 pub fn listen(server: *Server) !void {
     try server.io.setup(server.config.port, server.config.bind_address);
 
-    server.msg_recv.name = &server.addr_recv;
-    server.msg_recv.namelen = @sizeOf(linux.sockaddr);
+    server.msg_recv.name = @ptrCast(&server.addr_recv);
+    // Set name buffer size based on actual socket family.
+    const bind_addr = try std.net.Address.parseIp(server.config.bind_address, server.config.port);
+    server.msg_recv.namelen = bind_addr.getOsSockLen();
     server.msg_recv.controllen = 0;
 
     try server.io.recv_multishot(&server.msg_recv);
@@ -1632,7 +1634,7 @@ fn send_raw(
     peer_address: std.net.Address,
     index: usize,
 ) !void {
-    server.addrs_response[index] = peer_address.any;
+    server.addrs_response[index] = peer_address;
 
     server.iovs_response[index] = .{
         .base = @ptrCast(@constCast(data.ptr)),
@@ -1641,7 +1643,7 @@ fn send_raw(
 
     server.msgs_response[index] = .{
         .name = @ptrCast(&server.addrs_response[index]),
-        .namelen = @sizeOf(linux.sockaddr),
+        .namelen = peer_address.getOsSockLen(),
         .iov = @ptrCast(&server.iovs_response[index]),
         .iovlen = 1,
         .control = null,
