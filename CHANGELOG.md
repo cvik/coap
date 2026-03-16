@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1] - 2026-03-17
+- Separate (delayed) responses: `Request.deferResponse()` API (RFC 7252 §5.2.2)
+- Pre-allocated deferred pool with lock-free MPSC queue (`Config.max_deferred`)
+- CON retransmission with exponential backoff for separate responses
+- ACK/RST handling for deferred response lifecycle
+- Tier 1 RFC 7252 core compliance now fully complete (1.1-1.5)
+
 ## [0.5.0] - 2026-03-16
 - IPv6 support: server, client, DTLS, bench `--ipv6` flag
 - Dual-stack via `IPV6_V6ONLY=0` when binding `::`
