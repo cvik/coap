@@ -91,40 +91,29 @@ The client handles these; the server does not.
   allocate. Consider ring buffer of pending notifications per resource.
 
 ### 2.2 Server-side Block2 — large responses (RFC 7959)
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** Server responses capped at buffer_size (1280 bytes). No
   fragmentation engine for larger payloads.
-- **Impact:** Cannot serve resource descriptions, firmware manifests, or any
-  response exceeding one MTU.
-- **Effort:** Medium. Requires:
-  - Detect Block2 option in request (or response exceeds MTU)
-  - Fragment response into blocks, serve on demand
-  - Track block transfer state per peer+token
-  - Handle client block-size negotiation (smaller SZX)
-- **Perf note:** Pre-allocate block transfer state slots. Lazy fragmentation
-  (generate blocks on demand) avoids buffering full payload.
+- **Resolution:** Handler returns full payload; server fragments transparently.
+  Shared `BlockTransfer` pool (`Config.max_block_transfers`, default 32) caches
+  full payload and serves blocks on demand. SZX negotiation supported.
 
 ### 2.3 Server-side Block1 — large uploads (RFC 7959)
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** Server cannot receive payloads larger than one packet. No block
   reassembly on inbound requests.
-- **Impact:** Cannot accept firmware uploads, large config pushes, etc.
-- **Effort:** Medium. Requires:
-  - Detect Block1 option in incoming request
-  - Reassembly buffer per peer+token
-  - 2.31 Continue responses for intermediate blocks
-  - Deliver assembled payload to handler on final block
-  - Timeout/cleanup for abandoned transfers
-- **Perf note:** Reassembly buffers must be pre-allocated and bounded. Cap
-  concurrent transfers and max payload size. Evict stale transfers.
+- **Resolution:** Server reassembles Block1 fragments transparently. Handler
+  sees the complete payload only after all blocks arrive. 2.31 Continue sent
+  for intermediate blocks. Max upload size configurable via
+  `Config.max_block_payload` (default 64KB). Shared pool with Block2.
 
 ### 2.4 Observe sequence reordering (RFC 7641 §3.4)
-- **Status:** `[-]` field exists, never checked
+- **Status:** `[x]` done
 - **Issue:** Client has `last_seq` field but `routeObserve()` never compares
   incoming sequence numbers. Stale/reordered notifications delivered as fresh.
-- **Impact:** Application may act on stale data without knowing.
-- **Effort:** Small. Add comparison in `routeObserve()` per §3.4 freshness rules.
-- **Perf note:** None — single integer comparison.
+- **Resolution:** Client extracts Observe option from wire data, compares with
+  `last_seq` using 24-bit wrap-around freshness check per §3.4. Stale/duplicate
+  notifications dropped silently.
 
 ---
 

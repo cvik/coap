@@ -27,7 +27,7 @@ pub const Slot = struct {
     token_len: u8,
     peer_address: std.net.Address,
     payload_length: u32,
-    next_num: u24,
+    next_num: u32,
     szx: u3,
     created_at_ns: i64,
     next_free: u16,
@@ -165,7 +165,7 @@ pub fn evictExpired(self: *BlockTransfer, now_ns: i64, timeout_ns: i64) u16 {
 
 /// Append a Block1 fragment. Returns whether more blocks are expected,
 /// the transfer is complete, or an error occurred.
-pub fn appendBlock1(self: *BlockTransfer, idx: u16, num: u24, more: bool, data: []const u8) AppendResult {
+pub fn appendBlock1(self: *BlockTransfer, idx: u16, num: u32, more: bool, data: []const u8) AppendResult {
     const slot = &self.slots[idx];
     if (num != slot.next_num) return .error_wrong_num;
     const new_len = slot.payload_length + @as(u32, @intCast(data.len));
@@ -194,7 +194,7 @@ pub fn storeBlock2Payload(self: *BlockTransfer, idx: u16, payload: []const u8) v
 
 /// Serve a single Block2 chunk. Client may request a different SZX
 /// (smaller block size) than the one used to store.
-pub fn serveBlock2(self: *const BlockTransfer, idx: u16, num: u24, szx: u3) Block2Result {
+pub fn serveBlock2(self: *const BlockTransfer, idx: u16, num: u32, szx: u3) Block2Result {
     const slot = &self.slots[idx];
     const block_size: u32 = @as(u32, 1) << (@as(u5, szx) + 4);
     const offset = @as(u32, num) * block_size;

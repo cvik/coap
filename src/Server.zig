@@ -29,6 +29,7 @@ const Io = @import("Io.zig");
 const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
 const Deferred = @import("deferred.zig");
+const BlockTransfer = @import("block_transfer.zig");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
 const dtls = @import("dtls/dtls.zig");
@@ -56,6 +57,10 @@ pub const Config = struct {
     exchange_count: u16 = 256,
     /// Maximum concurrent deferred (separate) responses. 0 = disabled.
     max_deferred: u16 = 16,
+    /// Maximum concurrent block transfers (Block1 + Block2 shared). 0 = disabled.
+    max_block_transfers: u16 = 32,
+    /// Maximum payload size for block transfers in bytes.
+    max_block_payload: u32 = 64 * 1024,
     /// Link-format payload for GET /.well-known/core (RFC 6690).
     /// If null, requests pass through to the handler.
     well_known_core: ?[]const u8 = null,
@@ -112,6 +117,7 @@ arena: std.heap.ArenaAllocator,
 config: Config,
 exchanges: Exchange,
 deferred: ?Deferred,
+block_transfers: ?BlockTransfer,
 exchange_lifetime_ms: u32,
 running: std.atomic.Value(bool),
 
@@ -275,6 +281,16 @@ fn init_raw(
     }
     errdefer if (deferred) |*d| d.deinit(allocator);
 
+    var block_transfers: ?BlockTransfer = null;
+    if (config.max_block_transfers > 0) {
+        block_transfers = try BlockTransfer.init(allocator, .{
+            .max_transfers = config.max_block_transfers,
+            .max_payload = config.max_block_payload,
+            .buffer_size = @intCast(config.buffer_size),
+        });
+    }
+    errdefer if (block_transfers) |*bt| bt.deinit(allocator);
+
     const batch: usize = @min(
         constants.completion_batch_max,
         config.buffer_count,
@@ -342,6 +358,7 @@ fn init_raw(
         .config = config,
         .exchanges = exchanges,
         .deferred = deferred,
+        .block_transfers = block_transfers,
         .exchange_lifetime_ms = if (config.exchange_lifetime_ms > 0)
             config.exchange_lifetime_ms
         else
@@ -377,6 +394,7 @@ pub fn deinit(server: *Server) void {
     server.arena.deinit();
     server.exchanges.deinit(server.allocator);
     if (server.deferred) |*d| d.deinit(server.allocator);
+    if (server.block_transfers) |*bt| bt.deinit(server.allocator);
     server.io.deinit(server.allocator);
     server.allocator.free(server.addrs_response);
     server.allocator.free(server.msgs_response);
@@ -697,12 +715,16 @@ pub fn tick(server: *Server) !void {
         try server.io.recv_multishot(&server.msg_recv);
     }
 
-    // Periodic exchange eviction (~every 10 seconds).
+    // Periodic exchange and block transfer eviction (~every 10 seconds).
     const eviction_interval_ns: i64 = 10 * std.time.ns_per_s;
     if (server.tick_now_ns - server.last_eviction_ns > eviction_interval_ns) {
         const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
         if (evicted > 0) {
             log.debug("evicted {d} expired exchanges", .{evicted});
+        }
+        if (server.block_transfers) |*bt| {
+            const timeout_ns: i64 = @as(i64, server.exchange_lifetime_ms) * std.time.ns_per_ms;
+            _ = bt.evictExpired(server.tick_now_ns, timeout_ns);
         }
         server.last_eviction_ns = server.tick_now_ns;
     }
@@ -949,6 +971,49 @@ fn handle_recv(
         .defer_ctx = defer_ctx,
     };
 
+    // Block2 follow-up: serve next block from cached transfer (skip handler).
+    if (server.block_transfers) |*bt| {
+        if (packet.find_option(.block2)) |opt| {
+            if (opt.as_block()) |bv| {
+                if (bv.num > 0) {
+                    if (bt.findByToken(packet.token, recv.peer_address)) |bt_idx| {
+                        const block = bt.serveBlock2(bt_idx, bv.num, bv.szx);
+                        if (!block.more) bt.release(bt_idx);
+                        var b2_buf: [3]u8 = undefined;
+                        const b2_opt = (coapz.BlockValue{
+                            .num = bv.num,
+                            .more = block.more,
+                            .szx = bv.szx,
+                        }).option(.block2, &b2_buf);
+                        const opts = arena.dupe(coapz.Option, &.{b2_opt}) catch return;
+                        const resp = handler.Response{
+                            .code = .content,
+                            .options = opts,
+                            .payload = block.data,
+                        };
+                        server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Block1 upload: reassemble fragments, call handler only on final block.
+    if (server.block_transfers) |*bt| {
+        if (packet.find_option(.block1)) |opt| {
+            if (opt.as_block()) |bv| {
+                const bt_resp = server.handleBlock1(bt, bv, packet, recv.peer_address, arena);
+                if (bt_resp) |resp| {
+                    server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
+                    return;
+                }
+                // bt_resp == null → Block1 complete. packet.payload now points to
+                // reassembled data in the transfer pool. Fall through to handler.
+            }
+        }
+    }
+
     const maybe_response = blk: {
         if (server.config.well_known_core) |wkc| {
             if (is_well_known_core(packet)) {
@@ -985,7 +1050,32 @@ fn handle_recv(
         break :blk result;
     };
 
-    if (maybe_response) |response| {
+    if (maybe_response) |response_raw| {
+        // Block2 initiation: if response payload exceeds block size, start transfer.
+        const response = if (server.block_transfers) |*bt| blk: {
+            const default_szx: u3 = 6; // 1024 bytes
+            const block_size: u32 = @as(u32, 1) << (@as(u5, default_szx) + 4);
+            if (response_raw.payload.len > block_size) {
+                if (bt.allocate(packet.token, recv.peer_address, .block2_serving, default_szx, server.tick_now_ns)) |bt_idx| {
+                    bt.storeBlock2Payload(bt_idx, response_raw.payload);
+                    const block = bt.serveBlock2(bt_idx, 0, default_szx);
+                    var b2_buf: [3]u8 = undefined;
+                    const b2_opt = (coapz.BlockValue{
+                        .num = 0,
+                        .more = block.more,
+                        .szx = default_szx,
+                    }).option(.block2, &b2_buf);
+                    const opts = arena.dupe(coapz.Option, &.{b2_opt}) catch break :blk response_raw;
+                    break :blk handler.Response{
+                        .code = response_raw.code,
+                        .options = opts,
+                        .payload = block.data,
+                    };
+                }
+            }
+            break :blk response_raw;
+        } else response_raw;
+
         const response_kind: coapz.MessageKind = if (is_con)
             .acknowledgement
         else
@@ -1591,6 +1681,111 @@ fn send_rst(
 }
 
 /// Drain deferred response queue and retransmit pending separate CONs.
+/// Handle a Block1 upload fragment. Returns a response to send (2.31 Continue
+/// or error), or null if the upload is complete and the handler should be called.
+fn handleBlock1(
+    server: *Server,
+    bt: *BlockTransfer,
+    bv: coapz.BlockValue,
+    packet: coapz.Packet,
+    peer: std.net.Address,
+    arena: std.mem.Allocator,
+) ?handler.Response {
+    if (bv.num == 0) {
+        // First block — allocate transfer slot.
+        const idx = bt.allocate(packet.token, peer, .block1_receiving, bv.szx, server.tick_now_ns) orelse {
+            return handler.Response.withCode(.request_entity_too_large);
+        };
+        const result = bt.appendBlock1(idx, 0, bv.more, packet.payload);
+        return switch (result) {
+            .more => makeContinueResponse(bv, arena),
+            .complete => null, // handler will be called
+            .error_too_large => ret: {
+                bt.release(idx);
+                break :ret handler.Response.withCode(.request_entity_too_large);
+            },
+            .error_wrong_num => ret: {
+                bt.release(idx);
+                break :ret handler.Response.withCode(.bad_request);
+            },
+        };
+    }
+
+    // Subsequent block — find existing transfer.
+    const idx = bt.findByToken(packet.token, peer) orelse {
+        return handler.Response.withCode(.request_entity_incomplete);
+    };
+    const result = bt.appendBlock1(idx, bv.num, bv.more, packet.payload);
+    return switch (result) {
+        .more => makeContinueResponse(bv, arena),
+        .complete => null,
+        .error_too_large => ret: {
+            bt.release(idx);
+            break :ret handler.Response.withCode(.request_entity_too_large);
+        },
+        .error_wrong_num => ret: {
+            bt.release(idx);
+            break :ret handler.Response.withCode(.bad_request);
+        },
+    };
+}
+
+fn makeContinueResponse(bv: coapz.BlockValue, arena: std.mem.Allocator) ?handler.Response {
+    var b1_buf: [3]u8 = undefined;
+    const b1_opt = (coapz.BlockValue{
+        .num = bv.num,
+        .more = false, // server echoes with M=0 in 2.31
+        .szx = bv.szx,
+    }).option(.block1, &b1_buf);
+    const opts = arena.dupe(coapz.Option, &.{b1_opt}) catch return null;
+    return .{
+        .code = .@"continue",
+        .options = opts,
+    };
+}
+
+/// Send a response packet (shared by block transfer and normal paths).
+fn sendResponse(
+    server: *Server,
+    response: handler.Response,
+    packet: coapz.Packet,
+    peer: std.net.Address,
+    is_con: bool,
+    addr_key: u32,
+    raw_header: *const [4]u8,
+    index: usize,
+) !void {
+    const response_packet = coapz.Packet{
+        .kind = if (is_con) .acknowledgement else .non_confirmable,
+        .code = response.code,
+        .msg_id = if (is_con) packet.msg_id else server.nextMsgId(),
+        .token = packet.token,
+        .options = response.options,
+        .payload = response.payload,
+        .data_buf = &.{},
+    };
+
+    const data_wire = server.send_packet(response_packet, peer, index) catch |err| {
+        switch (err) {
+            error.OutOfMemory, error.BufferTooSmall => {
+                if (is_con) server.send_emergency_ack(raw_header, peer, index);
+            },
+            else => log.err("response send failed: {}", .{err}),
+        }
+        return err;
+    };
+
+    if (is_con) {
+        const key = Exchange.peer_key(peer, packet.msg_id);
+        if (server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns) == null) {
+            const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+            if (evicted > 0) {
+                _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
+            }
+        }
+    }
+}
+
 fn drainDeferred(server: *Server) void {
     const pool = &(server.deferred orelse return);
     if (pool.count_active == 0) return;
