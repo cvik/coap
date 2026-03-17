@@ -1389,6 +1389,13 @@ fn dispatchRecv(client: *Client, data: []const u8) void {
 }
 
 /// Try to route data to an observe subscription. Returns true if consumed.
+/// Extract the Observe option sequence number from raw CoAP wire data.
+/// Returns null if no Observe option is present.
+fn parseObserveSeq(data: []const u8) ?u24 {
+    const opt = coapz.Packet.peekOption(data, .observe) orelse return null;
+    return @intCast(opt.as_uint() orelse return null);
+}
+
 fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
     for (&client.observes) |*obs| {
         if (!obs.active) continue;
@@ -1397,15 +1404,28 @@ fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
 
         client.peer_confirmed = true;
 
+        // RFC 7641 §3.4: check observe sequence freshness.
+        // Extract observe option value from the wire data.
+        if (parseObserveSeq(data)) |seq| {
+            if (obs.last_seq != 0 or seq != 0) {
+                // Fresh if seq > last (with 24-bit wrap-around tolerance).
+                const diff = seq -% obs.last_seq;
+                if (diff == 0 or diff > 0x800000) {
+                    // Stale or duplicate — drop silently.
+                    return true;
+                }
+            }
+            obs.last_seq = seq;
+        }
+
         if (obs.pending_count < max_pending_notifications) {
             const copy = client.allocator.alloc(u8, data.len) catch return true;
             @memcpy(copy, data);
-            const msg_kind: u2 = @intCast((data[0] >> 4) & 0x03);
             obs.pending[obs.pending_count] = .{
                 .data = copy,
                 .len = @intCast(data.len),
-                .msg_id = @as(u16, data[2]) << 8 | data[3],
-                .is_con = msg_kind == 0,
+                .msg_id = coapz.Packet.peekMsgId(data) orelse 0,
+                .is_con = coapz.Packet.peekKind(data) == .confirmable,
             };
             obs.pending_count += 1;
         }
@@ -1644,12 +1664,11 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             if (obs.pending_count < max_pending_notifications) {
                 const copy = try client.allocator.alloc(u8, data.len);
                 @memcpy(copy, data);
-                const msg_kind: u2 = @intCast((data[0] >> 4) & 0x03);
                 obs.pending[obs.pending_count] = .{
                     .data = copy,
                     .len = @intCast(data.len),
-                    .msg_id = @as(u16, data[2]) << 8 | data[3],
-                    .is_con = msg_kind == 0,
+                    .msg_id = coapz.Packet.peekMsgId(data) orelse 0,
+                    .is_con = coapz.Packet.peekKind(data) == .confirmable,
                 };
                 obs.pending_count += 1;
             }
