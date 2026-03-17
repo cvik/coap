@@ -1389,6 +1389,66 @@ fn dispatchRecv(client: *Client, data: []const u8) void {
 }
 
 /// Try to route data to an observe subscription. Returns true if consumed.
+/// Extract the Observe option sequence number from raw CoAP wire data.
+/// Returns null if no Observe option is present.
+fn parseObserveSeq(data: []const u8) ?u24 {
+    // Parse just enough of the packet header to find the Observe option (6).
+    if (data.len < 4) return null;
+    const tkl: usize = data[0] & 0x0F;
+    var off: usize = 4 + tkl;
+    var opt_num: u16 = 0;
+
+    while (off < data.len and data[off] != 0xFF) {
+        if (data.len - off < 1) break;
+        const delta_nibble: u4 = @intCast(data[off] >> 4);
+        const len_nibble: u4 = @intCast(data[off] & 0x0F);
+        off += 1;
+
+        // Extended delta.
+        var delta: u16 = delta_nibble;
+        if (delta_nibble == 13) {
+            if (off >= data.len) break;
+            delta = @as(u16, data[off]) + 13;
+            off += 1;
+        } else if (delta_nibble == 14) {
+            if (off + 1 >= data.len) break;
+            delta = (@as(u16, data[off]) << 8 | data[off + 1]) + 269;
+            off += 2;
+        } else if (delta_nibble == 15) break;
+
+        // Extended length.
+        var len: u16 = len_nibble;
+        if (len_nibble == 13) {
+            if (off >= data.len) break;
+            len = @as(u16, data[off]) + 13;
+            off += 1;
+        } else if (len_nibble == 14) {
+            if (off + 1 >= data.len) break;
+            len = (@as(u16, data[off]) << 8 | data[off + 1]) + 269;
+            off += 2;
+        } else if (len_nibble == 15) break;
+
+        opt_num += delta;
+
+        if (opt_num == 6) { // Observe
+            // Value is 0-3 byte unsigned integer.
+            if (len == 0) return 0;
+            if (off + len > data.len) return null;
+            var val: u24 = 0;
+            for (data[off..][0..len]) |b| {
+                val = (val << 8) | b;
+            }
+            return val;
+        }
+
+        // Options past 6 — Observe won't appear.
+        if (opt_num > 6) return null;
+
+        off += len;
+    }
+    return null;
+}
+
 fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
     for (&client.observes) |*obs| {
         if (!obs.active) continue;
@@ -1396,6 +1456,20 @@ fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
         if (!std.mem.eql(u8, obs.token[0..obs.token_len], token)) continue;
 
         client.peer_confirmed = true;
+
+        // RFC 7641 §3.4: check observe sequence freshness.
+        // Extract observe option value from the wire data.
+        if (parseObserveSeq(data)) |seq| {
+            if (obs.last_seq != 0 or seq != 0) {
+                // Fresh if seq > last (with 24-bit wrap-around tolerance).
+                const diff = seq -% obs.last_seq;
+                if (diff == 0 or diff > 0x800000) {
+                    // Stale or duplicate — drop silently.
+                    return true;
+                }
+            }
+            obs.last_seq = seq;
+        }
 
         if (obs.pending_count < max_pending_notifications) {
             const copy = client.allocator.alloc(u8, data.len) catch return true;
