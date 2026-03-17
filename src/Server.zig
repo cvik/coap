@@ -834,7 +834,7 @@ fn handle_recv(
             }
         }
         // CON: send RST. NON: drop silently.
-        const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
+        const is_con_raw = coapz.Packet.peekKind(recv.payload) == .confirmable;
         release_buffer_robust(&server.io, recv.buffer_id);
         server.buffers_outstanding -|= 1;
         if (is_con_raw) server.send_rst(&raw_header, recv.peer_address, index);
@@ -846,7 +846,7 @@ fn handle_recv(
         if (server.rate_limiter) |*rl| {
             const addr_key = RateLimiter.AddrKey.fromAddress(recv.peer_address);
             if (!rl.allow(addr_key, server.tick_now_ns)) {
-                const is_con_raw = recv.payload.len >= 1 and ((recv.payload[0] >> 4) & 0x03) == 0;
+                const is_con_raw = coapz.Packet.peekKind(recv.payload) == .confirmable;
                 release_buffer_robust(&server.io, recv.buffer_id);
                 server.buffers_outstanding -|= 1;
                 if (is_con_raw) server.send_rst(&raw_header, recv.peer_address, index);
@@ -1638,23 +1638,13 @@ fn send_emergency_ack(
     peer_address: std.net.Address,
     index: usize,
 ) void {
-    if (raw_payload.len < 4) return;
-
-    // CoAP header: ver|type|tkl(1B) code(1B) msg_id(2B)
-    // Check if CON (type bits = 0b00 in bits 5:4)
-    const type_bits = (raw_payload[0] >> 4) & 0x03;
-    if (type_bits != 0) return; // not CON
+    if (coapz.Packet.peekKind(raw_payload) != .confirmable) return;
+    const msg_id = coapz.Packet.peekMsgId(raw_payload) orelse return;
 
     const slot = index * 4;
     if (slot + 4 > server.emergency_ack.len) return;
 
-    // Build empty ACK: version=1, type=ACK(2), tkl=0, code=0.00, same msg_id
-    server.emergency_ack[slot + 0] = 0x60; // ver=1, type=ACK(10), tkl=0
-    server.emergency_ack[slot + 1] = 0x00; // code = 0.00 (empty)
-    server.emergency_ack[slot + 2] = raw_payload[2]; // msg_id high
-    server.emergency_ack[slot + 3] = raw_payload[3]; // msg_id low
-
-    const ack_data = server.emergency_ack[slot..][0..4];
+    const ack_data = coapz.Packet.emptyAck(msg_id, server.emergency_ack[slot..][0..4]);
     server.send_data(ack_data, peer_address, index) catch {};
 }
 
@@ -1665,18 +1655,12 @@ fn send_rst(
     peer_address: std.net.Address,
     index: usize,
 ) void {
-    if (raw_header.len < 4) return;
+    const msg_id = coapz.Packet.peekMsgId(raw_header) orelse return;
 
     const slot = index * 4;
     if (slot + 4 > server.rate_limit_rst.len) return;
 
-    // Build RST: version=1, type=RST(3), tkl=0, code=0.00, same msg_id
-    server.rate_limit_rst[slot + 0] = 0x70; // ver=1, type=RST(11), tkl=0
-    server.rate_limit_rst[slot + 1] = 0x00;
-    server.rate_limit_rst[slot + 2] = raw_header[2];
-    server.rate_limit_rst[slot + 3] = raw_header[3];
-
-    const rst_data = server.rate_limit_rst[slot..][0..4];
+    const rst_data = coapz.Packet.emptyRst(msg_id, server.rate_limit_rst[slot..][0..4]);
     server.send_data(rst_data, peer_address, index) catch {};
 }
 

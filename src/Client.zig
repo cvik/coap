@@ -1392,61 +1392,8 @@ fn dispatchRecv(client: *Client, data: []const u8) void {
 /// Extract the Observe option sequence number from raw CoAP wire data.
 /// Returns null if no Observe option is present.
 fn parseObserveSeq(data: []const u8) ?u24 {
-    // Parse just enough of the packet header to find the Observe option (6).
-    if (data.len < 4) return null;
-    const tkl: usize = data[0] & 0x0F;
-    var off: usize = 4 + tkl;
-    var opt_num: u16 = 0;
-
-    while (off < data.len and data[off] != 0xFF) {
-        if (data.len - off < 1) break;
-        const delta_nibble: u4 = @intCast(data[off] >> 4);
-        const len_nibble: u4 = @intCast(data[off] & 0x0F);
-        off += 1;
-
-        // Extended delta.
-        var delta: u16 = delta_nibble;
-        if (delta_nibble == 13) {
-            if (off >= data.len) break;
-            delta = @as(u16, data[off]) + 13;
-            off += 1;
-        } else if (delta_nibble == 14) {
-            if (off + 1 >= data.len) break;
-            delta = (@as(u16, data[off]) << 8 | data[off + 1]) + 269;
-            off += 2;
-        } else if (delta_nibble == 15) break;
-
-        // Extended length.
-        var len: u16 = len_nibble;
-        if (len_nibble == 13) {
-            if (off >= data.len) break;
-            len = @as(u16, data[off]) + 13;
-            off += 1;
-        } else if (len_nibble == 14) {
-            if (off + 1 >= data.len) break;
-            len = (@as(u16, data[off]) << 8 | data[off + 1]) + 269;
-            off += 2;
-        } else if (len_nibble == 15) break;
-
-        opt_num += delta;
-
-        if (opt_num == 6) { // Observe
-            // Value is 0-3 byte unsigned integer.
-            if (len == 0) return 0;
-            if (off + len > data.len) return null;
-            var val: u24 = 0;
-            for (data[off..][0..len]) |b| {
-                val = (val << 8) | b;
-            }
-            return val;
-        }
-
-        // Options past 6 — Observe won't appear.
-        if (opt_num > 6) return null;
-
-        off += len;
-    }
-    return null;
+    const opt = coapz.Packet.peekOption(data, .observe) orelse return null;
+    return @intCast(opt.as_uint() orelse return null);
 }
 
 fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
@@ -1474,12 +1421,11 @@ fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
         if (obs.pending_count < max_pending_notifications) {
             const copy = client.allocator.alloc(u8, data.len) catch return true;
             @memcpy(copy, data);
-            const msg_kind: u2 = @intCast((data[0] >> 4) & 0x03);
             obs.pending[obs.pending_count] = .{
                 .data = copy,
                 .len = @intCast(data.len),
-                .msg_id = @as(u16, data[2]) << 8 | data[3],
-                .is_con = msg_kind == 0,
+                .msg_id = coapz.Packet.peekMsgId(data) orelse 0,
+                .is_con = coapz.Packet.peekKind(data) == .confirmable,
             };
             obs.pending_count += 1;
         }
@@ -1718,12 +1664,11 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             if (obs.pending_count < max_pending_notifications) {
                 const copy = try client.allocator.alloc(u8, data.len);
                 @memcpy(copy, data);
-                const msg_kind: u2 = @intCast((data[0] >> 4) & 0x03);
                 obs.pending[obs.pending_count] = .{
                     .data = copy,
                     .len = @intCast(data.len),
-                    .msg_id = @as(u16, data[2]) << 8 | data[3],
-                    .is_con = msg_kind == 0,
+                    .msg_id = coapz.Packet.peekMsgId(data) orelse 0,
+                    .is_con = coapz.Packet.peekKind(data) == .confirmable,
                 };
                 obs.pending_count += 1;
             }
