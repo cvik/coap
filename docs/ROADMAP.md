@@ -1,6 +1,6 @@
 # Protocol Compliance Roadmap
 
-Status as of v0.5.0 (2026-03-16). Items ordered by priority within each tier.
+Status as of v0.6.0 (2026-03-18). Items ordered by priority within each tier.
 
 Legend: `[x]` done, `[-]` partial, `[ ]` not started
 
@@ -254,18 +254,18 @@ Any work on the above must preserve these properties:
 
 ## Suggested Implementation Order
 
-Items 1-4 are done. Remaining sequence:
+Tier 1 and Tier 2 complete. Remaining sequence:
 
 1. ~~**1.1** Critical option rejection~~ ✓
 2. ~~**1.5** Option order validation~~ ✓
 3. ~~**1.3** NSTART enforcement~~ ✓
 4. ~~**1.4** IPv6~~ ✓
-5. **1.2** Separate responses — unblocks async handlers, prerequisite for 2.1
-6. **2.4** Observe sequence check — quick win, client fix
-7. **3.4** Size1/Size2 — small, server pre-check
-8. **2.2** Server Block2 — unblocks large responses
-9. **2.3** Server Block1 — unblocks large uploads
-10. **2.1** Server Observe — builds on separate responses + exchange pool
+5. ~~**1.2** Separate responses~~ ✓
+6. ~~**2.4** Observe sequence check~~ ✓
+7. ~~**2.2** Server Block2~~ ✓
+8. ~~**2.3** Server Block1~~ ✓
+9. ~~**2.1** Server Observe~~ ✓
+10. **3.4** Size1/Size2 — small, server pre-check
 11. **3.1** Request-Tag — completes Block1 correctness
 12. **3.2** Echo option — completes security posture
 13. **4.2** Server DTLS retransmit — completes DTLS compliance
