@@ -750,10 +750,11 @@ Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
 - [x] Parallel AES-CTR via AES-NI xorWide
 - [x] Critical option rejection (RFC 7252 §5.4.1)
 - [x] NSTART congestion control (RFC 7252 §4.7)
-- [ ] IPv6
-- [ ] Separate (delayed) responses
-- [ ] Server-side Observe (RFC 7641)
-- [ ] Server-side Block1/Block2 (RFC 7959)
+- [x] IPv6 with dual-stack support
+- [x] Separate (delayed) responses (RFC 7252 §5.2.2)
+- [x] Server-side Observe with thread-safe notify (RFC 7641)
+- [x] Server-side Block1/Block2 transfers (RFC 7959)
+- [x] Client observe sequence freshness check (RFC 7641 §3.4)
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full protocol compliance roadmap.
 
