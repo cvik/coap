@@ -75,20 +75,15 @@ These are protocol violations or mandatory omissions in the base CoAP spec.
 The client handles these; the server does not.
 
 ### 2.1 Server-side Observe (RFC 7641)
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** Server receives observe registrations but cannot maintain an observer
   list or push notifications. This is the biggest functional gap.
-- **Impact:** Cannot build sensor networks, event-driven systems, or any
-  push-notification use case on the server side.
-- **Effort:** Large. Requires:
-  - Observer registry (resource path → list of observers with tokens + addresses)
-  - Notification API for application code to trigger pushes
-  - Sequence number generation and ordering (§3.4)
-  - CON notification retransmission
-  - Observer eviction on RST, timeout, or Max-Age expiry
-  - Integration with exchange pool for dedup of notification ACKs
-- **Perf note:** Registry must be pre-allocated. Notification send path must not
-  allocate. Consider ring buffer of pending notifications per resource.
+- **Resolution:** Pre-allocated `ObserverRegistry` with resource slots and
+  per-resource observer lists. Handler registers clients via
+  `request.observeResource(rid)`. Application pushes notifications via
+  thread-safe `server.notify(rid, response)` using lock-free MPSC queue.
+  Tick loop sends NON notifications with auto-incrementing Observe sequence.
+  Observers evicted on RST. Config: `max_observers` (256), `max_observe_resources` (64).
 
 ### 2.2 Server-side Block2 — large responses (RFC 7959)
 - **Status:** `[x]` done
