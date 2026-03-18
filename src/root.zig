@@ -120,6 +120,7 @@ const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
 const Deferred = @import("deferred.zig");
 const BlockTransferMod = @import("block_transfer.zig");
+const ObserverRegistryMod = @import("observe.zig");
 
 /// Handle for a deferred (separate) response. See `Request.defer()`.
 pub const DeferredResponse = Deferred.DeferredResponse;
@@ -134,5 +135,6 @@ test {
     _ = RateLimiter;
     _ = Deferred;
     _ = BlockTransferMod;
+    _ = ObserverRegistryMod;
     _ = dtls;
 }
