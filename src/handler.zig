@@ -1,6 +1,7 @@
 const std = @import("std");
 const coapz = @import("coapz");
 const Deferred = @import("deferred.zig");
+const ObserverRegistry = @import("observe.zig");
 const log = std.log.scoped(.coap);
 
 /// Incoming CoAP request passed to the handler function.
@@ -40,11 +41,20 @@ pub const Request = struct {
     /// Deferred response context. Non-null when the server has a deferred
     /// pool configured (`Config.max_deferred > 0`) and the request is CON.
     defer_ctx: ?DeferContext = null,
+    /// Observe context. Non-null when the server has an observer registry.
+    observe_ctx: ?ObserveContext = null,
 
     /// Context for `defer()`. Provided by the server; not user-constructible.
     pub const DeferContext = struct {
         pool: *Deferred,
         next_msg_id: u16,
+    };
+
+    /// Context for observe registration. Provided by the server.
+    pub const ObserveContext = struct {
+        registry: *ObserverRegistry,
+        peer_address: std.net.Address,
+        token: []const u8,
     };
 
     /// Request a deferred (separate) response. The server immediately sends
@@ -71,6 +81,20 @@ pub const Request = struct {
             @truncate(std.time.nanoTimestamp()),
         ) orelse return null;
         return .{ .pool = ctx.pool, .slot_idx = idx };
+    }
+
+    /// Register this client as an observer of the given resource.
+    /// The `resource_id` is obtained from `server.allocateResource()`.
+    /// Returns true if registered, false if the registry is full.
+    pub fn observeResource(self: Request, resource_id: u16) bool {
+        const ctx = self.observe_ctx orelse return false;
+        return ctx.registry.addObserver(resource_id, ctx.peer_address, ctx.token);
+    }
+
+    /// Remove this client from the observer list of the given resource.
+    pub fn removeObserver(self: Request, resource_id: u16) void {
+        const ctx = self.observe_ctx orelse return;
+        ctx.registry.removeObserver(resource_id, ctx.peer_address, ctx.token);
     }
 
     /// Request method (`.get`, `.post`, `.put`, `.delete`, …).
