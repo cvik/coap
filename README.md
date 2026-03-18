@@ -5,7 +5,11 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 **Server:**
 - Zero allocations in the hot path (arena resets per batch)
 - CON/ACK reliability with duplicate detection and RST handling
+- Separate (delayed) responses with `Request.deferResponse()` (RFC 7252 §5.2.2)
+- Server-side Observe with thread-safe `server.notify()` push API (RFC 7641)
+- Transparent Block1 upload reassembly and Block2 large response fragmentation (RFC 7959)
 - Multi-threaded via SO_REUSEPORT (no shared state between threads)
+- IPv4 and IPv6 with dual-stack support
 - Per-IP rate limiting with token bucket and three-level load shedding
 - Critical option rejection with 4.02 Bad Option (RFC 7252 §5.4.1)
 - .well-known/core resource discovery (RFC 6690)
@@ -21,7 +25,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - NON fire-and-forget requests
 - Transparent Block2 response reassembly
 - Block1 segmented upload (RFC 7959)
-- Observe subscriptions (RFC 7641)
+- Observe subscriptions with sequence freshness check (RFC 7641)
 - DTLS 1.2 PSK handshake and encrypted transport
 - Pre-allocated in-flight tracking, zero hot-path allocations
 
