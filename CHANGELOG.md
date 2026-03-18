@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0] - 2026-03-18
+- Server-side Observe: `server.notify(rid, response)` thread-safe push API (RFC 7641)
+- `Request.observeResource(rid)` / `removeObserver(rid)` handler methods
+- Server-side Block2: transparent large response fragmentation (RFC 7959)
+- Server-side Block1: transparent upload reassembly (RFC 7959)
+- Client observe sequence freshness check (RFC 7641 §3.4)
+- Shared `BlockTransfer` pool (`Config.max_block_transfers`, `max_block_payload`)
+- Updated to coapz v0.3.0 (zero-alloc peek helpers, emptyAck/emptyRst)
+- **Tier 2 server-side protocol features now fully complete** (2.1-2.4)
+
 ## [0.5.1] - 2026-03-17
 - Separate (delayed) responses: `Request.deferResponse()` API (RFC 7252 §5.2.2)
 - Pre-allocated deferred pool with lock-free MPSC queue (`Config.max_deferred`)
