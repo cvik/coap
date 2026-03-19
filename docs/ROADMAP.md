@@ -117,13 +117,13 @@ The client handles these; the server does not.
 Important extensions beyond base CoAP.
 
 ### 3.1 Request-Tag (RFC 9175 §3)
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** Block1 reassembly uses token alone to match fragments. When
   multiple clients upload concurrently to the same resource, fragments can
   be mixed. Request-Tag disambiguates.
-- **Impact:** Correctness issue under concurrent Block1 uploads.
-- **Effort:** Small-medium. Add Request-Tag option generation in client uploads,
-  matching in server Block1 reassembly (once 2.3 is implemented).
+- **Resolution:** Server extracts Request-Tag (option 292) from Block1 requests
+  and includes it in transfer slot matching alongside token + peer address.
+  `findByToken` now requires all three to match.
 
 ### 3.2 Echo option (RFC 9175 §2)
 - **Status:** `[x]` done

@@ -25,6 +25,8 @@ pub const Slot = struct {
     kind: TransferKind,
     token: [8]u8,
     token_len: u8,
+    request_tag: [8]u8,
+    request_tag_len: u8,
     peer_address: std.net.Address,
     payload_length: u32,
     next_num: u32,
@@ -65,6 +67,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !BlockTransfer {
             .kind = .block1_receiving,
             .token = .{0} ** 8,
             .token_len = 0,
+            .request_tag = .{0} ** 8,
+            .request_tag_len = 0,
             .peer_address = std.mem.zeroes(std.net.Address),
             .payload_length = 0,
             .next_num = 0,
@@ -99,6 +103,7 @@ pub fn allocate(
     kind: TransferKind,
     szx: u3,
     now_ns: i64,
+    request_tag: []const u8,
 ) ?u16 {
     if (self.free_head == empty_sentinel) return null;
 
@@ -117,6 +122,13 @@ pub fn allocate(
             break :blk t;
         },
         .token_len = @intCast(@min(token.len, 8)),
+        .request_tag = blk: {
+            var rt: [8]u8 = .{0} ** 8;
+            const len = @min(request_tag.len, 8);
+            @memcpy(rt[0..len], request_tag[0..len]);
+            break :blk rt;
+        },
+        .request_tag_len = @intCast(@min(request_tag.len, 8)),
         .peer_address = peer_address,
         .payload_length = 0,
         .next_num = 0,
@@ -136,12 +148,14 @@ pub fn release(self: *BlockTransfer, idx: u16) void {
     self.count_active -|= 1;
 }
 
-/// Find an active transfer by token and peer address.
-pub fn findByToken(self: *const BlockTransfer, token: []const u8, peer: std.net.Address) ?u16 {
+/// Find an active transfer by token, peer address, and request tag.
+pub fn findByToken(self: *const BlockTransfer, token: []const u8, peer: std.net.Address, request_tag: []const u8) ?u16 {
     for (self.slots, 0..) |*slot, i| {
         if (slot.state != .active) continue;
         if (slot.token_len != token.len) continue;
         if (!std.mem.eql(u8, slot.token[0..slot.token_len], token)) continue;
+        if (slot.request_tag_len != request_tag.len) continue;
+        if (!std.mem.eql(u8, slot.request_tag[0..slot.request_tag_len], request_tag)) continue;
         if (!addrEqual(slot.peer_address, peer)) continue;
         return @intCast(i);
     }
@@ -239,7 +253,7 @@ test "allocate and release" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
     try testing.expectEqual(@as(u16, 1), pool.count_active);
     try testing.expectEqual(State.active, pool.slots[idx].state);
@@ -253,9 +267,9 @@ test "pool exhaustion" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    try testing.expect(pool.allocate(&.{0x01}, addr, .block1_receiving, 6, 0) != null);
-    try testing.expect(pool.allocate(&.{0x02}, addr, .block1_receiving, 6, 0) != null);
-    try testing.expect(pool.allocate(&.{0x03}, addr, .block1_receiving, 6, 0) == null);
+    try testing.expect(pool.allocate(&.{0x01}, addr, .block1_receiving, 6, 0, &.{}) != null);
+    try testing.expect(pool.allocate(&.{0x02}, addr, .block1_receiving, 6, 0, &.{}) != null);
+    try testing.expect(pool.allocate(&.{0x03}, addr, .block1_receiving, 6, 0, &.{}) == null);
 }
 
 test "findByToken" {
@@ -264,12 +278,12 @@ test "findByToken" {
 
     const addr1 = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
     const addr2 = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 5683);
-    const idx = pool.allocate(&.{ 0xAA, 0xBB }, addr1, .block1_receiving, 6, 0) orelse
+    const idx = pool.allocate(&.{ 0xAA, 0xBB }, addr1, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
-    try testing.expectEqual(idx, pool.findByToken(&.{ 0xAA, 0xBB }, addr1).?);
-    try testing.expect(pool.findByToken(&.{ 0xAA, 0xBB }, addr2) == null); // wrong addr
-    try testing.expect(pool.findByToken(&.{0xCC}, addr1) == null); // wrong token
+    try testing.expectEqual(idx, pool.findByToken(&.{ 0xAA, 0xBB }, addr1, &.{}).?);
+    try testing.expect(pool.findByToken(&.{ 0xAA, 0xBB }, addr2, &.{}) == null); // wrong addr
+    try testing.expect(pool.findByToken(&.{0xCC}, addr1, &.{}) == null); // wrong token
 }
 
 test "block1: reassemble three fragments" {
@@ -277,7 +291,7 @@ test "block1: reassemble three fragments" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
     const block = [_]u8{0x42} ** 1024;
@@ -296,7 +310,7 @@ test "block1: error on wrong block number" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
     try testing.expect(pool.appendBlock1(idx, 0, true, "data") == .more);
@@ -308,7 +322,7 @@ test "block1: error on payload too large" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
     const big = [_]u8{0x42} ** 101;
@@ -321,7 +335,7 @@ test "block2: store payload and serve blocks" {
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
     const payload = [_]u8{0x42} ** 2500;
-    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
     pool.storeBlock2Payload(idx, &payload);
@@ -348,7 +362,7 @@ test "block2: smaller SZX negotiation" {
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
     const payload = [_]u8{0x42} ** 600;
-    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
     pool.storeBlock2Payload(idx, &payload);
@@ -372,7 +386,7 @@ test "block2: out of range block number" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0) orelse
+    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
     pool.storeBlock2Payload(idx, "hello");
@@ -387,8 +401,8 @@ test "evictExpired" {
     defer pool.deinit(testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    _ = pool.allocate(&.{0x01}, addr, .block1_receiving, 6, 1000);
-    _ = pool.allocate(&.{0x02}, addr, .block1_receiving, 6, 5000);
+    _ = pool.allocate(&.{0x01}, addr, .block1_receiving, 6, 1000, &.{});
+    _ = pool.allocate(&.{0x02}, addr, .block1_receiving, 6, 5000, &.{});
 
     const evicted = pool.evictExpired(6000, 4000);
     try testing.expectEqual(@as(u16, 1), evicted);
