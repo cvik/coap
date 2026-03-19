@@ -105,6 +105,22 @@ pub const Request = struct {
         return null;
     }
 
+    /// If-Match ETag values from the request (RFC 7252 §5.10.1).
+    /// Returns an iterator over all If-Match options.
+    pub inline fn ifMatch(self: Request) coapz.OptionIterator {
+        return self.packet.find_options(.if_match);
+    }
+
+    /// True if the request contains an If-None-Match option (RFC 7252 §5.10.2).
+    pub inline fn ifNoneMatch(self: Request) bool {
+        return self.packet.find_option(.if_none_match) != null;
+    }
+
+    /// ETag values from the request.
+    pub inline fn etags(self: Request) coapz.OptionIterator {
+        return self.packet.find_options(.etag);
+    }
+
     /// Request method (`.get`, `.post`, `.put`, `.delete`, …).
     pub inline fn method(self: Request) coapz.Code {
         return self.packet.code;
@@ -232,6 +248,11 @@ pub const Response = struct {
     /// 4.02 Bad Option.
     pub inline fn badOption() Response {
         return .{ .code = .bad_option };
+    }
+
+    /// 4.12 Precondition Failed.
+    pub inline fn preconditionFailed() Response {
+        return .{ .code = .precondition_failed };
     }
 
     /// Response with an arbitrary code and no payload.
