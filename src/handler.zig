@@ -97,6 +97,14 @@ pub const Request = struct {
         ctx.registry.removeObserver(resource_id, ctx.peer_address, ctx.token);
     }
 
+    /// Return the Echo option value from this request, if present (RFC 9175 §2).
+    /// The handler can compare this with a previously sent Echo to verify freshness.
+    pub fn echoOption(self: Request) ?[]const u8 {
+        const echo_kind: coapz.OptionKind = @enumFromInt(252);
+        if (self.packet.find_option(echo_kind)) |opt| return opt.value;
+        return null;
+    }
+
     /// Request method (`.get`, `.post`, `.put`, `.delete`, …).
     pub inline fn method(self: Request) coapz.Code {
         return self.packet.code;
@@ -229,6 +237,21 @@ pub const Response = struct {
     /// Response with an arbitrary code and no payload.
     pub inline fn withCode(code: coapz.Code) Response {
         return .{ .code = code };
+    }
+
+    /// Add an Echo option (RFC 9175 §2) to this response for freshness
+    /// verification. The client must reflect the Echo value in subsequent
+    /// requests. Generates a random 8-byte Echo value.
+    pub fn withEcho(self: Response, arena: std.mem.Allocator) Response {
+        const echo_kind: coapz.OptionKind = @enumFromInt(252);
+        var echo_val: [8]u8 = undefined;
+        std.crypto.random.bytes(&echo_val);
+        const echo_opt = coapz.Option{ .kind = echo_kind, .value = arena.dupe(u8, &echo_val) catch return self };
+        const existing = self.options;
+        const opts = arena.alloc(coapz.Option, existing.len + 1) catch return self;
+        @memcpy(opts[0..existing.len], existing);
+        opts[existing.len] = echo_opt;
+        return .{ .code = self.code, .options = opts, .payload = self.payload };
     }
 };
 

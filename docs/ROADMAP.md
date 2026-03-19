@@ -126,12 +126,12 @@ Important extensions beyond base CoAP.
   `findByToken` now requires all three to match.
 
 ### 3.2 Echo option (RFC 9175 §2)
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** No mechanism for server to verify request freshness or client
   reachability. Needed to defend against replay attacks and IP spoofing.
-- **Impact:** Security gap for deployments exposed to untrusted networks.
-- **Effort:** Small. Server generates Echo value, client reflects it. State is
-  a single opaque token per peer.
+- **Resolution:** `Request.echoOption()` accessor returns reflected Echo value.
+  `Response.withEcho(arena)` adds random 8-byte Echo option. Handler-driven
+  freshness verification — server infrastructure, application policy.
 
 ### 3.3 Conditional requests (§5.10.1-2)
 - **Status:** `[-]` options parseable, no server enforcement
