@@ -32,7 +32,7 @@ const ctr_flags: u8 = l_prime;
 /// Encrypt plaintext with AES-128-CCM-8.
 /// out.len must equal plaintext.len + tag_len (8).
 pub fn encrypt(plaintext: []const u8, ad: []const u8, nonce: [nonce_len]u8, key: [key_len]u8, out: []u8) void {
-    std.debug.assert(out.len == plaintext.len + tag_len);
+    if (out.len != plaintext.len + tag_len) @panic("CCM encrypt: out.len != plaintext.len + tag_len");
 
     const aes = Aes128.initEnc(key);
 
@@ -56,8 +56,8 @@ pub fn encrypt(plaintext: []const u8, ad: []const u8, nonce: [nonce_len]u8, key:
 /// out.len must equal ciphertext_and_tag.len - tag_len.
 /// Returns error.AuthenticationFailed if authentication fails.
 pub fn decrypt(ciphertext_and_tag: []const u8, ad: []const u8, nonce: [nonce_len]u8, key: [key_len]u8, out: []u8) error{AuthenticationFailed}!void {
-    std.debug.assert(ciphertext_and_tag.len >= tag_len);
-    std.debug.assert(out.len == ciphertext_and_tag.len - tag_len);
+    if (ciphertext_and_tag.len < tag_len) @panic("CCM decrypt: ciphertext too short");
+    if (out.len != ciphertext_and_tag.len - tag_len) @panic("CCM decrypt: out.len mismatch");
 
     const ciphertext = ciphertext_and_tag[0..out.len];
     const received_tag = ciphertext_and_tag[out.len..][0..tag_len];
@@ -104,7 +104,7 @@ fn makeCtrBlock(nonce: [nonce_len]u8, counter: u24) [block_len]u8 {
 /// Uses wide (parallel) AES-NI operations when available, processing
 /// multiple counter blocks per round to exploit instruction pipelining.
 fn ctrEncrypt(aes: AesEncryptCtx(Aes128), nonce: [nonce_len]u8, src: []const u8, dst: []u8) void {
-    std.debug.assert(dst.len == src.len);
+    if (dst.len != src.len) @panic("CCM ctrEncrypt: dst.len != src.len");
     var counter: u24 = 1;
     var offset: usize = 0;
 
@@ -124,7 +124,7 @@ fn ctrEncrypt(aes: AesEncryptCtx(Aes128), nonce: [nonce_len]u8, src: []const u8,
     // Remaining full blocks, one at a time.
     while (offset + block_len <= src.len) : (offset += block_len) {
         aes.xor(dst[offset..][0..block_len], src[offset..][0..block_len], makeCtrBlock(nonce, counter));
-        counter += 1;
+        counter +%= 1;
     }
 
     // Final partial block.
@@ -158,7 +158,7 @@ fn computeCbcMac(aes: AesEncryptCtx(Aes128), plaintext: []const u8, ad: []const 
     if (ad.len > 0) {
         // For ad.len < 65280 (0xFF00): 2-byte big-endian length prefix
         // Standard DTLS records are well under this limit.
-        std.debug.assert(ad.len < 0xFF00);
+        if (ad.len >= 0xFF00) @panic("CCM: AD too large (>= 0xFF00)");
 
         // Treat the AD encoding as a stream: 2-byte length prefix then AD bytes,
         // processed in 16-byte blocks (zero-padded at the end).

@@ -1920,7 +1920,7 @@ fn drainDeferred(server: *Server) void {
         const data = pool.responseBuf(@intCast(i))[0..slot.response_length];
         server.send_data(data, slot.peer_address, i % batch) catch continue;
 
-        const backoff: u5 = @intCast(@min(slot.retransmit_count, 16));
+        const backoff: u5 = @intCast(@min(slot.retransmit_count, constants.max_retransmit));
         const timeout_ms: i64 = @as(i64, constants.ack_timeout_ms) << backoff;
         slot.retransmit_deadline_ns = server.tick_now_ns + timeout_ms * std.time.ns_per_ms;
     }

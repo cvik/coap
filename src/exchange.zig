@@ -186,8 +186,8 @@ pub fn insert(
     const slot = &exchange.slots[slot_idx];
     exchange.free_head = slot.next_free;
     exchange.count_active += 1;
-    // Invariant: free_head == empty_sentinel guards over-allocation above.
-    std.debug.assert(exchange.count_active <= exchange.config.exchange_count);
+    if (exchange.count_active > exchange.config.exchange_count)
+        @panic("exchange pool: count_active exceeds capacity");
 
     // Populate slot.
     slot.* = .{
@@ -222,7 +222,7 @@ pub fn insert(
 /// Get the cached response for a slot.
 pub fn cached_response(exchange: *const Exchange, slot_idx: u16) []const u8 {
     const slot = &exchange.slots[slot_idx];
-    std.debug.assert(slot.state == .completed);
+    if (slot.state != .completed) @panic("exchange: cached_response on non-completed slot");
     const offset = @as(usize, slot_idx) * exchange.config.response_size_max;
     return exchange.response_buffer[offset..][0..slot.response_length];
 }
@@ -264,7 +264,7 @@ pub fn evict_expired(exchange: *Exchange, now_ns: i64, lifetime_ms: u32) u16 {
 /// Remove a specific exchange and return its slot to the free list.
 pub fn remove(exchange: *Exchange, slot_idx: u16) void {
     const slot = &exchange.slots[slot_idx];
-    std.debug.assert(slot.state == .completed);
+    if (slot.state != .completed) return; // stale or already freed
 
     // Remove from hash table.
     exchange.remove_from_table(slot.peer_key);

@@ -31,7 +31,8 @@ pub const Observer = struct {
 
 pub const Resource = struct {
     active: bool = false,
-    observer_count: u16 = 0,
+    /// Atomic: read from notify() (any thread), written from handler threads.
+    observer_count: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
     seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
@@ -122,7 +123,7 @@ pub fn allocateResource(self: *ObserverRegistry) ?u16 {
     for (self.resources, 0..) |*res, i| {
         if (!res.active) {
             res.active = true;
-            res.observer_count = 0;
+            res.observer_count.store(0, .monotonic);
             res.seq = std.atomic.Value(u32).init(0);
             self.resource_count += 1;
             return @intCast(i);
@@ -157,7 +158,7 @@ pub fn addObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.Addr
             obs.token_len = @intCast(@min(token.len, 8));
             obs.token = .{0} ** 8;
             @memcpy(obs.token[0..obs.token_len], token[0..obs.token_len]);
-            self.resources[resource_id].observer_count += 1;
+            _ = self.resources[resource_id].observer_count.fetchAdd(1, .monotonic);
             return true;
         }
     }
@@ -177,7 +178,7 @@ pub fn removeObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.A
             addrEqual(obs.peer_address, peer))
         {
             obs.active = false;
-            self.resources[resource_id].observer_count -|= 1;
+            _ = self.resources[resource_id].observer_count.fetchSub(1, .monotonic);
             return;
         }
     }
@@ -192,7 +193,7 @@ pub fn removeByPeer(self: *ObserverRegistry, peer: std.net.Address) void {
         for (slice) |*obs| {
             if (obs.active and addrEqual(obs.peer_address, peer)) {
                 obs.active = false;
-                res.observer_count -|= 1;
+                _ = res.observer_count.fetchSub(1, .monotonic);
             }
         }
     }
@@ -214,7 +215,7 @@ pub fn notify(self: *ObserverRegistry, resource_id: u16, response: handler.Respo
     if (resource_id >= self.resources.len or !self.resources[resource_id].active) return;
     // observer_count check is racy but harmless — worst case we encode
     // a notification that gets sent to zero observers.
-    if (self.resources[resource_id].observer_count == 0) return;
+    if (self.resources[resource_id].observer_count.load(.monotonic) == 0) return;
 
     // Claim a queue slot atomically.
     const pos = self.notify_head.fetchAdd(1, .acq_rel);
@@ -339,10 +340,10 @@ test "add and remove observer" {
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
 
     try testing.expect(reg.addObserver(rid, addr, &.{ 0xAA, 0xBB }));
-    try testing.expectEqual(@as(u16, 1), reg.resources[rid].observer_count);
+    try testing.expectEqual(@as(u16, 1), reg.resources[rid].observer_count.load(.acquire));
 
     reg.removeObserver(rid, addr, &.{ 0xAA, 0xBB });
-    try testing.expectEqual(@as(u16, 0), reg.resources[rid].observer_count);
+    try testing.expectEqual(@as(u16, 0), reg.resources[rid].observer_count.load(.acquire));
 }
 
 test "duplicate observer is idempotent" {
@@ -357,7 +358,7 @@ test "duplicate observer is idempotent" {
 
     try testing.expect(reg.addObserver(rid, addr, &.{0xAA}));
     try testing.expect(reg.addObserver(rid, addr, &.{0xAA})); // duplicate
-    try testing.expectEqual(@as(u16, 1), reg.resources[rid].observer_count);
+    try testing.expectEqual(@as(u16, 1), reg.resources[rid].observer_count.load(.acquire));
 }
 
 test "removeByPeer removes all observers for that peer" {
@@ -378,9 +379,9 @@ test "removeByPeer removes all observers for that peer" {
 
     reg.removeByPeer(addr1);
     // r0: addr1/0x01 removed, addr2/0x03 kept → count=1
-    try testing.expectEqual(@as(u16, 1), reg.resources[r0].observer_count);
+    try testing.expectEqual(@as(u16, 1), reg.resources[r0].observer_count.load(.acquire));
     // r1: addr1/0x02 removed → count=0
-    try testing.expectEqual(@as(u16, 0), reg.resources[r1].observer_count);
+    try testing.expectEqual(@as(u16, 0), reg.resources[r1].observer_count.load(.acquire));
 }
 
 test "notify enqueues and drain processes" {
