@@ -1028,6 +1028,8 @@ fn handle_recv(
                 if (bv.num > 0) {
                     if (bt.findByToken(packet.token, recv.peer_address, &.{})) |bt_idx| {
                         const block = bt.serveBlock2(bt_idx, bv.num, bv.szx);
+                        // Read payload_length before release (#45).
+                        const total_payload_len = bt.slots[bt_idx].payload_length;
                         if (!block.more) bt.release(bt_idx);
                         var b2_buf: [3]u8 = undefined;
                         const b2_opt = (coapz.BlockValue{
@@ -1036,7 +1038,7 @@ fn handle_recv(
                             .szx = bv.szx,
                         }).option(.block2, &b2_buf);
                         var sz2_buf: [4]u8 = undefined;
-                        const sz2_opt = coapz.Option.uint(.size2, bt.slots[bt_idx].payload_length, &sz2_buf);
+                        const sz2_opt = coapz.Option.uint(.size2, total_payload_len, &sz2_buf);
                         const opts = arena.dupe(coapz.Option, &.{ b2_opt, sz2_opt }) catch return;
                         const resp = handler.Response{
                             .code = .content,
@@ -1865,7 +1867,8 @@ fn drainNotifications(server: *Server) void {
     const drained = reg.drainNotifyQueue(&entries);
 
     for (drained) |entry| {
-        const notify_buf = reg.notifyBuf(entry.resource_id & reg.notify_mask);
+        if (entry.response_len == 0) continue; // encoding failed
+        const notify_buf = reg.notifyBuf(entry.queue_slot);
         const template = notify_buf[0..entry.response_len];
         const obs_list = reg.getObservers(entry.resource_id);
 

@@ -396,6 +396,40 @@ test "block2: out of range block number" {
     try testing.expect(!b.more);
 }
 
+test "block2: payload_length readable after release for Size2" {
+    // Regression test for #45: Server reads payload_length after release
+    // for the Size2 option on the final block. If release zeros the field
+    // (or a new allocate reuses the slot), Size2 would be wrong.
+    var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 1, .max_payload = 4096 });
+    defer pool.deinit(testing.allocator);
+
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
+        return error.PoolExhausted;
+
+    const payload = [_]u8{0x42} ** 500;
+    pool.storeBlock2Payload(idx, &payload);
+
+    // Serve last block (only block for 500 bytes at SZX=6=1024).
+    const b0 = pool.serveBlock2(idx, 0, 6);
+    try testing.expect(!b0.more);
+
+    // Read payload_length BEFORE release — this is what the fix should do.
+    const total_before = pool.slots[idx].payload_length;
+    try testing.expectEqual(@as(u32, 500), total_before);
+
+    // Release the slot.
+    pool.release(idx);
+
+    // Allocate a new transfer in the same slot.
+    const idx2 = pool.allocate(&.{0xBB}, addr, .block1_receiving, 6, 0, &.{}) orelse
+        return error.PoolExhausted;
+    try testing.expectEqual(idx, idx2); // reuses same slot
+
+    // After reallocation, payload_length is 0 — reading it now gives wrong Size2.
+    try testing.expectEqual(@as(u32, 0), pool.slots[idx].payload_length);
+}
+
 test "evictExpired" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 256 });
     defer pool.deinit(testing.allocator);
