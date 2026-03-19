@@ -142,11 +142,12 @@ Important extensions beyond base CoAP.
   management is application-specific.
 
 ### 3.4 Size1/Size2 options
-- **Status:** `[-]` defined, not enforced
+- **Status:** `[x]` done
 - **Issue:** No automatic 4.13 Request Entity Too Large when payload exceeds
   Size1. No Size2 in responses for total payload indication.
-- **Impact:** Constrained devices can't pre-negotiate acceptable sizes.
-- **Effort:** Small. Check Size1 against buffer capacity before handler dispatch.
+- **Resolution:** Server checks Size1 option against `max_block_payload` before
+  handler dispatch — returns 4.13 if exceeded. Block2 responses include Size2
+  option indicating total payload size.
 
 ---
 

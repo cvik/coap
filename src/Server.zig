@@ -1035,7 +1035,9 @@ fn handle_recv(
                             .more = block.more,
                             .szx = bv.szx,
                         }).option(.block2, &b2_buf);
-                        const opts = arena.dupe(coapz.Option, &.{b2_opt}) catch return;
+                        var sz2_buf: [4]u8 = undefined;
+                        const sz2_opt = coapz.Option.uint(.size2, bt.slots[bt_idx].payload_length, &sz2_buf);
+                        const opts = arena.dupe(coapz.Option, &.{ b2_opt, sz2_opt }) catch return;
                         const resp = handler.Response{
                             .code = .content,
                             .options = opts,
@@ -1045,6 +1047,21 @@ fn handle_recv(
                         return;
                     }
                 }
+            }
+        }
+    }
+
+    // Size1 check: reject requests that declare a body larger than max_block_payload.
+    if (packet.find_option(.size1)) |size1_opt| {
+        if (size1_opt.as_uint()) |declared_size| {
+            const max = if (server.block_transfers != null)
+                server.config.max_block_payload
+            else
+                server.config.buffer_size;
+            if (declared_size > max) {
+                const resp = handler.Response.withCode(.request_entity_too_large);
+                server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
+                return;
             }
         }
     }
@@ -1115,7 +1132,9 @@ fn handle_recv(
                         .more = block.more,
                         .szx = default_szx,
                     }).option(.block2, &b2_buf);
-                    const opts = arena.dupe(coapz.Option, &.{b2_opt}) catch break :blk response_raw;
+                    var sz2_buf: [4]u8 = undefined;
+                    const sz2_opt = coapz.Option.uint(.size2, @intCast(response_raw.payload.len), &sz2_buf);
+                    const opts = arena.dupe(coapz.Option, &.{ b2_opt, sz2_opt }) catch break :blk response_raw;
                     break :blk handler.Response{
                         .code = response_raw.code,
                         .options = opts,
