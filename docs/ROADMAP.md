@@ -255,7 +255,7 @@ Any work on the above must preserve these properties:
 
 ## Suggested Implementation Order
 
-Tier 1 and Tier 2 complete. Remaining sequence:
+Tiers 1–3 complete. Remaining sequence:
 
 1. ~~**1.1** Critical option rejection~~ ✓
 2. ~~**1.5** Option order validation~~ ✓
@@ -266,10 +266,11 @@ Tier 1 and Tier 2 complete. Remaining sequence:
 7. ~~**2.2** Server Block2~~ ✓
 8. ~~**2.3** Server Block1~~ ✓
 9. ~~**2.1** Server Observe~~ ✓
-10. **3.4** Size1/Size2 — small, server pre-check
-11. **3.1** Request-Tag — completes Block1 correctness
-12. **3.2** Echo option — completes security posture
-13. **4.2** Server DTLS retransmit — completes DTLS compliance
-14. **4.1** DTLS session resumption — performance for reconnects
-15. **4.3** Additional cipher suites — interop
-16. **4.4** CoAP over TCP — new transport
+10. ~~**3.4** Size1/Size2~~ ✓
+11. ~~**3.1** Request-Tag~~ ✓
+12. ~~**3.2** Echo option~~ ✓
+13. ~~**3.3** Conditional requests~~ ✓
+14. **4.2** Server DTLS retransmit — completes DTLS compliance
+15. **4.1** DTLS session resumption — performance for reconnects
+16. **4.3** Additional cipher suites — interop
+17. **4.4** CoAP over TCP — new transport

@@ -8,6 +8,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 - Separate (delayed) responses with `Request.deferResponse()` (RFC 7252 §5.2.2)
 - Server-side Observe with thread-safe `server.notify()` push API (RFC 7641)
 - Transparent Block1 upload reassembly and Block2 large response fragmentation (RFC 7959)
+- Request-Tag, Echo option, conditional requests, Size1/Size2 (RFC 9175, RFC 7252)
 - Multi-threaded via SO_REUSEPORT (no shared state between threads)
 - IPv4 and IPv6 with dual-stack support
 - Per-IP rate limiting with token bucket and three-level load shedding
