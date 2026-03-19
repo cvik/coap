@@ -76,6 +76,11 @@ pub const DeferredResponse = struct {
     }
 };
 
+pub const QueueEntry = struct {
+    idx: u16,
+    seq: std.atomic.Value(u32),
+};
+
 // ── Pool state ──
 
 slots: []Slot,
@@ -84,12 +89,11 @@ config: Config,
 count_active: u16,
 free_head: u16,
 
-// MPSC ring buffer: producers (handler threads) write slot indices,
-// consumer (server tick) reads them.
-queue: []u16,
-queue_head: std.atomic.Value(u16), // producer (atomic)
-queue_tail: u16, // consumer (single-threaded tick)
-queue_mask: u16,
+// MPSC ring buffer (#46).
+queue: []QueueEntry,
+queue_head: std.atomic.Value(u32), // producer claims slot (atomic)
+queue_tail: u32, // consumer reads (single-threaded tick)
+queue_mask: u32,
 
 const empty_sentinel: u16 = 0xFFFF;
 
@@ -108,9 +112,11 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Deferred {
         while (size < config.max_deferred) size <<= 1;
         break :blk size;
     };
-    const queue = try allocator.alloc(u16, queue_size);
+    const queue = try allocator.alloc(QueueEntry, queue_size);
     errdefer allocator.free(queue);
-    @memset(queue, empty_sentinel);
+    for (queue, 0..) |*entry, i| {
+        entry.* = .{ .idx = 0, .seq = std.atomic.Value(u32).init(@intCast(i)) };
+    }
 
     for (slots, 0..) |*slot, i| {
         slot.* = .{
@@ -137,9 +143,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Deferred {
         .count_active = 0,
         .free_head = 0,
         .queue = queue,
-        .queue_head = std.atomic.Value(u16).init(0),
+        .queue_head = std.atomic.Value(u32).init(0),
         .queue_tail = 0,
-        .queue_mask = queue_size - 1,
+        .queue_mask = @as(u32, queue_size) - 1,
     };
 }
 
@@ -201,19 +207,31 @@ pub fn responseBuf(self: *Deferred, idx: u16) []u8 {
 
 /// Enqueue a slot index for the tick loop to process.
 /// Called from handler threads — must be thread-safe.
+/// Uses Vyukov-style sequenced MPSC: claim slot via fetchAdd, write data,
+/// then publish by storing the expected sequence number (#46).
 fn enqueue(self: *Deferred, idx: u16) void {
+    const pos = self.queue_head.fetchAdd(1, .acq_rel);
+    const entry = &self.queue[pos & self.queue_mask];
+    // Spin until the slot is available (consumer has advanced past it).
+    while (entry.seq.load(.acquire) != pos) {
+        std.atomic.spinLoopHint();
+    }
+    entry.idx = idx;
     self.slots[idx].state.store(.ready, .release);
-    const head = self.queue_head.fetchAdd(1, .acq_rel);
-    self.queue[head & self.queue_mask] = idx;
+    entry.seq.store(pos +% 1, .release); // publish
 }
 
 /// Drain all queued slot indices. Called from the server tick loop only.
 /// Returns a slice into `out_buf` with the drained indices.
 pub fn drainQueue(self: *Deferred, out_buf: []u16) []const u16 {
-    const head = self.queue_head.load(.acquire);
     var count: u16 = 0;
-    while (self.queue_tail != head and count < out_buf.len) {
-        out_buf[count] = self.queue[self.queue_tail & self.queue_mask];
+    while (count < out_buf.len) {
+        const entry = &self.queue[self.queue_tail & self.queue_mask];
+        const expected_seq = self.queue_tail +% 1;
+        if (entry.seq.load(.acquire) != expected_seq) break; // not published yet
+        out_buf[count] = entry.idx;
+        // Advance the slot sequence so producers can reuse it.
+        entry.seq.store(self.queue_tail +% @as(u32, @intCast(self.queue.len)), .release);
         self.queue_tail +%= 1;
         count += 1;
     }

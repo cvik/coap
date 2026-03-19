@@ -38,6 +38,12 @@ pub const Resource = struct {
 pub const NotifyEntry = struct {
     resource_id: u16,
     response_len: u16,
+    queue_slot: u16,
+};
+
+const QueueSlot = struct {
+    entry: NotifyEntry,
+    seq: std.atomic.Value(u32),
 };
 
 // ── Registry state ──
@@ -48,12 +54,12 @@ resource_count: u16,
 config: Config,
 observers_per_resource: u16,
 
-// MPSC notification queue.
-notify_queue: []NotifyEntry,
+// MPSC notification queue with per-slot sequencing (#46).
+notify_queue: []QueueSlot,
 notify_buffer: []u8,
-notify_head: std.atomic.Value(u16),
-notify_tail: u16,
-notify_mask: u16,
+notify_head: std.atomic.Value(u32),
+notify_tail: u32,
+notify_mask: u32,
 
 pub fn init(allocator: std.mem.Allocator, config: Config) !ObserverRegistry {
     if (config.max_resources == 0 or config.max_observers == 0) return error.InvalidConfig;
@@ -78,9 +84,14 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !ObserverRegistry {
         while (size < config.queue_depth) size <<= 1;
         break :blk size;
     };
-    const notify_queue = try allocator.alloc(NotifyEntry, queue_size);
+    const notify_queue = try allocator.alloc(QueueSlot, queue_size);
     errdefer allocator.free(notify_queue);
-    @memset(notify_queue, .{ .resource_id = 0, .response_len = 0 });
+    for (notify_queue, 0..) |*slot, i| {
+        slot.* = .{
+            .entry = .{ .resource_id = 0, .response_len = 0, .queue_slot = 0 },
+            .seq = std.atomic.Value(u32).init(@intCast(i)),
+        };
+    }
 
     const notify_buffer = try allocator.alloc(u8, @as(usize, queue_size) * config.buffer_size);
     errdefer allocator.free(notify_buffer);
@@ -93,9 +104,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !ObserverRegistry {
         .observers_per_resource = config.max_observers / config.max_resources,
         .notify_queue = notify_queue,
         .notify_buffer = notify_buffer,
-        .notify_head = std.atomic.Value(u16).init(0),
+        .notify_head = std.atomic.Value(u32).init(0),
         .notify_tail = 0,
-        .notify_mask = queue_size - 1,
+        .notify_mask = @as(u32, queue_size) - 1,
     };
 }
 
@@ -196,25 +207,33 @@ pub fn getObservers(self: *const ObserverRegistry, resource_id: u16) []const Obs
 /// Push a notification to the queue. Thread-safe.
 /// Encodes the response as a NON CoAP packet with Observe option for each
 /// observer. The tick loop sends them.
+/// Push a notification to the queue. Thread-safe.
+/// Uses Vyukov-style sequenced MPSC (#46). Also fixes #47 by tracking
+/// the queue slot index in the entry.
 pub fn notify(self: *ObserverRegistry, resource_id: u16, response: handler.Response) void {
     if (resource_id >= self.resources.len or !self.resources[resource_id].active) return;
+    // observer_count check is racy but harmless — worst case we encode
+    // a notification that gets sent to zero observers.
     if (self.resources[resource_id].observer_count == 0) return;
+
+    // Claim a queue slot atomically.
+    const pos = self.notify_head.fetchAdd(1, .acq_rel);
+    const slot_idx: u16 = @intCast(pos & self.notify_mask);
+    const qs = &self.notify_queue[slot_idx];
+
+    // Spin until the slot is available (consumer has advanced past it).
+    while (qs.seq.load(.acquire) != pos) {
+        std.atomic.spinLoopHint();
+    }
 
     // Increment sequence number (atomic — notify may be called from any thread).
     const seq = self.resources[resource_id].seq.fetchAdd(1, .monotonic) +% 1;
 
-    // Encode a template notification (NON, with Observe option).
-    // Token is placeholder — tick loop patches it per observer.
-    const head = self.notify_head.load(.acquire);
-    const slot = head & self.notify_mask;
-    const buf = self.notifyBuf(slot);
+    const buf = self.notifyBuf(slot_idx);
 
     var obs_buf: [4]u8 = undefined;
     const obs_opt = coapz.Option.uint(.observe, seq, &obs_buf);
 
-    // Merge observe option with response options.
-    // For simplicity, encode with just the observe option + response options.
-    // We build the options array on the stack.
     var opts_buf: [16]coapz.Option = undefined;
     opts_buf[0] = obs_opt;
     const resp_opts = @min(response.options.len, opts_buf.len - 1);
@@ -225,30 +244,34 @@ pub fn notify(self: *ObserverRegistry, resource_id: u16, response: handler.Respo
     const pkt = coapz.Packet{
         .kind = .non_confirmable,
         .code = response.code,
-        .msg_id = 0, // tick loop assigns per-send
-        .token = &.{0}, // tick loop patches per observer
+        .msg_id = 0,
+        .token = &.{0},
         .options = opts_buf[0 .. 1 + resp_opts],
         .payload = response.payload,
         .data_buf = &.{},
     };
 
     if (pkt.writeBuf(buf)) |written| {
-        const entry = NotifyEntry{
+        qs.entry = .{
             .resource_id = resource_id,
             .response_len = @intCast(written.len),
+            .queue_slot = slot_idx,
         };
-        self.notify_queue[slot] = entry;
-        _ = self.notify_head.fetchAdd(1, .release);
-    } else |_| {}
+    } else |_| {
+        qs.entry = .{ .resource_id = resource_id, .response_len = 0, .queue_slot = slot_idx };
+    }
+    qs.seq.store(pos +% 1, .release); // publish
 }
 
 /// Drain the notification queue. Called from tick loop only.
 pub fn drainNotifyQueue(self: *ObserverRegistry, out: []NotifyEntry) []const NotifyEntry {
-    const head = self.notify_head.load(.acquire);
     var count: u16 = 0;
-    while (self.notify_tail != head and count < out.len) {
-        const slot = self.notify_tail & self.notify_mask;
-        out[count] = self.notify_queue[slot];
+    while (count < out.len) {
+        const qs = &self.notify_queue[self.notify_tail & self.notify_mask];
+        const expected_seq = self.notify_tail +% 1;
+        if (qs.seq.load(.acquire) != expected_seq) break;
+        out[count] = qs.entry;
+        qs.seq.store(self.notify_tail +% @as(u32, @intCast(self.notify_queue.len)), .release);
         self.notify_tail +%= 1;
         count += 1;
     }

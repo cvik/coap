@@ -1867,7 +1867,8 @@ fn drainNotifications(server: *Server) void {
     const drained = reg.drainNotifyQueue(&entries);
 
     for (drained) |entry| {
-        const notify_buf = reg.notifyBuf(entry.resource_id & reg.notify_mask);
+        if (entry.response_len == 0) continue; // encoding failed
+        const notify_buf = reg.notifyBuf(entry.queue_slot);
         const template = notify_buf[0..entry.response_len];
         const obs_list = reg.getObservers(entry.resource_id);
 
