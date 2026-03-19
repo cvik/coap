@@ -1234,6 +1234,8 @@ fn initTestSession(session: *Session.Session, addr: std.net.Address) void {
         .retransmit_deadline_ns = 0,
         .retransmit_count = 0,
         .retransmit_timeout_ms = 0,
+        .last_flight = .{0} ** 256,
+        .last_flight_len = 0,
         .master_secret = .{0} ** 48,
         .session_id = .{0} ** 32,
         .session_id_len = 0,

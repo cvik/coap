@@ -52,6 +52,9 @@ pub const Session = struct {
     retransmit_deadline_ns: i64,
     retransmit_count: u8,
     retransmit_timeout_ms: u32,
+    /// Cached last flight bytes for server-side retransmission (RFC 6347 §4.2.4).
+    last_flight: [256]u8,
+    last_flight_len: u16,
 
     // Resumption-ready (unused in v1)
     master_secret: [48]u8,
@@ -70,6 +73,7 @@ pub const Session = struct {
         std.crypto.secureZero(u8, &self.client_write_iv);
         std.crypto.secureZero(u8, &self.server_write_iv);
         std.crypto.secureZero(u8, &self.master_secret);
+        std.crypto.secureZero(u8, &self.last_flight);
         std.crypto.secureZero(u8, &self.client_random);
         std.crypto.secureZero(u8, &self.server_random);
     }
@@ -200,6 +204,8 @@ pub const SessionTable = struct {
             .retransmit_deadline_ns = 0,
             .retransmit_count = 0,
             .retransmit_timeout_ms = 0,
+            .last_flight = .{0} ** 256,
+            .last_flight_len = 0,
             .master_secret = .{0} ** 48,
             .session_id = .{0} ** 32,
             .session_id_len = 0,
