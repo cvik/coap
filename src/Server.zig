@@ -1026,7 +1026,7 @@ fn handle_recv(
         if (packet.find_option(.block2)) |opt| {
             if (opt.as_block()) |bv| {
                 if (bv.num > 0) {
-                    if (bt.findByToken(packet.token, recv.peer_address)) |bt_idx| {
+                    if (bt.findByToken(packet.token, recv.peer_address, &.{})) |bt_idx| {
                         const block = bt.serveBlock2(bt_idx, bv.num, bv.szx);
                         if (!block.more) bt.release(bt_idx);
                         var b2_buf: [3]u8 = undefined;
@@ -1106,7 +1106,7 @@ fn handle_recv(
             const default_szx: u3 = 6; // 1024 bytes
             const block_size: u32 = @as(u32, 1) << (@as(u5, default_szx) + 4);
             if (response_raw.payload.len > block_size) {
-                if (bt.allocate(packet.token, recv.peer_address, .block2_serving, default_szx, server.tick_now_ns)) |bt_idx| {
+                if (bt.allocate(packet.token, recv.peer_address, .block2_serving, default_szx, server.tick_now_ns, &.{})) |bt_idx| {
                     bt.storeBlock2Payload(bt_idx, response_raw.payload);
                     const block = bt.serveBlock2(bt_idx, 0, default_szx);
                     var b2_buf: [3]u8 = undefined;
@@ -1735,9 +1735,14 @@ fn handleBlock1(
     peer: std.net.Address,
     arena: std.mem.Allocator,
 ) ?handler.Response {
+    // Extract Request-Tag (RFC 9175 §3) for Block1 disambiguation.
+    // Request-Tag option number 292 (RFC 9175).
+    const request_tag_kind: coapz.OptionKind = @enumFromInt(292);
+    const request_tag: []const u8 = if (packet.find_option(request_tag_kind)) |rt| rt.value else &.{};
+
     if (bv.num == 0) {
         // First block — allocate transfer slot.
-        const idx = bt.allocate(packet.token, peer, .block1_receiving, bv.szx, server.tick_now_ns) orelse {
+        const idx = bt.allocate(packet.token, peer, .block1_receiving, bv.szx, server.tick_now_ns, request_tag) orelse {
             return handler.Response.withCode(.request_entity_too_large);
         };
         const result = bt.appendBlock1(idx, 0, bv.more, packet.payload);
@@ -1755,8 +1760,8 @@ fn handleBlock1(
         };
     }
 
-    // Subsequent block — find existing transfer.
-    const idx = bt.findByToken(packet.token, peer) orelse {
+    // Subsequent block — find existing transfer by token + peer + request-tag.
+    const idx = bt.findByToken(packet.token, peer, request_tag) orelse {
         return handler.Response.withCode(.request_entity_incomplete);
     };
     const result = bt.appendBlock1(idx, bv.num, bv.more, packet.payload);
