@@ -134,12 +134,12 @@ Important extensions beyond base CoAP.
   freshness verification — server infrastructure, application policy.
 
 ### 3.3 Conditional requests (§5.10.1-2)
-- **Status:** `[-]` options parseable, no server enforcement
+- **Status:** `[x]` done
 - **Issue:** If-Match and If-None-Match are defined in coapz but server never
   validates preconditions. No automatic 4.12 Precondition Failed.
-- **Impact:** Handlers must implement conditional logic manually.
-- **Effort:** Small for server-side pre-check. Requires ETag tracking which is
-  application-specific, so likely remains handler-assisted.
+- **Resolution:** `Request.ifMatch()`, `Request.ifNoneMatch()`, `Request.etags()`
+  accessors. `Response.preconditionFailed()` helper. Handler-driven — ETag
+  management is application-specific.
 
 ### 3.4 Size1/Size2 options
 - **Status:** `[-]` defined, not enforced
