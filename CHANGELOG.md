@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1] - 2026-03-19
+- Request-Tag (RFC 9175 §3) for Block1 upload disambiguation
+- Echo option (RFC 9175 §2) request/response helpers for freshness verification
+- Conditional request accessors: `ifMatch()`, `ifNoneMatch()`, `etags()`, `preconditionFailed()`
+- Size1 rejection (4.13 Request Entity Too Large) and Size2 in Block2 responses
+- **Tier 3 protocol extensions now fully complete** (3.1-3.4)
+
 ## [0.6.0] - 2026-03-18
 - Server-side Observe: `server.notify(rid, response)` thread-safe push API (RFC 7641)
 - `Request.observeResource(rid)` / `removeObserver(rid)` handler methods
