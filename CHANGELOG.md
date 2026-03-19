@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.2] - 2026-03-19
+- Fix: Block2 use-after-free — Size2 on last block read after slot release (#45)
+- Fix: MPSC ring race condition — sequenced Vyukov-style ring in deferred and observe (#46, #47, #57)
+- Fix: wrong buffer index in drainNotifications (#47)
+- Fix: `debug.assert` replaced with `@panic` for precondition checks in release builds (#48)
+- Fix: CTR counter wrapping consistency in AES-CCM scalar path (#49)
+- Fix: `observer_count` made atomic for thread safety (#50)
+- Fix: retransmit backoff bound uses `max_retransmit` (#51)
+
 ## [0.6.1] - 2026-03-19
 - Request-Tag (RFC 9175 §3) for Block1 upload disambiguation
 - Echo option (RFC 9175 §2) request/response helpers for freshness verification
