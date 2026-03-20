@@ -177,15 +177,19 @@ fn(coap.Request) ?coap.Response
 
 The request provides convenience accessors and the underlying packet:
 
-- `method()` — request method (`.get`, `.post`, `.put`, `.delete`, …).
-- `payload()` — request payload bytes.
-- `pathSegments()` — iterator over URI-Path option segments.
-- `querySegments()` — iterator over URI-Query option values.
-- `findOptions(kind)` / `findOption(kind)` — option lookup by kind.
-- `packet` — the full parsed CoAP packet (`coap.coap.Packet`) for advanced use.
-- `peer_address` — source address of the client (`std.net.Address`).
-- `arena` — per-request arena allocator. Resets after the handler returns.
-  Use it for any allocations needed during response construction.
+- `method()` — request method (`.get`, `.post`, `.put`, `.delete`, …)
+- `payload()` — request payload bytes
+- `param("name")` — route parameter captured by the router (e.g. `:id`)
+- `pathSegments()` — iterator over URI-Path option segments
+- `querySegments()` — iterator over URI-Query option values
+- `findOptions(kind)` / `findOption(kind)` — option lookup by kind
+- `ifMatch()` / `ifNoneMatch()` / `etags()` — conditional request accessors
+- `echoOption()` — reflected Echo value for freshness verification
+- `deferResponse()` — defer the response for async handling (separate response)
+- `observeResource(rid)` / `removeObserver(rid)` — observe registration
+- `packet` — the full parsed CoAP packet for advanced use
+- `peer_address` — source address of the client (`std.net.Address`)
+- `arena` — per-request arena allocator (resets after handler returns)
 
 ### Response
 
@@ -205,7 +209,9 @@ Response.methodNotAllowed()                  // 4.05 Method Not Allowed
 Response.unauthorized()                      // 4.01 Unauthorized
 Response.forbidden()                         // 4.03 Forbidden
 Response.badOption()                         // 4.02 Bad Option
+Response.preconditionFailed()                // 4.12 Precondition Failed
 Response.withCode(.gateway_timeout)          // arbitrary code
+Response.withEcho(arena)                     // add Echo option for freshness
 ```
 
 Or construct directly:
