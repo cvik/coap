@@ -43,6 +43,15 @@ pub const Request = struct {
     defer_ctx: ?DeferContext = null,
     /// Observe context. Non-null when the server has an observer registry.
     observe_ctx: ?ObserveContext = null,
+    /// Route parameters captured by the router (e.g. `:id` segments).
+    route_params: [max_route_params]RouteParam = [_]RouteParam{.{}} ** max_route_params,
+    route_param_count: u8 = 0,
+
+    pub const max_route_params = 4;
+    pub const RouteParam = struct {
+        name: []const u8 = "",
+        value: []const u8 = "",
+    };
 
     /// Context for `defer()`. Provided by the server; not user-constructible.
     pub const DeferContext = struct {
@@ -95,6 +104,23 @@ pub const Request = struct {
     pub fn removeObserver(self: Request, resource_id: u16) void {
         const ctx = self.observe_ctx orelse return;
         ctx.registry.removeObserver(resource_id, ctx.peer_address, ctx.token);
+    }
+
+    /// Look up a named route parameter captured by the router.
+    /// Returns `null` if the parameter was not captured.
+    ///
+    /// ```zig
+    /// // Route: .{ .get, "/sensor/:id", handler }
+    /// fn handler(req: coap.Request) ?coap.Response {
+    ///     const id = req.param("id") orelse return coap.Response.badRequest();
+    ///     // id is a []const u8 pointing into the request's URI-Path option data
+    /// }
+    /// ```
+    pub fn param(self: Request, name: []const u8) ?[]const u8 {
+        for (self.route_params[0..self.route_param_count]) |p| {
+            if (std.mem.eql(u8, p.name, name)) return p.value;
+        }
+        return null;
     }
 
     /// Return the Echo option value from this request, if present (RFC 9175 §2).

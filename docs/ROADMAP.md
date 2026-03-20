@@ -241,14 +241,14 @@ Important extensions beyond base CoAP.
 ## Tier 6 — Ergonomics
 
 ### 6.1 Router
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** All requests go to a single handler function. The handler must
   manually match on method + path segments. This is tedious and error-prone
   for servers with multiple resources.
-- **Impact:** Every non-trivial server needs hand-rolled routing boilerplate.
-- **Effort:** Medium. Comptime route table from declarative resource definitions.
-  Must resolve to a direct function call — no dynamic dispatch or allocation
-  in the hot path.
+- **Resolution:** `coap.Router(.{ .{ .get, "/path", handler }, ... })` generates
+  a comptime route table. No heap allocation, no dynamic dispatch. Supports
+  method + exact path matching, multi-segment paths, and custom fallback via
+  `handlerWithFallback()`.
 
 ### 6.2 Request builder helpers
 - **Status:** `[x]` done

@@ -49,6 +49,45 @@ fn echo(request: coap.Request) ?coap.Response {
 }
 ```
 
+### Server with Router
+
+```zig
+const coap = @import("coap");
+
+const router = coap.Router(.{
+    .{ .get,  "/temperature",    getTemp },
+    .{ .put,  "/temperature",    setTemp },
+    .{ .get,  "/sensor/:id",     getSensor },
+    .{ .post, "/led",            toggleLed },
+});
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var server = try coap.Server.init(gpa.allocator(), .{}, router.handler());
+    defer server.deinit();
+    try server.run();
+}
+
+fn getTemp(_: coap.Request) ?coap.Response {
+    return coap.Response.ok("22.5");
+}
+
+fn setTemp(req: coap.Request) ?coap.Response {
+    _ = req.payload(); // new temperature value
+    return coap.Response.changed();
+}
+
+fn getSensor(req: coap.Request) ?coap.Response {
+    const id = req.param("id") orelse return coap.Response.badRequest();
+    _ = id; // look up sensor by id
+    return coap.Response.ok("sensor data");
+}
+
+fn toggleLed(_: coap.Request) ?coap.Response {
+    return coap.Response.changed();
+}
+```
+
 ### Client
 
 ```zig
