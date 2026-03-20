@@ -165,12 +165,12 @@ Important extensions beyond base CoAP.
   - Session cache with TTL eviction
 
 ### 4.2 Server-side DTLS flight retransmission
-- **Status:** `[-]` TODO at Server.zig:677
+- **Status:** `[x]` done
 - **Issue:** Server relies on client to drive retransmission during handshake.
   Violates RFC 6347 §4.2.4 which requires both sides to retransmit.
-- **Impact:** Handshakes may fail when server→client packet is lost.
-- **Effort:** Small-medium. Scan handshaking sessions in tick loop, retransmit
-  expired flights.
+- **Resolution:** Server caches last flight in 256-byte per-session buffer.
+  Tick loop scans handshaking sessions for expired retransmit deadlines.
+  Exponential backoff (1s → 60s, max 5 retries). Flight cleared on established.
 
 ### 4.3 Additional DTLS cipher suites
 - **Status:** `[ ]` single suite only

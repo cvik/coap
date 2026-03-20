@@ -784,10 +784,7 @@ pub fn tick(server: *Server) !void {
             log.debug("evicted {d} timed-out DTLS sessions", .{evicted_sessions});
         }
 
-        // TODO: scan handshaking sessions for expired retransmit deadlines and
-        // re-send the server's last flight. Currently the server relies on the
-        // client to retransmit, which is sufficient for most cases but not
-        // fully spec-compliant (RFC 6347 §4.2.4).
+        server.checkDtlsRetransmits();
     }
 
     // Drain deferred response queue and retransmit pending CONs.
@@ -1371,6 +1368,8 @@ fn process_dtls_record(
                     server.send_data(data, peer, index) catch |err| {
                         log.warn("DTLS handshake send failed: {}", .{err});
                     };
+                    // Cache flight for retransmission (RFC 6347 §4.2.4).
+                    cacheFlight(sess, data, server.tick_now_ns);
                 },
                 .established => {
                     tbl.promote(sess, server.tick_now_ns);
@@ -1454,9 +1453,13 @@ fn process_dtls_record(
                         server.send_data(data, peer, index) catch |err| {
                             log.warn("DTLS handshake send failed: {}", .{err});
                         };
+                        cacheFlight(sess, data, server.tick_now_ns);
                     },
                     .established => {
                         tbl.promote(sess, server.tick_now_ns);
+                        // Clear flight cache — handshake complete.
+                        sess.last_flight_len = 0;
+                        sess.retransmit_count = 0;
                         log.debug("DTLS session established: {any}", .{peer});
                     },
                     .failed => |desc| {
@@ -1857,6 +1860,48 @@ fn sendResponse(
 }
 
 /// Drain the observe notification queue and send NON notifications.
+/// Cache a DTLS handshake flight in the session for retransmission.
+fn cacheFlight(sess: *dtls.Session.Session, data: []const u8, now_ns: i64) void {
+    const len = @min(data.len, sess.last_flight.len);
+    @memcpy(sess.last_flight[0..len], data[0..len]);
+    sess.last_flight_len = @intCast(len);
+    sess.retransmit_count = 0;
+    sess.retransmit_timeout_ms = constants.dtls_retransmit_initial_ms;
+    sess.retransmit_deadline_ns = now_ns + @as(i64, constants.dtls_retransmit_initial_ms) * std.time.ns_per_ms;
+}
+
+/// Scan handshaking DTLS sessions for expired retransmit deadlines.
+fn checkDtlsRetransmits(server: *Server) void {
+    const tbl = server.dtls_sessions orelse return;
+    const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
+
+    for (tbl.slots) |*sess| {
+        if (sess.state != .handshaking) continue;
+        if (sess.last_flight_len == 0) continue;
+        if (server.tick_now_ns < sess.retransmit_deadline_ns) continue;
+
+        sess.retransmit_count += 1;
+        if (sess.retransmit_count > constants.dtls_max_retransmits) {
+            log.debug("DTLS handshake timeout for {any}", .{sess.addr});
+            sess.last_flight_len = 0;
+            tbl.release(sess);
+            continue;
+        }
+
+        // Retransmit cached flight.
+        const flight = sess.last_flight[0..sess.last_flight_len];
+        server.send_data(flight, sess.addr, @as(usize, sess.retransmit_count) % batch) catch continue;
+
+        // Exponential backoff.
+        sess.retransmit_timeout_ms = @min(
+            sess.retransmit_timeout_ms * 2,
+            constants.dtls_retransmit_max_ms,
+        );
+        sess.retransmit_deadline_ns = server.tick_now_ns +
+            @as(i64, sess.retransmit_timeout_ms) * std.time.ns_per_ms;
+    }
+}
+
 fn drainNotifications(server: *Server) void {
     const reg = &(server.observers orelse return);
     if (reg.notify_head.load(.acquire) == reg.notify_tail) return;
