@@ -1118,9 +1118,13 @@ fn print_scenario_tree(
                         const rps_str = fmtInt(&rps_buf, @as(u64, @intFromFloat(r.rps)));
                         const err_str = fmtInt(&err_buf, r.errors);
                         const err_color: []const u8 = if (r.errors > 0) R else D;
-                        std.debug.print("  " ++ G ++ "{s:>10}" ++ Z ++ "  {d:>8.1}  {d:>8.1}  {d:>8.1}  {s}{s:>6}" ++ Z ++ "", .{
-                            rps_str, r.p50_us, r.p99_us, r.p999_us, err_color, err_str,
-                        });
+                        std.debug.print("  " ++ G ++ "{s:>10}" ++ Z ++ "  ", .{rps_str});
+                        if (r.p50_us > 0) {
+                            std.debug.print("{d:>8.1}  {d:>8.1}  {d:>8.1}", .{ r.p50_us, r.p99_us, r.p999_us });
+                        } else {
+                            std.debug.print("{s:>8}  {s:>8}  {s:>8}", .{ "-", "-", "-" });
+                        }
+                        std.debug.print("  {s}{s:>6}" ++ Z ++ "", .{ err_color, err_str });
                     }
                 }
                 std.debug.print("\n", .{});
