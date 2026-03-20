@@ -887,6 +887,14 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerC
         posix.dup2(devnull, 2) catch {};
         posix.close(devnull);
 
+        // Pin server threads to cores 0..N-1 for cache locality.
+        var affinity_buf: [256]u16 = undefined;
+        const affinity: ?[]const u16 = if (thread_count > 1) blk: {
+            const n = @min(thread_count, affinity_buf.len);
+            for (affinity_buf[0..n], 0..) |*a, i| a.* = @intCast(i);
+            break :blk affinity_buf[0..n];
+        } else null;
+
         if (counters) |ctx| {
             var server = coap.Server.initContext(
                 std.heap.page_allocator,
@@ -897,6 +905,7 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerC
                     .buffer_size = 1280,
                     .thread_count = thread_count,
                     .rate_limit_ip_count = 0,
+                    .cpu_affinity = affinity,
                     .psk = psk,
                 },
                 counting_handler,
@@ -913,6 +922,7 @@ fn fork_server(port: u16, thread_count: u16, psk: ?coap.Psk, counters: ?*ServerC
                     .buffer_size = 1280,
                     .thread_count = thread_count,
                     .rate_limit_ip_count = 0,
+                    .cpu_affinity = affinity,
                     .psk = psk,
                 },
                 echo_handler,
