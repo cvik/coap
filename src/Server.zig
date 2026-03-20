@@ -751,7 +751,7 @@ pub fn tick(server: *Server) !void {
     // Periodic exchange and block transfer eviction (~every 10 seconds).
     const eviction_interval_ns: i64 = 10 * std.time.ns_per_s;
     if (server.tick_now_ns - server.last_eviction_ns > eviction_interval_ns) {
-        const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+        const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
         if (evicted > 0) {
             log.debug("evicted {d} expired exchanges", .{evicted});
         }
@@ -857,9 +857,9 @@ fn handle_recv(
         // Always serve cached CON retransmits.
         if (recv.payload.len >= 4) {
             const msg_id = std.mem.readInt(u16, raw_header[2..4], .big);
-            const key = Exchange.peer_key(recv.peer_address, msg_id);
+            const key = Exchange.peerKey(recv.peer_address, msg_id);
             if (server.exchanges.find(key)) |slot_idx| {
-                const cached = server.exchanges.cached_response(slot_idx);
+                const cached = server.exchanges.cachedResponse(slot_idx);
                 release_buffer_robust(&server.io, recv.buffer_id);
                 server.buffers_outstanding -|= 1;
                 server.send_data(cached, recv.peer_address, index) catch {};
@@ -909,7 +909,7 @@ fn handle_recv(
 
     // RST cancels the matching exchange.
     if (packet.kind == .reset) {
-        const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
+        const key = Exchange.peerKey(recv.peer_address, packet.msg_id);
         if (server.exchanges.find(key)) |slot_idx| {
             server.exchanges.remove(slot_idx);
         }
@@ -938,20 +938,20 @@ fn handle_recv(
 
     const is_con = packet.kind == .confirmable;
 
-    const addr_key = Exchange.addr_hash(recv.peer_address);
+    const addr_key = Exchange.addrHash(recv.peer_address);
 
     // CON duplicate detection.
     if (is_con) {
-        const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
+        const key = Exchange.peerKey(recv.peer_address, packet.msg_id);
         if (server.exchanges.find(key)) |slot_idx| {
             // Duplicate CON — retransmit cached response.
-            const cached = server.exchanges.cached_response(slot_idx);
+            const cached = server.exchanges.cachedResponse(slot_idx);
             try server.send_data(cached, recv.peer_address, index);
             return;
         }
         // New request from this peer — they received all prior responses,
         // so evict stale exchanges for this address.
-        _ = server.exchanges.evict_peer(addr_key);
+        _ = server.exchanges.evictPeer(addr_key);
     }
 
     // Critical option rejection (RFC 7252 §5.4.1).
@@ -977,9 +977,9 @@ fn handle_recv(
         };
 
         if (is_con) {
-            const key = Exchange.peer_key(recv.peer_address, packet.msg_id);
+            const key = Exchange.peerKey(recv.peer_address, packet.msg_id);
             if (server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns) == null) {
-                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
                 if (evicted > 0) {
                     server.last_eviction_ns = server.tick_now_ns;
                     _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
@@ -1172,7 +1172,7 @@ fn handle_recv(
 
         // Cache the response for CON dedup.
         if (is_con) {
-            const key = Exchange.peer_key(
+            const key = Exchange.peerKey(
                 recv.peer_address,
                 packet.msg_id,
             );
@@ -1184,7 +1184,7 @@ fn handle_recv(
                 server.tick_now_ns,
             ) == null) {
                 // Try evicting expired entries before giving up.
-                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
                 if (evicted > 0) {
                     server.last_eviction_ns = server.tick_now_ns;
                     _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
@@ -1216,7 +1216,7 @@ fn handle_recv(
         };
 
         // Cache the empty ACK too.
-        const key = Exchange.peer_key(
+        const key = Exchange.peerKey(
             recv.peer_address,
             packet.msg_id,
         );
@@ -1227,7 +1227,7 @@ fn handle_recv(
             data_wire,
             server.tick_now_ns,
         ) == null) {
-            const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+            const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
             if (evicted > 0) {
                 server.last_eviction_ns = server.tick_now_ns;
                 _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
@@ -1493,18 +1493,18 @@ fn process_dtls_coap(
     if (packet.kind == .reset) return;
 
     const is_con = packet.kind == .confirmable;
-    const addr_key = Exchange.addr_hash(peer);
+    const addr_key = Exchange.addrHash(peer);
 
     // CON duplicate detection.
     if (is_con) {
-        const key = Exchange.peer_key(peer, packet.msg_id);
+        const key = Exchange.peerKey(peer, packet.msg_id);
         if (server.exchanges.find(key)) |slot_idx| {
             // Duplicate CON — retransmit cached response (already encrypted).
-            const cached = server.exchanges.cached_response(slot_idx);
+            const cached = server.exchanges.cachedResponse(slot_idx);
             server.send_data(cached, peer, index) catch {};
             return;
         }
-        _ = server.exchanges.evict_peer(addr_key);
+        _ = server.exchanges.evictPeer(addr_key);
     }
 
     // Critical option rejection (RFC 7252 §5.4.1).
@@ -1525,9 +1525,9 @@ fn process_dtls_coap(
         };
 
         if (is_con) {
-            const key = Exchange.peer_key(peer, packet.msg_id);
+            const key = Exchange.peerKey(peer, packet.msg_id);
             if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
-                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
                 if (evicted > 0) {
                     server.last_eviction_ns = server.tick_now_ns;
                     _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
@@ -1612,9 +1612,9 @@ fn process_dtls_coap(
         };
 
         if (is_con) {
-            const key = Exchange.peer_key(peer, packet.msg_id);
+            const key = Exchange.peerKey(peer, packet.msg_id);
             if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
-                const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+                const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
                 if (evicted > 0) {
                     server.last_eviction_ns = server.tick_now_ns;
                     _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
@@ -1639,9 +1639,9 @@ fn process_dtls_coap(
             return;
         };
 
-        const key = Exchange.peer_key(peer, packet.msg_id);
+        const key = Exchange.peerKey(peer, packet.msg_id);
         if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
-            const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+            const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
             if (evicted > 0) {
                 server.last_eviction_ns = server.tick_now_ns;
                 _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
@@ -1810,7 +1810,8 @@ fn makeContinueResponse(bv: coapz.BlockValue, arena: std.mem.Allocator) ?handler
         .more = false, // server echoes with M=0 in 2.31
         .szx = bv.szx,
     }).option(.block1, &b1_buf);
-    const opts = arena.dupe(coapz.Option, &.{b1_opt}) catch return null;
+    const opts = arena.dupe(coapz.Option, &.{b1_opt}) catch
+        return .{ .code = .internal_server_error };
     return .{
         .code = .@"continue",
         .options = opts,
@@ -1849,9 +1850,9 @@ fn sendResponse(
     };
 
     if (is_con) {
-        const key = Exchange.peer_key(peer, packet.msg_id);
+        const key = Exchange.peerKey(peer, packet.msg_id);
         if (server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns) == null) {
-            const evicted = server.exchanges.evict_expired(server.tick_now_ns, server.exchange_lifetime_ms);
+            const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
             if (evicted > 0) {
                 _ = server.exchanges.insert(key, addr_key, packet.msg_id, data_wire, server.tick_now_ns);
             }
@@ -2018,6 +2019,8 @@ fn update_load_level(server: *Server) void {
 
 /// Get the response buffer slot for a given CQE index.
 fn response_buf(server: *Server, index: usize) []u8 {
+    const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
+    if (index >= batch) @panic("response_buf: index out of bounds");
     const offset_buf = index * server.config.buffer_size;
     return server.buffer_response[offset_buf..][0..server.config.buffer_size];
 }
@@ -2050,7 +2053,7 @@ fn send_data(
             data.len,
             server.config.buffer_size,
         });
-        return;
+        return error.BufferTooSmall;
     }
 
     // If data is not already in the response buffer, copy it in.

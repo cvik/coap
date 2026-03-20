@@ -357,7 +357,7 @@ fn addrHash(addr: std.net.Address) u64 {
     const bytes = switch (addr.any.family) {
         posix.AF.INET => std.mem.asBytes(&addr.in),
         posix.AF.INET6 => std.mem.asBytes(&addr.in6),
-        else => std.mem.asBytes(&addr.in),
+        else => std.mem.asBytes(&addr.any),
     };
     var hash: u64 = 0xcbf29ce484222325; // FNV-1a 64-bit offset basis
     for (bytes) |b| {
