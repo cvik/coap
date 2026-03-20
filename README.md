@@ -579,7 +579,7 @@ Note: the kernel distributes packets by 4-tuple hash (src/dst IP + port).
 A single client socket always hashes to one server thread. Throughput scales
 with the number of distinct client connections — multiple clients (different
 source ports) spread across all threads. Even on loopback, the bench shows
-~5M req/s at 32T vs ~800K at 1T because it uses one socket per client thread.
+multi-thread throughput scales linearly because it uses one socket per client thread.
 
 ### `max_arena_size`
 
@@ -723,37 +723,17 @@ Log messages:
 
 ## Benchmarks
 
-Echo server on loopback (32 CPUs). The bench suite groups scenarios by
-transport (Plain/DTLS) × type (NON/CON) × threads × payload size.
-NON throughput is measured server-side via shared-memory atomic counters.
-CON throughput is measured client-side (echo round-trip).
+The included bench suite runs a matrix of scenarios grouped by transport
+(Plain/DTLS) × type (NON/CON) × threads × payload size. NON throughput
+is measured server-side via shared-memory counters; CON measures echo
+round-trip latency. Results vary by hardware — run on your own system:
 
-**Plain UDP:**
-
-| Scenario | req/s | p50 µs | p99 µs | p99.9 µs |
-|----------|------:|-------:|-------:|---------:|
-| NON 1T 0B | 840K | — | — | — |
-| NON 32T 0B | 3.3M | — | — | — |
-| CON 1T 0B | 840K | 310 | 340 | 530 |
-| CON 32T 0B | 5.0M | 210 | 1,480 | 2,580 |
-
-**DTLS (TLS_PSK_WITH_AES_128_CCM_8):**
-
-| Scenario | req/s | p50 µs | p99 µs | p99.9 µs |
-|----------|------:|-------:|-------:|---------:|
-| NON 1T 0B | 700K | — | — | — |
-| NON 32T 0B | 3.5M | — | — | — |
-| CON 1T 0B | 185K | 1,340 | 1,580 | 1,870 |
-| CON 32T 0B | 1.1M | 1,500 | 3,690 | 6,410 |
-
-Loopback numbers are bottlenecked by the kernel's UDP stack. With a real
-NIC and RSS distributing across queues, throughput scales further with
-core count.
-
-Run benchmarks: `zig build bench -Doptimize=ReleaseFast`
+```bash
+zig build bench -Doptimize=ReleaseFast
+```
 
 Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
-`--single-only`, `--multi-only`. Use `--help` for all options.
+`--single-only`, `--multi-only`, `--ipv6`. Use `--help` for all options.
 
 ## Requirements
 
