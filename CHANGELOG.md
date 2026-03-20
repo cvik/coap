@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1] - 2026-03-20
+- Fix: `response_buf` bounds check (#53)
+- Fix: `makeContinueResponse` returns 5.00 on OOM instead of null (#54)
+- Fix: `send_data` returns error on oversized packet (#55)
+- Fix: unknown address family hashes full sockaddr (#56)
+- Rename `snake_case` to `camelCase` in exchange.zig and rate_limiter.zig (#52)
+- **All code review issues resolved** (#45-#57)
+
 ## [0.7.0] - 2026-03-20
 - Comptime request router: `coap.Router(.{ .{ .get, "/path", handler }, ... })`
 - Route parameters: `/sensor/:id` with `req.param("id")` accessor

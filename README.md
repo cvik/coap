@@ -153,7 +153,7 @@ Add to your `build.zig.zon`:
 
 ```zig
 .coap = .{
-    .url = "git+https://github.com/cvik/coap#v0.7.0",
+    .url = "git+https://github.com/cvik/coap#v0.7.1",
     .hash = "...",  // zig build will tell you the expected hash
 },
 ```
