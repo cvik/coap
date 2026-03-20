@@ -304,28 +304,53 @@ defer client.deinit();
 
 ### get / post / put / delete — path convenience
 
-CON request/response by path string with automatic retransmission:
+CON request/response by URI string with automatic retransmission.
+Paths and query strings are parsed automatically:
 
 ```zig
 const result = try client.get(allocator, "/sensor/temperature");
 defer result.deinit(allocator);
 // result.code, result.payload, result.options
 
-const r2 = try client.post(allocator, "/log", "event happened");
+// Query strings work too:
+const r2 = try client.get(allocator, "/sensors?type=temp&floor=2");
 defer r2.deinit(allocator);
+
+const r3 = try client.post(allocator, "/log", "event happened");
+defer r3.deinit(allocator);
 ```
 
 Returns `error.Timeout` after max retransmissions, `error.Reset` if the
 server sends RST. Transparently reassembles Block2 multi-block responses.
+
+### URI helpers
+
+For building options manually (e.g. with `call` or `submit`), use the
+`coap.uri` helpers. All stack-allocated, no heap:
+
+```zig
+const uri = coap.uri;
+
+// Parse a full URI into CoAP options:
+var buf: [uri.max_options]coapz.Option = undefined;
+const opts = uri.fromUri("/sensors/temp?unit=celsius&fmt=json", &buf);
+const result = try client.call(allocator, .get, opts, &.{});
+
+// Or build path and query separately:
+var path_buf: [8]coapz.Option = undefined;
+const path = uri.fromPath("sensors/temp", &path_buf);
+
+var query_buf: [8]coapz.Option = undefined;
+const query = uri.fromQuery("unit=celsius&fmt=json", &query_buf);
+```
 
 ### cast — NON fire-and-forget
 
 Sends a NON request with no response expected:
 
 ```zig
-try client.cast(.post, &.{
-    .{ .kind = .uri_path, .value = "log" },
-}, "event happened");
+var buf: [coap.uri.max_options]coapz.Option = undefined;
+try client.cast(.post, coap.uri.fromUri("/log", &buf), "event happened");
 ```
 
 ### call — CON request/response
@@ -334,9 +359,8 @@ Lower-level CON method accepting raw options. Use `get`/`post`/`put`/`delete`
 for simpler path-based requests.
 
 ```zig
-const result = try client.call(allocator, .get, &.{
-    .{ .kind = .uri_path, .value = "sensor" },
-}, &.{});
+var buf: [coap.uri.max_options]coapz.Option = undefined;
+const result = try client.call(allocator, .get, coap.uri.fromUri("/sensor", &buf), &.{});
 defer result.deinit(allocator);
 ```
 

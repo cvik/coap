@@ -125,6 +125,9 @@ const ObserverRegistryMod = @import("observe.zig");
 /// Handle for a deferred (separate) response. See `Request.defer()`.
 pub const DeferredResponse = Deferred.DeferredResponse;
 
+/// URI path and query string helpers for building CoAP options.
+pub const uri = @import("uri.zig");
+
 test {
     _ = handler;
     _ = constants;
@@ -136,5 +139,6 @@ test {
     _ = Deferred;
     _ = BlockTransferMod;
     _ = ObserverRegistryMod;
+    _ = uri;
     _ = dtls;
 }

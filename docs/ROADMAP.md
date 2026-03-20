@@ -251,14 +251,13 @@ Important extensions beyond base CoAP.
   in the hot path.
 
 ### 6.2 Request builder helpers
-- **Status:** `[ ]` not implemented
+- **Status:** `[x]` done
 - **Issue:** Building CoAP requests with URI-Path and URI-Query options
   requires manual option construction. Common patterns like paths and
   query strings should have convenience builders.
-- **Impact:** Client code is verbose for simple requests.
-- **Effort:** Small. Add helpers like `.fromPath("a/b/c")` that splits on
-  `/` and produces URI-Path options, `.fromQuery("a=1&b=2")` that splits
-  on `&` and produces URI-Query options. Stack-allocated, no heap.
+- **Resolution:** `uri.fromPath()`, `uri.fromQuery()`, `uri.fromUri()` helpers
+  in `src/uri.zig`. Stack-allocated, no heap. Client convenience methods
+  (`get`, `post`, `put`, `delete`) now accept query strings via `fromUri`.
 
 ---
 
