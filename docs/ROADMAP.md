@@ -238,6 +238,20 @@ Important extensions beyond base CoAP.
 
 ---
 
+## Tier 6 — Ergonomics
+
+### 6.1 Router
+- **Status:** `[ ]` not implemented
+- **Issue:** All requests go to a single handler function. The handler must
+  manually match on method + path segments. This is tedious and error-prone
+  for servers with multiple resources.
+- **Impact:** Every non-trivial server needs hand-rolled routing boilerplate.
+- **Effort:** Medium. Comptime route table from declarative resource definitions.
+  Must resolve to a direct function call — no dynamic dispatch or allocation
+  in the hot path.
+
+---
+
 ## Performance Invariants
 
 Any work on the above must preserve these properties:
@@ -270,7 +284,8 @@ Tiers 1–3 complete. Remaining sequence:
 11. ~~**3.1** Request-Tag~~ ✓
 12. ~~**3.2** Echo option~~ ✓
 13. ~~**3.3** Conditional requests~~ ✓
-14. **4.2** Server DTLS retransmit — completes DTLS compliance
+14. ~~**4.2** Server DTLS retransmit~~ ✓
 15. **4.1** DTLS session resumption — performance for reconnects
-16. **4.3** Additional cipher suites — interop
-17. **4.4** CoAP over TCP — new transport
+16. **4.3** Additional cipher suites — interop (postponed)
+17. **4.4** CoAP over TCP — new transport (postponed)
+18. **6.1** Router — comptime route table for multi-resource servers
