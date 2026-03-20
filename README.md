@@ -2,33 +2,27 @@
 
 High-performance CoAP server and client library for Zig, built on Linux io_uring.
 
-**Server:**
-- Zero allocations in the hot path (arena resets per batch)
-- CON/ACK reliability with duplicate detection and RST handling
-- Separate (delayed) responses with `Request.deferResponse()` (RFC 7252 §5.2.2)
-- Server-side Observe with thread-safe `server.notify()` push API (RFC 7641)
-- Transparent Block1 upload reassembly and Block2 large response fragmentation (RFC 7959)
-- Request-Tag, Echo option, conditional requests, Size1/Size2 (RFC 9175, RFC 7252)
-- Multi-threaded via SO_REUSEPORT (no shared state between threads)
-- IPv4 and IPv6 with dual-stack support
-- Per-IP rate limiting with token bucket and three-level load shedding
-- Critical option rejection with 4.02 Bad Option (RFC 7252 §5.4.1)
-- .well-known/core resource discovery (RFC 6690)
-- DTLS 1.2 PSK security (RFC 6347) with AES-128-CCM-8
-- Simple handler interface: `fn(Request) ?Response`
-- Context handlers and error-handling wrappers (`safeWrap`)
-- ~840K req/s single-threaded, ~5M req/s multi-threaded on loopback
+### Highlights
 
-**Client:**
-- CON request/response with retransmission (RFC 7252 §4.2)
-- NSTART congestion control for new peers (RFC 7252 §4.7)
-- Pipelined async requests (`submit`/`poll`) for high-throughput workloads
-- NON fire-and-forget requests
-- Transparent Block2 response reassembly
-- Block1 segmented upload (RFC 7959)
-- Observe subscriptions with sequence freshness check (RFC 7641)
-- DTLS 1.2 PSK handshake and encrypted transport
-- Pre-allocated in-flight tracking, zero hot-path allocations
+- **Simple handler interface** — `fn(Request) ?Response`, with context handlers and error wrappers
+- **Zero allocations in the hot path** — pre-allocated pools, arena resets per batch
+- **Multi-threaded** — SO_REUSEPORT, no shared state between threads
+- **DTLS 1.2 PSK** — pure Zig AES-128-CCM-8, stateless cookies, anti-replay
+- **IPv4 and IPv6** with dual-stack support
+
+### RFC compliance
+
+Full compliance with the core CoAP protocol stack:
+
+| RFC | Feature | Coverage |
+|-----|---------|----------|
+| [7252](https://datatracker.ietf.org/doc/html/rfc7252) | CoAP core, separate responses, critical options | Full |
+| [7641](https://datatracker.ietf.org/doc/html/rfc7641) | Observe (client subscribe + server push) | Full |
+| [7959](https://datatracker.ietf.org/doc/html/rfc7959) | Block-wise transfers (client + server) | Full |
+| [6347](https://datatracker.ietf.org/doc/html/rfc6347) | DTLS 1.2 (PSK, flight retransmit) | Full |
+| [9175](https://datatracker.ietf.org/doc/html/rfc9175) | Echo option, Request-Tag | Full |
+| [6690](https://datatracker.ietf.org/doc/html/rfc6690) | .well-known/core discovery | Full |
+| [4279](https://datatracker.ietf.org/doc/html/rfc4279) | PSK key exchange | Full |
 
 See the [protocol compliance roadmap](docs/ROADMAP.md) for planned features.
 
