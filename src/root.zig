@@ -128,6 +128,11 @@ pub const DeferredResponse = Deferred.DeferredResponse;
 /// URI path and query string helpers for building CoAP options.
 pub const uri = @import("uri.zig");
 
+/// Comptime request router. See `Router` for usage.
+pub const Router = @import("router.zig").Router;
+
+const router_mod = @import("router.zig");
+
 test {
     _ = handler;
     _ = constants;
@@ -140,5 +145,6 @@ test {
     _ = BlockTransferMod;
     _ = ObserverRegistryMod;
     _ = uri;
+    _ = router_mod;
     _ = dtls;
 }
