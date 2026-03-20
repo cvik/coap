@@ -201,6 +201,7 @@ Convenience constructors for common responses:
 Response.ok("hello")                         // 2.05 Content with payload
 Response.content(arena, .json, "{}")         // 2.05 with Content-Format option
 Response.created()                           // 2.01 Created
+Response.valid()                             // 2.03 Valid
 Response.deleted()                           // 2.02 Deleted
 Response.changed()                           // 2.04 Changed
 Response.notFound()                          // 4.04 Not Found
@@ -291,7 +292,22 @@ responses, or use `safeWrap` for automatic error conversion.
 
 ### Routing
 
-There is no built-in router. Use the request accessors to route:
+Use the comptime `Router` for multi-resource servers (see [Server with Router](#server-with-router)).
+Routes support parameterized segments:
+
+```zig
+const router = coap.Router(.{
+    .{ .get, "/sensor/:id", getSensor },
+});
+
+fn getSensor(req: coap.Request) ?coap.Response {
+    const id = req.param("id") orelse return coap.Response.badRequest();
+    _ = id; // look up sensor
+    return coap.Response.ok("data");
+}
+```
+
+For simple servers, manual routing with request accessors also works:
 
 ```zig
 fn handler(request: coap.Request) ?coap.Response {
