@@ -1008,24 +1008,7 @@ fn resetResult() Result {
 
 // ─── Path convenience methods ────────────────────────────────────
 
-const max_path_segments = 16;
-
-/// Split a URI path string into uri_path options.
-/// Strips leading '/' and splits on '/'. Empty segments are skipped.
-fn pathToOptions(path: []const u8, buf: *[max_path_segments]coapz.Option) []const coapz.Option {
-    const trimmed = if (path.len > 0 and path[0] == '/') path[1..] else path;
-    if (trimmed.len == 0) return buf[0..0];
-
-    var count: usize = 0;
-    var it = std.mem.splitScalar(u8, trimmed, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0) continue;
-        if (count >= max_path_segments) break;
-        buf[count] = .{ .kind = .uri_path, .value = seg };
-        count += 1;
-    }
-    return buf[0..count];
-}
+const uri = @import("uri.zig");
 
 /// CON GET by URI path. Splits `path` into URI-Path options and
 /// calls `call()`. Caller must call `result.deinit(allocator)`.
@@ -1035,26 +1018,26 @@ fn pathToOptions(path: []const u8, buf: *[max_path_segments]coapz.Option) []cons
 /// defer result.deinit(allocator);
 /// ```
 pub fn get(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    return client.call(allocator, .get, pathToOptions(path, &buf), &.{});
+    var buf: [uri.max_options]coapz.Option = undefined;
+    return client.call(allocator, .get, uri.fromUri(path, &buf), &.{});
 }
 
-/// CON POST by URI path with payload. Caller must call `result.deinit(allocator)`.
+/// CON POST by URI path (with optional query) and payload. Caller must call `result.deinit(allocator)`.
 pub fn post(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    return client.call(allocator, .post, pathToOptions(path, &buf), payload);
+    var buf: [uri.max_options]coapz.Option = undefined;
+    return client.call(allocator, .post, uri.fromUri(path, &buf), payload);
 }
 
-/// CON PUT by URI path with payload. Caller must call `result.deinit(allocator)`.
+/// CON PUT by URI path (with optional query) and payload. Caller must call `result.deinit(allocator)`.
 pub fn put(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    return client.call(allocator, .put, pathToOptions(path, &buf), payload);
+    var buf: [uri.max_options]coapz.Option = undefined;
+    return client.call(allocator, .put, uri.fromUri(path, &buf), payload);
 }
 
-/// CON DELETE by URI path. Caller must call `result.deinit(allocator)`.
+/// CON DELETE by URI path (with optional query). Caller must call `result.deinit(allocator)`.
 pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    return client.call(allocator, .delete, pathToOptions(path, &buf), &.{});
+    var buf: [uri.max_options]coapz.Option = undefined;
+    return client.call(allocator, .delete, uri.fromUri(path, &buf), &.{});
 }
 
 // ─── sendRaw / recvRaw ───────────────────────────────────────────
@@ -1971,32 +1954,20 @@ test "recvRaw returns null on timeout" {
     try testing.expect(result == null);
 }
 
-test "pathToOptions splits path" {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    const opts = pathToOptions("/hello/world", &buf);
+test "uri.fromPath splits path" {
+    var buf: [uri.max_options]coapz.Option = undefined;
+    const opts = uri.fromPath("/hello/world", &buf);
     try testing.expectEqual(@as(usize, 2), opts.len);
     try testing.expectEqualSlices(u8, "hello", opts[0].value);
     try testing.expectEqualSlices(u8, "world", opts[1].value);
 }
 
-test "pathToOptions handles no leading slash" {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    const opts = pathToOptions("a/b/c", &buf);
+test "uri.fromUri with query" {
+    var buf: [uri.max_options]coapz.Option = undefined;
+    const opts = uri.fromUri("/a/b?x=1", &buf);
     try testing.expectEqual(@as(usize, 3), opts.len);
-    try testing.expectEqualSlices(u8, "a", opts[0].value);
-    try testing.expectEqualSlices(u8, "c", opts[2].value);
-}
-
-test "pathToOptions handles empty path" {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    const opts = pathToOptions("", &buf);
-    try testing.expectEqual(@as(usize, 0), opts.len);
-}
-
-test "pathToOptions handles root path" {
-    var buf: [max_path_segments]coapz.Option = undefined;
-    const opts = pathToOptions("/", &buf);
-    try testing.expectEqual(@as(usize, 0), opts.len);
+    try testing.expectEqual(coapz.OptionKind.uri_path, opts[0].kind);
+    try testing.expectEqual(coapz.OptionKind.uri_query, opts[2].kind);
 }
 
 test "get convenience calls call with path options" {
