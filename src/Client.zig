@@ -359,6 +359,10 @@ rng: std.Random.DefaultPrng,
 
 dtls_session: ?dtls.Session.Session,
 dtls_client_hs_state: dtls.Handshake.ClientHandshakeState,
+/// Cached session data for DTLS resumption.
+dtls_cached_session_id: [32]u8,
+dtls_cached_session_id_len: u8,
+dtls_cached_master_secret: [48]u8,
 
 const empty_sentinel: u16 = 0xFFFF;
 
@@ -475,6 +479,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         .rng = rng,
         .dtls_session = if (effective_config.psk != null) std.mem.zeroes(dtls.Session.Session) else null,
         .dtls_client_hs_state = .idle,
+        .dtls_cached_session_id = .{0} ** 32,
+        .dtls_cached_session_id_len = 0,
+        .dtls_cached_master_secret = .{0} ** 48,
     };
 }
 
@@ -516,14 +523,20 @@ pub fn handshake(client: *Client) !void {
     sess.read_epoch = 0;
     sess.replay_window = 0;
 
+    // Set cached session_id for resumption attempt.
+    sess.session_id = client.dtls_cached_session_id;
+    sess.session_id_len = client.dtls_cached_session_id_len;
+
     var send_buf: [512]u8 = undefined;
 
-    // Build and send initial ClientHello.
+    // Build and send initial ClientHello (includes session_id if cached).
+    const cached_sid = client.dtls_cached_session_id[0..client.dtls_cached_session_id_len];
     const action = dtls.Handshake.clientBuildInitialHello(
         sess,
         &client.dtls_client_hs_state,
         psk,
         &send_buf,
+        cached_sid,
     );
     var last_flight: []const u8 = switch (action) {
         .send => |data| data,
@@ -613,7 +626,13 @@ pub fn handshake(client: *Client) !void {
                     retransmit_deadline_ns = std.time.nanoTimestamp() +
                         @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
                 },
-                .established => return,
+                .established => {
+                    // Cache session for resumption.
+                    client.dtls_cached_session_id = sess.session_id;
+                    client.dtls_cached_session_id_len = sess.session_id_len;
+                    client.dtls_cached_master_secret = sess.master_secret;
+                    return;
+                },
                 .failed => return error.HandshakeFailed,
                 .none => {},
             }

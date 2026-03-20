@@ -631,6 +631,7 @@ pub fn clientBuildInitialHello(
     client_hs_state: *ClientHandshakeState,
     psk: types.Psk,
     send_buf: []u8,
+    session_id: []const u8,
 ) HandshakeAction {
     if (psk.identity.len > types.max_psk_identity_len or psk.key.len > types.max_psk_key_len)
         return .{ .failed = .internal_error };
@@ -643,7 +644,7 @@ pub fn clientBuildInitialHello(
 
     // Build ClientHello body (no cookie).
     var ch_body: [256]u8 = undefined;
-    const ch_len = buildClientHelloBody(session.client_random, &.{}, &ch_body);
+    const ch_len = buildClientHelloBody(session.client_random, &.{}, session_id, &ch_body);
 
     var hs_buf: [300]u8 = undefined;
     session.message_seq = 0;
@@ -752,7 +753,9 @@ fn clientHandleHelloVerifyRequest(
 
     // Build new ClientHello with cookie.
     var ch_body: [256]u8 = undefined;
-    const ch_len = buildClientHelloBody(session.client_random, cookie, &ch_body);
+    // Include session_id from the session (set by clientBuildInitialHello if resuming).
+    const sid = session.session_id[0..session.session_id_len];
+    const ch_len = buildClientHelloBody(session.client_random, cookie, sid, &ch_body);
 
     var hs_buf: [300]u8 = undefined;
     session.message_seq = 0;
@@ -917,7 +920,7 @@ fn clientHandleFinished(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, out: []u8) usize {
+fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, session_id: []const u8, out: []u8) usize {
     var off: usize = 0;
 
     // client_version: DTLS 1.2
@@ -929,9 +932,13 @@ fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, out: []u8) us
     @memcpy(out[off..][0..32], &client_random);
     off += 32;
 
-    // session_id_len = 0
-    out[off] = 0;
+    // session_id
+    out[off] = @intCast(session_id.len);
     off += 1;
+    if (session_id.len > 0) {
+        @memcpy(out[off..][0..session_id.len], session_id);
+        off += session_id.len;
+    }
 
     // cookie
     out[off] = @intCast(cookie.len);
@@ -1039,7 +1046,7 @@ test "full server handshake" {
     // Step 1: ClientHello without cookie → expect HelloVerifyRequest
     {
         var ch_body_buf: [256]u8 = undefined;
-        const ch_len = buildClientHelloBody(client_random, &.{}, &ch_body_buf);
+        const ch_len = buildClientHelloBody(client_random, &.{}, &.{}, &ch_body_buf);
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_hello, 0, ch_body_buf[0..ch_len], &hs_buf);
 
@@ -1064,7 +1071,7 @@ test "full server handshake" {
     {
         const cookie = Cookie.generate(cookie_secret, addr, client_random);
         var ch_body_buf: [256]u8 = undefined;
-        const ch_len = buildClientHelloBody(client_random, &cookie, &ch_body_buf);
+        const ch_len = buildClientHelloBody(client_random, &cookie, &.{}, &ch_body_buf);
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_hello, 0, ch_body_buf[0..ch_len], &hs_buf);
 
@@ -1146,7 +1153,7 @@ test "full client-server handshake integration" {
     var send_buf2: [2048]u8 = undefined;
 
     // Client → Initial ClientHello
-    const action1 = clientBuildInitialHello(&client_session, &client_hs_state, psk, &send_buf);
+    const action1 = clientBuildInitialHello(&client_session, &client_hs_state, psk, &send_buf, &.{});
     var client_data: []const u8 = undefined;
     switch (action1) {
         .send => |data| client_data = data,

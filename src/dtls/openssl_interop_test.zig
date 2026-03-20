@@ -136,7 +136,7 @@ test "OpenSSL interop: handshake state machine with OpenSSL s_server" {
     var pt_buf: [512]u8 = undefined;
 
     // Build and send initial ClientHello.
-    const action = Handshake.clientBuildInitialHello(&session, &hs_state, test_psk, &send_buf);
+    const action = Handshake.clientBuildInitialHello(&session, &hs_state, test_psk, &send_buf, &.{});
     const initial_flight = switch (action) {
         .send => |data| data,
         else => return error.TestUnexpectedResult,
