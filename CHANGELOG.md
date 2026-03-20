@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.0] - 2026-03-20
+- Comptime request router: `coap.Router(.{ .{ .get, "/path", handler }, ... })`
+- Route parameters: `/sensor/:id` with `req.param("id")` accessor
+- URI helpers: `uri.fromPath()`, `uri.fromQuery()`, `uri.fromUri()`
+- Client convenience methods now accept query strings (`/path?key=val`)
+- DTLS server-side flight retransmission with cached flights (RFC 6347 §4.2.4)
+- Bench: CPU affinity for server threads in multi-thread scenarios
+- **Tier 6 ergonomics complete** (6.1-6.2)
+
 ## [0.6.2] - 2026-03-19
 - Fix: Block2 use-after-free — Size2 on last block read after slot release (#45)
 - Fix: MPSC ring race condition — sequenced Vyukov-style ring in deferred and observe (#46, #47, #57)
