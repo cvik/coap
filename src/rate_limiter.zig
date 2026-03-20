@@ -137,7 +137,7 @@ pub fn allow(self: *RateLimiter, addr_key: AddrKey, now_ns: i64) bool {
     const key = addr_key.hash();
 
     // Look up existing entry.
-    if (self.find_slot(key, addr_key)) |slot_idx| {
+    if (self.findSlot(key, addr_key)) |slot_idx| {
         const slot = &self.slots[slot_idx];
         self.refill(slot, now_ns);
         if (slot.tokens == 0) return false;
@@ -146,7 +146,7 @@ pub fn allow(self: *RateLimiter, addr_key: AddrKey, now_ns: i64) bool {
     }
 
     // New IP — allocate a slot.
-    const slot_idx = self.allocate_slot(key, addr_key, now_ns) orelse {
+    const slot_idx = self.allocateSlot(key, addr_key, now_ns) orelse {
         // Table completely full with no eviction candidate.
         // Fail open: allow the packet rather than DoS everyone.
         return true;
@@ -178,7 +178,7 @@ pub fn reset(self: *RateLimiter) void {
 
 // ── Internal ──
 
-fn find_slot(self: *const RateLimiter, key: u64, addr_key: AddrKey) ?u16 {
+fn findSlot(self: *const RateLimiter, key: u64, addr_key: AddrKey) ?u16 {
     var idx: u16 = @intCast(@as(u32, @truncate(key)) & self.table_mask);
     var probes: u16 = 0;
     while (probes <= self.table_mask) : (probes += 1) {
@@ -206,7 +206,7 @@ fn refill(self: *const RateLimiter, slot: *Slot, now_ns: i64) void {
     }
 }
 
-fn allocate_slot(self: *RateLimiter, key: u64, addr_key: AddrKey, now_ns: i64) ?u16 {
+fn allocateSlot(self: *RateLimiter, key: u64, addr_key: AddrKey, now_ns: i64) ?u16 {
     var slot_idx: u16 = undefined;
 
     if (self.free_head != empty_sentinel) {
@@ -248,7 +248,7 @@ fn evict(self: *RateLimiter) ?u16 {
         const slot = &self.slots[idx];
         if (slot.state == .active and slot.tokens >= half_burst) {
             self.clock_hand = (idx +% 1) % count;
-            self.remove_slot(idx);
+            self.removeSlot(idx);
             return idx;
         }
     }
@@ -264,14 +264,14 @@ fn evict(self: *RateLimiter) ?u16 {
     }
 
     if (oldest_idx) |oi| {
-        self.remove_slot(oi);
+        self.removeSlot(oi);
         return oi;
     }
 
     return null;
 }
 
-fn remove_slot(self: *RateLimiter, slot_idx: u16) void {
+fn removeSlot(self: *RateLimiter, slot_idx: u16) void {
     const slot = &self.slots[slot_idx];
     const key = slot.addr_key.hash();
     slot.state = .free;
@@ -281,14 +281,14 @@ fn remove_slot(self: *RateLimiter, slot_idx: u16) void {
     while (self.table[idx] != empty_sentinel) {
         if (self.table[idx] == slot_idx) {
             self.table[idx] = empty_sentinel;
-            self.rehash_after_remove(idx);
+            self.rehashAfterRemove(idx);
             return;
         }
         idx = (idx + 1) & self.table_mask;
     }
 }
 
-fn rehash_after_remove(self: *RateLimiter, removed_idx: u16) void {
+fn rehashAfterRemove(self: *RateLimiter, removed_idx: u16) void {
     var gap = removed_idx;
     var idx = (removed_idx + 1) & self.table_mask;
     while (self.table[idx] != empty_sentinel) {
@@ -296,8 +296,8 @@ fn rehash_after_remove(self: *RateLimiter, removed_idx: u16) void {
         const desired: u16 = @intCast(
             @as(u32, @truncate(self.slots[si].addr_key.hash())) & self.table_mask,
         );
-        if (wrapping_distance(desired, idx, self.table_mask) >=
-            wrapping_distance(desired, gap, self.table_mask))
+        if (wrappingDistance(desired, idx, self.table_mask) >=
+            wrappingDistance(desired, gap, self.table_mask))
         {
             self.table[gap] = si;
             self.table[idx] = empty_sentinel;
@@ -307,7 +307,7 @@ fn rehash_after_remove(self: *RateLimiter, removed_idx: u16) void {
     }
 }
 
-fn wrapping_distance(from: u16, to: u16, mask: u16) u16 {
+fn wrappingDistance(from: u16, to: u16, mask: u16) u16 {
     return (to -% from) & mask;
 }
 

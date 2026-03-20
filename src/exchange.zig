@@ -24,7 +24,7 @@ pub const State = enum(u8) {
 
 pub const Slot = struct {
     state: State,
-    peer_key: u64,
+    peerKey: u64,
     /// Address-only hash (no message ID) for peer-based eviction.
     addr_key: u32,
     message_id: u16,
@@ -39,7 +39,7 @@ slots: []Slot,
 /// Backing buffer for cached responses, indexed as
 /// slots[i] -> response_buffer[i * response_size_max ..].
 response_buffer: []u8,
-/// Hash table mapping peer_key XOR message_id -> slot index.
+/// Hash table mapping peerKey XOR message_id -> slot index.
 /// Uses open addressing with linear probing.
 /// 0xFFFF = empty sentinel.
 table: []u16,
@@ -80,7 +80,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Exchange {
     for (slots, 0..) |*slot, i| {
         slot.* = .{
             .state = .free,
-            .peer_key = 0,
+            .peerKey = 0,
             .addr_key = 0,
             .message_id = 0,
             .response_length = 0,
@@ -112,7 +112,7 @@ pub fn deinit(exchange: *Exchange, allocator: std.mem.Allocator) void {
 }
 
 /// Hash peer address only (no message ID) for peer-based eviction.
-pub fn addr_hash(address: std.net.Address) u32 {
+pub fn addrHash(address: std.net.Address) u32 {
     var hash: u32 = 0x811c9dc5; // FNV-1a 32-bit offset basis
     for (addrBytes(&address)) |b| {
         hash ^= b;
@@ -122,7 +122,7 @@ pub fn addr_hash(address: std.net.Address) u32 {
 }
 
 /// Compute a hash key from peer address and message ID.
-pub fn peer_key(address: std.net.Address, message_id: u16) u64 {
+pub fn peerKey(address: std.net.Address, message_id: u16) u64 {
     var hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
     for (addrBytes(&address)) |b| {
         hash ^= b;
@@ -138,7 +138,7 @@ fn addrBytes(address: *const std.net.Address) []const u8 {
     return switch (address.any.family) {
         posix.AF.INET => std.mem.asBytes(&address.in),
         posix.AF.INET6 => std.mem.asBytes(&address.in6),
-        else => std.mem.asBytes(&address.in),
+        else => std.mem.asBytes(&address.any),
     };
 }
 
@@ -154,7 +154,7 @@ pub fn find(exchange: *const Exchange, key: u64) ?u16 {
             return null;
         }
         const slot = &exchange.slots[slot_idx];
-        if (slot.peer_key == key) {
+        if (slot.peerKey == key) {
             return slot_idx;
         }
         idx = (idx + 1) & exchange.table_mask;
@@ -192,7 +192,7 @@ pub fn insert(
     // Populate slot.
     slot.* = .{
         .state = .completed,
-        .peer_key = key,
+        .peerKey = key,
         .addr_key = addr_key,
         .message_id = message_id,
         .response_length = @intCast(response_data.len),
@@ -220,9 +220,9 @@ pub fn insert(
 }
 
 /// Get the cached response for a slot.
-pub fn cached_response(exchange: *const Exchange, slot_idx: u16) []const u8 {
+pub fn cachedResponse(exchange: *const Exchange, slot_idx: u16) []const u8 {
     const slot = &exchange.slots[slot_idx];
-    if (slot.state != .completed) @panic("exchange: cached_response on non-completed slot");
+    if (slot.state != .completed) @panic("exchange: cachedResponse on non-completed slot");
     const offset = @as(usize, slot_idx) * exchange.config.response_size_max;
     return exchange.response_buffer[offset..][0..slot.response_length];
 }
@@ -230,7 +230,7 @@ pub fn cached_response(exchange: *const Exchange, slot_idx: u16) []const u8 {
 /// Evict all completed exchanges for a given peer address.
 /// Called when a new (non-duplicate) request arrives from a peer,
 /// proving the peer received all prior responses.
-pub fn evict_peer(exchange: *Exchange, ak: u32) u16 {
+pub fn evictPeer(exchange: *Exchange, ak: u32) u16 {
     var evicted: u16 = 0;
     for (exchange.slots, 0..) |*slot, i| {
         if (slot.state != .completed) continue;
@@ -243,7 +243,7 @@ pub fn evict_peer(exchange: *Exchange, ak: u32) u16 {
 
 /// Evict exchanges that have expired past the exchange lifetime.
 /// Returns the number of evicted exchanges.
-pub fn evict_expired(exchange: *Exchange, now_ns: i64, lifetime_ms: u32) u16 {
+pub fn evictExpired(exchange: *Exchange, now_ns: i64, lifetime_ms: u32) u16 {
     const lifetime_ns: i64 = @as(i64, lifetime_ms) *
         std.time.ns_per_ms;
     var evicted: u16 = 0;
@@ -267,7 +267,7 @@ pub fn remove(exchange: *Exchange, slot_idx: u16) void {
     if (slot.state != .completed) return; // stale or already freed
 
     // Remove from hash table.
-    exchange.remove_from_table(slot.peer_key);
+    exchange.removeFromTable(slot.peerKey);
 
     // Return to free list.
     slot.state = .free;
@@ -276,7 +276,7 @@ pub fn remove(exchange: *Exchange, slot_idx: u16) void {
     exchange.count_active -= 1;
 }
 
-fn remove_from_table(exchange: *Exchange, key: u64) void {
+fn removeFromTable(exchange: *Exchange, key: u64) void {
     var idx: u16 = @intCast(
         @as(u32, @truncate(key)) & exchange.table_mask,
     );
@@ -287,10 +287,10 @@ fn remove_from_table(exchange: *Exchange, key: u64) void {
         if (slot_idx == empty_sentinel) {
             return;
         }
-        if (exchange.slots[slot_idx].peer_key == key) {
+        if (exchange.slots[slot_idx].peerKey == key) {
             // Found. Remove and rehash subsequent entries.
             exchange.table[idx] = empty_sentinel;
-            exchange.rehash_after_remove(idx);
+            exchange.rehashAfterRemove(idx);
             return;
         }
         idx = (idx + 1) & exchange.table_mask;
@@ -299,19 +299,19 @@ fn remove_from_table(exchange: *Exchange, key: u64) void {
 
 /// After removing a table entry, shift back subsequent entries that
 /// were displaced by linear probing (backward-shift deletion).
-fn rehash_after_remove(exchange: *Exchange, removed_idx: u16) void {
+fn rehashAfterRemove(exchange: *Exchange, removed_idx: u16) void {
     var gap = removed_idx;
     var idx = (removed_idx + 1) & exchange.table_mask;
     while (exchange.table[idx] != empty_sentinel) {
         const slot_idx = exchange.table[idx];
         const desired: u16 = @intCast(
-            @as(u32, @truncate(exchange.slots[slot_idx].peer_key)) &
+            @as(u32, @truncate(exchange.slots[slot_idx].peerKey)) &
                 exchange.table_mask,
         );
         // If moving this entry to the gap would place it on or closer
         // to its desired position, shift it back.
-        if (wrapping_distance(desired, idx, exchange.table_mask) >=
-            wrapping_distance(desired, gap, exchange.table_mask))
+        if (wrappingDistance(desired, idx, exchange.table_mask) >=
+            wrappingDistance(desired, gap, exchange.table_mask))
         {
             exchange.table[gap] = slot_idx;
             exchange.table[idx] = empty_sentinel;
@@ -321,7 +321,7 @@ fn rehash_after_remove(exchange: *Exchange, removed_idx: u16) void {
     }
 }
 
-fn wrapping_distance(from: u16, to: u16, mask: u16) u16 {
+fn wrappingDistance(from: u16, to: u16, mask: u16) u16 {
     return (to -% from) & mask;
 }
 
@@ -348,7 +348,7 @@ test "insert and find" {
     defer pool.deinit(testing.allocator);
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const key = Exchange.peer_key(addr, 0x1234);
+    const key = Exchange.peerKey(addr, 0x1234);
 
     try testing.expect(pool.find(key) == null);
 
@@ -361,7 +361,7 @@ test "insert and find" {
     try testing.expectEqualSlices(
         u8,
         "response",
-        pool.cached_response(found.?),
+        pool.cachedResponse(found.?),
     );
 }
 
@@ -373,7 +373,7 @@ test "duplicate detection" {
     defer pool.deinit(testing.allocator);
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const key = Exchange.peer_key(addr, 0xAAAA);
+    const key = Exchange.peerKey(addr, 0xAAAA);
 
     _ = pool.insert(key, 0, 0xAAAA, "first", 0);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
@@ -384,7 +384,7 @@ test "duplicate detection" {
     try testing.expectEqualSlices(
         u8,
         "first",
-        pool.cached_response(found.?),
+        pool.cachedResponse(found.?),
     );
 }
 
@@ -396,9 +396,9 @@ test "pool exhaustion" {
     defer pool.deinit(testing.allocator);
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const k1 = Exchange.peer_key(addr, 1);
-    const k2 = Exchange.peer_key(addr, 2);
-    const k3 = Exchange.peer_key(addr, 3);
+    const k1 = Exchange.peerKey(addr, 1);
+    const k2 = Exchange.peerKey(addr, 2);
+    const k3 = Exchange.peerKey(addr, 3);
 
     try testing.expect(pool.insert(k1, 0, 1, "a", 0) != null);
     try testing.expect(pool.insert(k2, 0, 2, "b", 0) != null);
@@ -414,8 +414,8 @@ test "evict expired" {
     defer pool.deinit(testing.allocator);
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const k1 = Exchange.peer_key(addr, 1);
-    const k2 = Exchange.peer_key(addr, 2);
+    const k1 = Exchange.peerKey(addr, 1);
+    const k2 = Exchange.peerKey(addr, 2);
 
     // Insert at time 0.
     _ = pool.insert(k1, 0, 1, "old", 0);
@@ -428,7 +428,7 @@ test "evict expired" {
 
     // Evict at time = lifetime + 1ms. Only the old one should expire.
     const now = recent + std.time.ns_per_ms;
-    const evicted = pool.evict_expired(now, constants.exchange_lifetime_ms);
+    const evicted = pool.evictExpired(now, constants.exchange_lifetime_ms);
     try testing.expectEqual(@as(u16, 1), evicted);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
 
@@ -445,7 +445,7 @@ test "remove is public" {
     defer pool.deinit(testing.allocator);
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const key = Exchange.peer_key(addr, 0x0001);
+    const key = Exchange.peerKey(addr, 0x0001);
 
     const slot = pool.insert(key, 0, 0x0001, "data", 0);
     try testing.expect(slot != null);
@@ -503,7 +503,7 @@ test "rehash after remove with simple chain" {
     try testing.expectEqualSlices(
         u8,
         "y",
-        pool.cached_response(pool.find(key_y).?),
+        pool.cachedResponse(pool.find(key_y).?),
     );
 }
 
@@ -529,7 +529,7 @@ test "rehash after remove wraps around table" {
     try testing.expect(pool.find(key_g) != null);
 }
 
-test "evict_peer removes all exchanges for a peer" {
+test "evictPeer removes all exchanges for a peer" {
     var pool = try Exchange.init(testing.allocator, .{
         .exchange_count = 8,
         .response_size_max = 64,
@@ -538,36 +538,36 @@ test "evict_peer removes all exchanges for a peer" {
 
     const addr_a = try std.net.Address.parseIp("10.0.0.1", 5683);
     const addr_b = try std.net.Address.parseIp("10.0.0.2", 5683);
-    const ak_a = Exchange.addr_hash(addr_a);
-    const ak_b = Exchange.addr_hash(addr_b);
+    const ak_a = Exchange.addrHash(addr_a);
+    const ak_b = Exchange.addrHash(addr_b);
 
     // Two exchanges from peer A, one from peer B.
-    _ = pool.insert(Exchange.peer_key(addr_a, 1), ak_a, 1, "a1", 0);
-    _ = pool.insert(Exchange.peer_key(addr_a, 2), ak_a, 2, "a2", 0);
-    _ = pool.insert(Exchange.peer_key(addr_b, 3), ak_b, 3, "b1", 0);
+    _ = pool.insert(Exchange.peerKey(addr_a, 1), ak_a, 1, "a1", 0);
+    _ = pool.insert(Exchange.peerKey(addr_a, 2), ak_a, 2, "a2", 0);
+    _ = pool.insert(Exchange.peerKey(addr_b, 3), ak_b, 3, "b1", 0);
     try testing.expectEqual(@as(u16, 3), pool.count_active);
 
     // Evict peer A — should remove 2, leave peer B.
-    const evicted = pool.evict_peer(ak_a);
+    const evicted = pool.evictPeer(ak_a);
     try testing.expectEqual(@as(u16, 2), evicted);
     try testing.expectEqual(@as(u16, 1), pool.count_active);
-    try testing.expect(pool.find(Exchange.peer_key(addr_b, 3)) != null);
+    try testing.expect(pool.find(Exchange.peerKey(addr_b, 3)) != null);
 }
 
-test "addr_hash differentiates IPv4 and IPv6" {
+test "addrHash differentiates IPv4 and IPv6" {
     const v4 = try std.net.Address.parseIp("127.0.0.1", 5683);
     const v6 = try std.net.Address.parseIp("::1", 5683);
-    try testing.expect(Exchange.addr_hash(v4) != Exchange.addr_hash(v6));
+    try testing.expect(Exchange.addrHash(v4) != Exchange.addrHash(v6));
 }
 
-test "peer_key differentiates IPv4 and IPv6" {
+test "peerKey differentiates IPv4 and IPv6" {
     const v4 = try std.net.Address.parseIp("127.0.0.1", 5683);
     const v6 = try std.net.Address.parseIp("::1", 5683);
-    try testing.expect(Exchange.peer_key(v4, 0x1234) != Exchange.peer_key(v6, 0x1234));
+    try testing.expect(Exchange.peerKey(v4, 0x1234) != Exchange.peerKey(v6, 0x1234));
 }
 
-test "addr_hash different IPv6 addresses produce different hashes" {
+test "addrHash different IPv6 addresses produce different hashes" {
     const a = try std.net.Address.parseIp("::1", 5683);
     const b = try std.net.Address.parseIp("fe80::1", 5683);
-    try testing.expect(Exchange.addr_hash(a) != Exchange.addr_hash(b));
+    try testing.expect(Exchange.addrHash(a) != Exchange.addrHash(b));
 }
