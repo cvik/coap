@@ -154,7 +154,7 @@ Important extensions beyond base CoAP.
 ## Tier 4 — Transport & Security
 
 ### 4.1 DTLS session resumption
-- **Status:** `[-]` fields allocated in Session struct, unused
+- **Status:** `[x]` done
 - **Issue:** Every reconnect requires full handshake (3 flights, ~1-3s worst
   case). Session ID fields exist but server always sends session_id_len=0.
 - **Impact:** High latency on reconnect. Matters for mobile/intermittent clients.

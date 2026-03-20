@@ -161,6 +161,22 @@ pub const SessionTable = struct {
         return null;
     }
 
+    /// Find an established session by session_id for resumption.
+    /// Linear scan — infrequent (once per reconnect).
+    pub fn findBySessionId(self: *SessionTable, session_id: []const u8) ?*Session {
+        if (session_id.len == 0) return null;
+        for (self.slots) |*sess| {
+            if (sess.state != .established) continue;
+            if (sess.session_id_len == 0) continue;
+            if (sess.session_id_len == session_id.len and
+                std.mem.eql(u8, sess.session_id[0..sess.session_id_len], session_id))
+            {
+                return sess;
+            }
+        }
+        return null;
+    }
+
     /// Allocate a new session for the given address.
     /// Evicts LRU if no free slots remain. Returns null if capacity == 0.
     pub fn allocate(self: *SessionTable, addr: std.net.Address, now_ns: i64) ?*Session {

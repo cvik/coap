@@ -1352,6 +1352,32 @@ fn process_dtls_record(
             const record = dtls.Record.decodePlaintext(rec_data) orelse continue;
 
             const buf = server.response_buf(index);
+
+            // Check for session resumption: if this is a ClientHello with
+            // a non-empty session_id, look up the cached session.
+            var resumption: ?dtls.Handshake.ResumptionData = null;
+            if (record.content_type == .handshake and record.payload.len > 12 + 2 + 32 + 1) {
+                // Peek at handshake message type (byte 0 of body) and session_id.
+                const hs_body_off: usize = 12; // handshake header
+                const msg_type = record.payload[0];
+                if (msg_type == 1) { // client_hello
+                    const sid_off = hs_body_off + 2 + 32; // version + random
+                    if (sid_off < record.payload.len) {
+                        const sid_len = record.payload[sid_off];
+                        if (sid_len > 0 and sid_off + 1 + sid_len <= record.payload.len) {
+                            const sid = record.payload[sid_off + 1 ..][0..sid_len];
+                            if (tbl.findBySessionId(sid)) |cached| {
+                                resumption = .{
+                                    .master_secret = cached.master_secret,
+                                    .session_id = cached.session_id,
+                                    .session_id_len = cached.session_id_len,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
             const action = dtls.Handshake.serverProcessMessage(
                 sess,
                 record.content_type,
@@ -1360,6 +1386,7 @@ fn process_dtls_record(
                 server.dtls_cookie_secret,
                 server.dtls_cookie_secret_prev,
                 buf,
+                resumption,
             );
 
             switch (action) {
@@ -1445,6 +1472,7 @@ fn process_dtls_record(
                     server.dtls_cookie_secret,
                     server.dtls_cookie_secret_prev,
                     buf,
+                    null,
                 );
 
                 switch (action) {

@@ -127,6 +127,14 @@ pub const HandshakeAction = union(enum) {
 // Server-side state machine
 // ---------------------------------------------------------------------------
 
+/// Optional resumption data passed by the server when the ClientHello
+/// contains a session_id that matches an established session.
+pub const ResumptionData = struct {
+    master_secret: [48]u8,
+    session_id: [32]u8,
+    session_id_len: u8,
+};
+
 pub fn serverProcessMessage(
     session: *Session.Session,
     content_type: types.ContentType,
@@ -135,11 +143,12 @@ pub fn serverProcessMessage(
     cookie_secret: [32]u8,
     cookie_secret_prev: [32]u8,
     send_buf: []u8,
+    resumption: ?ResumptionData,
 ) HandshakeAction {
     if (psk.identity.len > types.max_psk_identity_len or psk.key.len > types.max_psk_key_len)
         return .{ .failed = .internal_error };
     switch (content_type) {
-        .handshake => return serverProcessHandshake(session, payload, psk, cookie_secret, cookie_secret_prev, send_buf),
+        .handshake => return serverProcessHandshake(session, payload, psk, cookie_secret, cookie_secret_prev, send_buf, resumption),
         .change_cipher_spec => return serverProcessCcs(session, payload),
         else => return .{ .failed = .unexpected_message },
     }
@@ -152,6 +161,7 @@ fn serverProcessHandshake(
     cookie_secret: [32]u8,
     cookie_secret_prev: [32]u8,
     send_buf: []u8,
+    resumption: ?ResumptionData,
 ) HandshakeAction {
     const msg = decodeHandshakeMessage(payload) orelse
         return .{ .failed = .decode_error };
@@ -160,7 +170,7 @@ fn serverProcessHandshake(
         .idle, .expect_client_hello, .cookie_sent => {
             if (msg.msg_type != .client_hello)
                 return .{ .failed = .unexpected_message };
-            return serverHandleClientHello(session, msg.body, payload, psk, cookie_secret, cookie_secret_prev, send_buf);
+            return serverHandleClientHello(session, msg.body, payload, psk, cookie_secret, cookie_secret_prev, send_buf, resumption);
         },
         .expect_client_key_exchange => {
             if (msg.msg_type != .client_key_exchange)
@@ -278,6 +288,7 @@ fn serverHandleClientHello(
     cookie_secret: [32]u8,
     cookie_secret_prev: [32]u8,
     send_buf: []u8,
+    resumption: ?ResumptionData,
 ) HandshakeAction {
     // Parse ClientHello body:
     // client_version(2) + client_random(32) + session_id_len(1) + session_id(var) +
@@ -328,28 +339,47 @@ fn serverHandleClientHello(
     // Generate server_random.
     std.crypto.random.bytes(&session.server_random);
 
-    // Build response flight: ServerHello + ServerKeyExchange + ServerHelloDone
+    // Generate or reuse session_id.
+    if (resumption) |r| {
+        session.session_id = r.session_id;
+        session.session_id_len = r.session_id_len;
+    } else {
+        std.crypto.random.bytes(&session.session_id);
+        session.session_id_len = 32;
+    }
+
     var offset: usize = 0;
     var hs_buf: [256]u8 = undefined;
     var record_buf: [300]u8 = undefined;
 
-    // --- ServerHello ---
+    // --- ServerHello (with session_id) ---
     {
-        // body: server_version(2) + server_random(32) + session_id_len(1,0) + cipher_suite(2) + compression(1,0)
-        var sh_body: [38]u8 = undefined;
+        var sh_body: [70]u8 = undefined;
         sh_body[0] = 0xFE; // DTLS 1.2
         sh_body[1] = 0xFD;
         @memcpy(sh_body[2..34], &session.server_random);
-        sh_body[34] = 0; // session_id_len = 0
-        std.mem.writeInt(u16, sh_body[35..37], @intFromEnum(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
-        sh_body[37] = 0; // compression = null
+        sh_body[34] = session.session_id_len;
+        @memcpy(sh_body[35..][0..session.session_id_len], session.session_id[0..session.session_id_len]);
+        const cs_off = 35 + @as(usize, session.session_id_len);
+        std.mem.writeInt(u16, sh_body[cs_off..][0..2], @intFromEnum(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
+        sh_body[cs_off + 2] = 0; // compression = null
+        const sh_len = cs_off + 3;
 
-        // Server's own message_seq counter starts at 0, independent of client's.
-        const hs_msg = encodeHandshakeMessage(.server_hello, session.message_seq, &sh_body, &hs_buf);
+        const hs_msg = encodeHandshakeMessage(.server_hello, session.message_seq, sh_body[0..sh_len], &hs_buf);
         session.handshake_hash.update(hs_msg);
         const rec = Record.encodePlaintext(.handshake, hs_msg, &session.write_sequence, &record_buf);
         @memcpy(send_buf[offset..][0..rec.len], rec);
         offset += rec.len;
+    }
+
+    // --- Abbreviated handshake (session resumption) ---
+    if (resumption) |r| {
+        // Reuse master_secret, derive new keys from new randoms.
+        session.master_secret = r.master_secret;
+        applyKeyDerivation(session);
+
+        // CCS + Finished (same as full handshake final flight).
+        return serverSendCcsAndFinished(session, send_buf, &offset, &hs_buf, &record_buf, psk);
     }
 
     // --- ServerKeyExchange (PSK) ---
@@ -445,6 +475,72 @@ fn serverHandleClientKeyExchange(
     return .none;
 }
 
+/// Send CCS + Finished from the server. Used by both abbreviated (resumption)
+/// and full handshake paths. For resumption, the server expects client CCS+Finished
+/// next; for full handshake, the state is already set to expect_change_cipher_spec.
+/// Apply key derivation to a session from its master_secret and randoms.
+fn applyKeyDerivation(session: *Session.Session) void {
+    const kb = deriveKeys(session.master_secret, session.server_random, session.client_random);
+    session.client_write_key = kb.client_write_key;
+    session.server_write_key = kb.server_write_key;
+    session.client_write_iv = kb.client_write_iv;
+    session.server_write_iv = kb.server_write_iv;
+}
+
+/// Send CCS + Finished from the server. Used by both abbreviated (resumption)
+/// and full handshake paths.
+fn serverSendCcsAndFinished(
+    session: *Session.Session,
+    send_buf: []u8,
+    offset: *usize,
+    hs_buf: *[256]u8,
+    record_buf: *[300]u8,
+    psk: types.Psk,
+) HandshakeAction {
+    _ = psk;
+    // --- CCS ---
+    {
+        const ccs_payload = [_]u8{0x01};
+        const rec = Record.encodePlaintext(.change_cipher_spec, &ccs_payload, &session.write_sequence, record_buf);
+        @memcpy(send_buf[offset.*..][0..rec.len], rec);
+        offset.* += rec.len;
+    }
+
+    // Activate write keys.
+    session.write_epoch = 1;
+    session.write_sequence = 0;
+
+    // --- Server Finished ---
+    {
+        var server_verify: [12]u8 = undefined;
+        var hash_copy = session.handshake_hash;
+        const hs_hash = hash_copy.finalResult();
+        Prf.prf(&session.master_secret, "server finished", &hs_hash, &server_verify);
+
+        session.message_seq += 1;
+        const hs_msg = encodeHandshakeMessage(.finished, session.message_seq, &server_verify, hs_buf);
+        session.handshake_hash.update(hs_msg);
+
+        var enc_buf: [128]u8 = undefined;
+        const rec = Record.encodeEncrypted(
+            .handshake,
+            hs_msg,
+            session.server_write_key,
+            session.server_write_iv,
+            session.write_epoch,
+            &session.write_sequence,
+            &enc_buf,
+        );
+        @memcpy(send_buf[offset.*..][0..rec.len], rec);
+        offset.* += rec.len;
+    }
+
+    // For resumption: expect client CCS+Finished next.
+    // For full handshake: caller sets state to .established.
+    session.handshake_state = .expect_change_cipher_spec;
+    return .{ .send = send_buf[0..offset.*] };
+}
+
 fn serverHandleFinished(
     session: *Session.Session,
     body: []const u8,
@@ -535,6 +631,7 @@ pub fn clientBuildInitialHello(
     client_hs_state: *ClientHandshakeState,
     psk: types.Psk,
     send_buf: []u8,
+    session_id: []const u8,
 ) HandshakeAction {
     if (psk.identity.len > types.max_psk_identity_len or psk.key.len > types.max_psk_key_len)
         return .{ .failed = .internal_error };
@@ -547,7 +644,7 @@ pub fn clientBuildInitialHello(
 
     // Build ClientHello body (no cookie).
     var ch_body: [256]u8 = undefined;
-    const ch_len = buildClientHelloBody(session.client_random, &.{}, &ch_body);
+    const ch_len = buildClientHelloBody(session.client_random, &.{}, session_id, &ch_body);
 
     var hs_buf: [300]u8 = undefined;
     session.message_seq = 0;
@@ -656,7 +753,9 @@ fn clientHandleHelloVerifyRequest(
 
     // Build new ClientHello with cookie.
     var ch_body: [256]u8 = undefined;
-    const ch_len = buildClientHelloBody(session.client_random, cookie, &ch_body);
+    // Include session_id from the session (set by clientBuildInitialHello if resuming).
+    const sid = session.session_id[0..session.session_id_len];
+    const ch_len = buildClientHelloBody(session.client_random, cookie, sid, &ch_body);
 
     var hs_buf: [300]u8 = undefined;
     session.message_seq = 0;
@@ -821,7 +920,7 @@ fn clientHandleFinished(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, out: []u8) usize {
+fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, session_id: []const u8, out: []u8) usize {
     var off: usize = 0;
 
     // client_version: DTLS 1.2
@@ -833,9 +932,13 @@ fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, out: []u8) us
     @memcpy(out[off..][0..32], &client_random);
     off += 32;
 
-    // session_id_len = 0
-    out[off] = 0;
+    // session_id
+    out[off] = @intCast(session_id.len);
     off += 1;
+    if (session_id.len > 0) {
+        @memcpy(out[off..][0..session_id.len], session_id);
+        off += session_id.len;
+    }
 
     // cookie
     out[off] = @intCast(cookie.len);
@@ -943,11 +1046,11 @@ test "full server handshake" {
     // Step 1: ClientHello without cookie → expect HelloVerifyRequest
     {
         var ch_body_buf: [256]u8 = undefined;
-        const ch_len = buildClientHelloBody(client_random, &.{}, &ch_body_buf);
+        const ch_len = buildClientHelloBody(client_random, &.{}, &.{}, &ch_body_buf);
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_hello, 0, ch_body_buf[0..ch_len], &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf, null);
         switch (action) {
             .send => |data| {
                 try testing.expect(data.len > 0);
@@ -968,11 +1071,11 @@ test "full server handshake" {
     {
         const cookie = Cookie.generate(cookie_secret, addr, client_random);
         var ch_body_buf: [256]u8 = undefined;
-        const ch_len = buildClientHelloBody(client_random, &cookie, &ch_body_buf);
+        const ch_len = buildClientHelloBody(client_random, &cookie, &.{}, &ch_body_buf);
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_hello, 0, ch_body_buf[0..ch_len], &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf, null);
         switch (action) {
             .send => |data| {
                 try testing.expect(data.len > 0);
@@ -992,14 +1095,14 @@ test "full server handshake" {
         var hs_buf: [300]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.client_key_exchange, 1, cke_body[0 .. 2 + psk_identity.len], &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf, null);
         try testing.expectEqual(HandshakeAction.none, action);
         try testing.expectEqual(Session.ServerHandshakeState.expect_change_cipher_spec, server_session.handshake_state);
     }
 
     // Step 4: ChangeCipherSpec
     {
-        const action = serverProcessMessage(&server_session, .change_cipher_spec, &[_]u8{0x01}, psk, cookie_secret, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .change_cipher_spec, &[_]u8{0x01}, psk, cookie_secret, cookie_secret, &send_buf, null);
         try testing.expectEqual(HandshakeAction.none, action);
         try testing.expectEqual(Session.ServerHandshakeState.expect_finished, server_session.handshake_state);
         try testing.expectEqual(@as(u16, 1), server_session.read_epoch);
@@ -1018,7 +1121,7 @@ test "full server handshake" {
         var hs_buf: [64]u8 = undefined;
         const hs_msg = encodeHandshakeMessage(.finished, 2, &client_verify, &hs_buf);
 
-        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf);
+        const action = serverProcessMessage(&server_session, .handshake, hs_msg, psk, cookie_secret, cookie_secret, &send_buf, null);
         switch (action) {
             .send => |data| {
                 try testing.expect(data.len > 0);
@@ -1050,7 +1153,7 @@ test "full client-server handshake integration" {
     var send_buf2: [2048]u8 = undefined;
 
     // Client → Initial ClientHello
-    const action1 = clientBuildInitialHello(&client_session, &client_hs_state, psk, &send_buf);
+    const action1 = clientBuildInitialHello(&client_session, &client_hs_state, psk, &send_buf, &.{});
     var client_data: []const u8 = undefined;
     switch (action1) {
         .send => |data| client_data = data,
@@ -1061,7 +1164,7 @@ test "full client-server handshake integration" {
     // Server processes ClientHello → HelloVerifyRequest
     {
         const rec = Record.decodePlaintext(client_data) orelse return error.TestUnexpectedNull;
-        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
+        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, cookie_secret, &send_buf2, null);
         switch (action) {
             .send => |data| {
                 // Client processes HVR
@@ -1087,7 +1190,7 @@ test "full client-server handshake integration" {
     var server_flight: []const u8 = undefined;
     {
         const rec = Record.decodePlaintext(client_data) orelse return error.TestUnexpectedNull;
-        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
+        const action = serverProcessMessage(&server_session, rec.content_type, rec.payload, psk, cookie_secret, cookie_secret, &send_buf2, null);
         switch (action) {
             .send => |data| server_flight = data,
             else => return error.TestUnexpectedResult,
@@ -1136,7 +1239,7 @@ test "full client-server handshake integration" {
                                 srv_off += srv_total;
                                 continue;
                             };
-                            _ = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
+                            _ = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, cookie_secret, &send_buf2, null);
                         } else {
                             // Encrypted record (Finished).
                             var pt_buf: [256]u8 = undefined;
@@ -1151,7 +1254,7 @@ test "full client-server handshake integration" {
                                 srv_off += srv_total;
                                 continue;
                             };
-                            const srv_action = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, cookie_secret, &send_buf2);
+                            const srv_action = serverProcessMessage(&server_session, srv_rec.content_type, srv_rec.payload, psk, cookie_secret, cookie_secret, &send_buf2, null);
                             switch (srv_action) {
                                 .send => |srv_resp| {
                                     // Server sends CCS + Finished back. Feed to client.
@@ -1244,4 +1347,143 @@ fn initTestSession(session: *Session.Session, addr: std.net.Address) void {
         .lru_next = 0xFFFFFFFF,
         .next_free = 0xFFFFFFFF,
     };
+}
+
+test "session resumption: server abbreviated path with ResumptionData" {
+    const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
+    const cookie_secret = [_]u8{0xAA} ** 32;
+    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+
+    // Simulate a previously established session with known master_secret.
+    var saved_master_secret: [48]u8 = undefined;
+    std.crypto.random.bytes(&saved_master_secret);
+    var saved_session_id: [32]u8 = undefined;
+    std.crypto.random.bytes(&saved_session_id);
+
+    // Build a ClientHello with the cached session_id.
+    var client_session: Session.Session = undefined;
+    initTestSession(&client_session, addr);
+    var client_hs_state: ClientHandshakeState = .idle;
+    var send_buf: [2048]u8 = undefined;
+
+    const action1 = clientBuildInitialHello(
+        &client_session, &client_hs_state, psk, &send_buf,
+        &saved_session_id,
+    );
+    const client_hello_data = switch (action1) {
+        .send => |data| data,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Server receives ClientHello — but it contains no cookie, so
+    // the first response is HelloVerifyRequest regardless.
+    var server_session: Session.Session = undefined;
+    initTestSession(&server_session, addr);
+    var send_buf2: [2048]u8 = undefined;
+
+    const resumption = ResumptionData{
+        .master_secret = saved_master_secret,
+        .session_id = saved_session_id,
+        .session_id_len = 32,
+    };
+
+    {
+        const rec = Record.decodePlaintext(client_hello_data) orelse return error.TestUnexpectedNull;
+        const hvr_action = serverProcessMessage(
+            &server_session, rec.content_type, rec.payload,
+            psk, cookie_secret, cookie_secret, &send_buf2, resumption,
+        );
+        // First ClientHello has no cookie → HelloVerifyRequest
+        switch (hvr_action) {
+            .send => {}, // HVR sent
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Now simulate a ClientHello WITH cookie (as if client responded to HVR).
+    // We need a valid cookie for the server to proceed.
+    const cookie = Cookie.generate(cookie_secret, addr, client_session.client_random);
+
+    var ch_body: [256]u8 = undefined;
+    const ch_len = buildClientHelloBody(client_session.client_random, &cookie, &saved_session_id, &ch_body);
+
+    var hs_buf: [300]u8 = undefined;
+    const hs_msg = encodeHandshakeMessage(.client_hello, 1, ch_body[0..ch_len], &hs_buf);
+    var record_buf: [350]u8 = undefined;
+    var write_seq: u48 = 1;
+    const rec = Record.encodePlaintext(.handshake, hs_msg, &write_seq, &record_buf);
+
+    // Reset server session for the cookie-validated attempt.
+    initTestSession(&server_session, addr);
+
+    const action = serverProcessMessage(
+        &server_session, .handshake, rec[13..], // strip record header, pass payload
+        psk, cookie_secret, cookie_secret, &send_buf2, resumption,
+    );
+
+    // With valid cookie + resumption data → abbreviated handshake.
+    switch (action) {
+        .send => |data| {
+            try testing.expect(data.len > 0);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Verify abbreviated path results.
+    try testing.expectEqualSlices(u8, &saved_session_id, &server_session.session_id);
+    try testing.expectEqualSlices(u8, &saved_master_secret, &server_session.master_secret);
+    try testing.expect(server_session.write_epoch == 1); // CCS was sent
+    try testing.expect(!std.mem.eql(u8, &server_session.server_write_key, &([_]u8{0} ** 16))); // keys derived
+}
+
+test "session resumption: client sends cached session_id" {
+    const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
+    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+
+    var session: Session.Session = undefined;
+    initTestSession(&session, addr);
+    var hs_state: ClientHandshakeState = .idle;
+    var send_buf: [2048]u8 = undefined;
+
+    // Build ClientHello with a cached session_id.
+    var cached_sid: [32]u8 = undefined;
+    std.crypto.random.bytes(&cached_sid);
+
+    const action = clientBuildInitialHello(&session, &hs_state, psk, &send_buf, &cached_sid);
+    const data = switch (action) {
+        .send => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Verify the ClientHello contains the session_id.
+    // ClientHello is inside a record (13 bytes header) + handshake header (12 bytes)
+    // + version(2) + random(32) + session_id_len(1) + session_id(32)
+    const body_off: usize = 13 + 12; // record header + handshake header
+    const sid_len_off = body_off + 2 + 32; // version + random
+    try testing.expect(data.len > sid_len_off + 1 + 32);
+    try testing.expectEqual(@as(u8, 32), data[sid_len_off]);
+    try testing.expectEqualSlices(u8, &cached_sid, data[sid_len_off + 1 ..][0..32]);
+}
+
+test "session resumption: empty session_id produces full handshake" {
+    const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
+    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+
+    var session: Session.Session = undefined;
+    initTestSession(&session, addr);
+    var hs_state: ClientHandshakeState = .idle;
+    var send_buf: [2048]u8 = undefined;
+
+    // Build ClientHello with empty session_id.
+    const action = clientBuildInitialHello(&session, &hs_state, psk, &send_buf, &.{});
+    const data = switch (action) {
+        .send => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Verify session_id_len = 0 in the ClientHello.
+    const body_off: usize = 13 + 12;
+    const sid_len_off = body_off + 2 + 32;
+    try testing.expect(data.len > sid_len_off);
+    try testing.expectEqual(@as(u8, 0), data[sid_len_off]);
 }
