@@ -575,11 +575,11 @@ var server = try coap.Server.init(allocator, .{
 }, handler);
 ```
 
-Note: scaling depends on traffic coming from multiple source addresses/ports.
-A single client socket always hashes to the same server thread. On loopback,
-the kernel serializes UDP processing so multi-threading adds overhead without
-throughput gain — benefits require a real NIC with RSS or CPU-intensive
-handlers.
+Note: the kernel distributes packets by 4-tuple hash (src/dst IP + port).
+A single client socket always hashes to one server thread. Throughput scales
+with the number of distinct client connections — multiple clients (different
+source ports) spread across all threads. Even on loopback, the bench shows
+~5M req/s at 32T vs ~800K at 1T because it uses one socket per client thread.
 
 ### `max_arena_size`
 
