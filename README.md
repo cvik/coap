@@ -440,10 +440,15 @@ All fields have sensible defaults. Pass `.{}` for a standard server on port 5683
 ```zig
 var server = try coap.Server.init(allocator, .{
     .port = 5683,                     // UDP listen port
-    .bind_address = "0.0.0.0",        // IPv4 bind address
+    .bind_address = "0.0.0.0",        // IPv4/IPv6 bind address
     .buffer_count = 512,              // io_uring provided buffers
     .buffer_size = 1280,              // max UDP datagram size (bytes)
     .exchange_count = 256,            // max concurrent CON exchanges
+    .max_deferred = 16,               // max concurrent separate responses
+    .max_block_transfers = 32,        // max concurrent Block1/Block2 transfers
+    .max_block_payload = 64 * 1024,   // max block transfer payload (bytes)
+    .max_observers = 256,             // max total observer entries
+    .max_observe_resources = 64,      // max observed resources
     .well_known_core = null,          // RFC 6690 discovery payload
     .recognized_options = &.{},       // extra critical options to allow
     .thread_count = 1,                // server threads (SO_REUSEPORT)
@@ -466,8 +471,9 @@ UDP port to bind. Default: `5683` (CoAP standard port per RFC 7252).
 
 ### `bind_address`
 
-IPv4 address to bind. Use `"127.0.0.1"` for loopback only, `"0.0.0.0"` for
-all interfaces. IPv6 is not yet supported. Default: `"0.0.0.0"`.
+Address to bind. Use `"0.0.0.0"` for all IPv4 interfaces, `"::"` for
+dual-stack IPv6 (accepts both v4 and v6 clients via `IPV6_V6ONLY=0`),
+`"127.0.0.1"` or `"::1"` for loopback only. Default: `"0.0.0.0"`.
 
 ### `buffer_count`
 
@@ -499,6 +505,30 @@ Memory per exchange: `~8 + buffer_size` bytes. With defaults: `256 * 1288 ≈ 32
 If the pool is exhausted, new CON responses are sent but not cached — the
 server logs a warning and duplicate detection is unavailable for those
 exchanges.
+
+### `max_deferred`
+
+Maximum concurrent separate (delayed) responses. When a handler calls
+`request.deferResponse()`, the server sends an empty ACK and tracks the
+pending response in this pool. Set to `0` to disable. Default: `16`.
+
+### `max_block_transfers`
+
+Maximum concurrent Block1 upload reassembly and Block2 large response
+fragmentation transfers (shared pool). Set to `0` to disable block transfer
+support. Default: `32`.
+
+### `max_block_payload`
+
+Maximum payload size for block transfers in bytes. Block1 uploads exceeding
+this are rejected with 4.13. Block2 responses are capped at this size.
+Default: `65536` (64 KB).
+
+### `max_observers` / `max_observe_resources`
+
+Maximum total observer entries and maximum observed resources for server-side
+Observe (RFC 7641). The observer list is partitioned evenly across resources.
+Set `max_observers` to `0` to disable. Defaults: `256` / `64`.
 
 ### `well_known_core`
 
