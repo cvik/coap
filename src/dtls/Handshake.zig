@@ -1348,3 +1348,142 @@ fn initTestSession(session: *Session.Session, addr: std.net.Address) void {
         .next_free = 0xFFFFFFFF,
     };
 }
+
+test "session resumption: server abbreviated path with ResumptionData" {
+    const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
+    const cookie_secret = [_]u8{0xAA} ** 32;
+    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+
+    // Simulate a previously established session with known master_secret.
+    var saved_master_secret: [48]u8 = undefined;
+    std.crypto.random.bytes(&saved_master_secret);
+    var saved_session_id: [32]u8 = undefined;
+    std.crypto.random.bytes(&saved_session_id);
+
+    // Build a ClientHello with the cached session_id.
+    var client_session: Session.Session = undefined;
+    initTestSession(&client_session, addr);
+    var client_hs_state: ClientHandshakeState = .idle;
+    var send_buf: [2048]u8 = undefined;
+
+    const action1 = clientBuildInitialHello(
+        &client_session, &client_hs_state, psk, &send_buf,
+        &saved_session_id,
+    );
+    const client_hello_data = switch (action1) {
+        .send => |data| data,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Server receives ClientHello — but it contains no cookie, so
+    // the first response is HelloVerifyRequest regardless.
+    var server_session: Session.Session = undefined;
+    initTestSession(&server_session, addr);
+    var send_buf2: [2048]u8 = undefined;
+
+    const resumption = ResumptionData{
+        .master_secret = saved_master_secret,
+        .session_id = saved_session_id,
+        .session_id_len = 32,
+    };
+
+    {
+        const rec = Record.decodePlaintext(client_hello_data) orelse return error.TestUnexpectedNull;
+        const hvr_action = serverProcessMessage(
+            &server_session, rec.content_type, rec.payload,
+            psk, cookie_secret, cookie_secret, &send_buf2, resumption,
+        );
+        // First ClientHello has no cookie → HelloVerifyRequest
+        switch (hvr_action) {
+            .send => {}, // HVR sent
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Now simulate a ClientHello WITH cookie (as if client responded to HVR).
+    // We need a valid cookie for the server to proceed.
+    const cookie = Cookie.generate(cookie_secret, addr, client_session.client_random);
+
+    var ch_body: [256]u8 = undefined;
+    const ch_len = buildClientHelloBody(client_session.client_random, &cookie, &saved_session_id, &ch_body);
+
+    var hs_buf: [300]u8 = undefined;
+    const hs_msg = encodeHandshakeMessage(.client_hello, 1, ch_body[0..ch_len], &hs_buf);
+    var record_buf: [350]u8 = undefined;
+    var write_seq: u48 = 1;
+    const rec = Record.encodePlaintext(.handshake, hs_msg, &write_seq, &record_buf);
+
+    // Reset server session for the cookie-validated attempt.
+    initTestSession(&server_session, addr);
+
+    const action = serverProcessMessage(
+        &server_session, .handshake, rec[13..], // strip record header, pass payload
+        psk, cookie_secret, cookie_secret, &send_buf2, resumption,
+    );
+
+    // With valid cookie + resumption data → abbreviated handshake.
+    switch (action) {
+        .send => |data| {
+            try testing.expect(data.len > 0);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Verify abbreviated path results.
+    try testing.expectEqualSlices(u8, &saved_session_id, &server_session.session_id);
+    try testing.expectEqualSlices(u8, &saved_master_secret, &server_session.master_secret);
+    try testing.expect(server_session.write_epoch == 1); // CCS was sent
+    try testing.expect(!std.mem.eql(u8, &server_session.server_write_key, &([_]u8{0} ** 16))); // keys derived
+}
+
+test "session resumption: client sends cached session_id" {
+    const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
+    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+
+    var session: Session.Session = undefined;
+    initTestSession(&session, addr);
+    var hs_state: ClientHandshakeState = .idle;
+    var send_buf: [2048]u8 = undefined;
+
+    // Build ClientHello with a cached session_id.
+    var cached_sid: [32]u8 = undefined;
+    std.crypto.random.bytes(&cached_sid);
+
+    const action = clientBuildInitialHello(&session, &hs_state, psk, &send_buf, &cached_sid);
+    const data = switch (action) {
+        .send => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Verify the ClientHello contains the session_id.
+    // ClientHello is inside a record (13 bytes header) + handshake header (12 bytes)
+    // + version(2) + random(32) + session_id_len(1) + session_id(32)
+    const body_off: usize = 13 + 12; // record header + handshake header
+    const sid_len_off = body_off + 2 + 32; // version + random
+    try testing.expect(data.len > sid_len_off + 1 + 32);
+    try testing.expectEqual(@as(u8, 32), data[sid_len_off]);
+    try testing.expectEqualSlices(u8, &cached_sid, data[sid_len_off + 1 ..][0..32]);
+}
+
+test "session resumption: empty session_id produces full handshake" {
+    const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
+    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+
+    var session: Session.Session = undefined;
+    initTestSession(&session, addr);
+    var hs_state: ClientHandshakeState = .idle;
+    var send_buf: [2048]u8 = undefined;
+
+    // Build ClientHello with empty session_id.
+    const action = clientBuildInitialHello(&session, &hs_state, psk, &send_buf, &.{});
+    const data = switch (action) {
+        .send => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Verify session_id_len = 0 in the ClientHello.
+    const body_off: usize = 13 + 12;
+    const sid_len_off = body_off + 2 + 32;
+    try testing.expect(data.len > sid_len_off);
+    try testing.expectEqual(@as(u8, 0), data[sid_len_off]);
+}
