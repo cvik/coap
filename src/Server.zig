@@ -1010,7 +1010,7 @@ fn handle_recv(
         };
     }
 
-    const request = handler.Request{
+    var request = handler.Request{
         .packet = packet,
         .peer_address = recv.peer_address,
         .arena = arena,
@@ -1066,16 +1066,20 @@ fn handle_recv(
     }
 
     // Block1 upload: reassemble fragments, call handler only on final block.
+    var block1_slot: ?u16 = null;
     if (server.block_transfers) |*bt| {
         if (packet.find_option(.block1)) |opt| {
             if (opt.as_block()) |bv| {
-                const bt_resp = server.handleBlock1(bt, bv, packet, recv.peer_address, arena);
-                if (bt_resp) |resp| {
-                    server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
-                    return;
-                }
-                // bt_resp == null → Block1 complete. packet.payload now points to
-                // reassembled data in the transfer pool. Fall through to handler.
+                if (server.handleBlock1(bt, bv, packet, recv.peer_address, arena)) |b1| switch (b1) {
+                    .response => |resp| {
+                        server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
+                        return;
+                    },
+                    .complete => |bt_idx| {
+                        request.payload_override = bt.payloadSlice(bt_idx);
+                        block1_slot = bt_idx;
+                    },
+                };
             }
         }
     }
@@ -1235,6 +1239,10 @@ fn handle_recv(
                 log.warn("exchange pool full ({d} active), cannot cache", .{server.exchanges.count_active});
             }
         }
+    }
+
+    if (block1_slot) |idx| {
+        if (server.block_transfers) |*bt| bt.release(idx);
     }
 }
 
@@ -1779,6 +1787,12 @@ fn send_rst(
 /// Drain deferred response queue and retransmit pending separate CONs.
 /// Handle a Block1 upload fragment. Returns a response to send (2.31 Continue
 /// or error), or null if the upload is complete and the handler should be called.
+
+const Block1Result = union(enum) {
+    response: handler.Response,
+    complete: u16,
+};
+
 fn handleBlock1(
     server: *Server,
     bt: *BlockTransfer,
@@ -1786,7 +1800,7 @@ fn handleBlock1(
     packet: coapz.Packet,
     peer: std.net.Address,
     arena: std.mem.Allocator,
-) ?handler.Response {
+) ?Block1Result {
     // Extract Request-Tag (RFC 9175 §3) for Block1 disambiguation.
     // Request-Tag option number 292 (RFC 9175).
     const request_tag_kind: coapz.OptionKind = @enumFromInt(292);
@@ -1795,38 +1809,47 @@ fn handleBlock1(
     if (bv.num == 0) {
         // First block — allocate transfer slot.
         const idx = bt.allocate(packet.token, peer, .block1_receiving, bv.szx, server.tick_now_ns, request_tag) orelse {
-            return handler.Response.withCode(.request_entity_too_large);
+            return .{ .response = handler.Response.withCode(.request_entity_too_large) };
         };
         const result = bt.appendBlock1(idx, 0, bv.more, packet.payload);
         return switch (result) {
-            .more => makeContinueResponse(bv, arena),
-            .complete => null, // handler will be called
+            .more => ret: {
+                const cont = makeContinueResponse(bv, arena) orelse
+                    break :ret .{ .response = handler.Response.withCode(.internal_server_error) };
+                break :ret .{ .response = cont };
+            },
+            .complete => .{ .complete = idx },
             .error_too_large => ret: {
                 bt.release(idx);
-                break :ret handler.Response.withCode(.request_entity_too_large);
+                break :ret .{ .response = handler.Response.withCode(.request_entity_too_large) };
             },
             .error_wrong_num => ret: {
                 bt.release(idx);
-                break :ret handler.Response.withCode(.bad_request);
+                break :ret .{ .response = handler.Response.withCode(.bad_request) };
             },
         };
     }
 
-    // Subsequent block — find existing transfer by token + peer + request-tag.
-    const idx = bt.findByToken(packet.token, peer, request_tag) orelse {
-        return handler.Response.withCode(.request_entity_incomplete);
+    // Subsequent block — find existing transfer by peer + request-tag.
+    // Tokens may differ across Block1 requests (RFC 7959 §2.5).
+    const idx = bt.findBlock1ByPeer(peer, request_tag) orelse {
+        return .{ .response = handler.Response.withCode(.request_entity_incomplete) };
     };
     const result = bt.appendBlock1(idx, bv.num, bv.more, packet.payload);
     return switch (result) {
-        .more => makeContinueResponse(bv, arena),
-        .complete => null,
+        .more => ret: {
+            const cont = makeContinueResponse(bv, arena) orelse
+                break :ret .{ .response = handler.Response.withCode(.internal_server_error) };
+            break :ret .{ .response = cont };
+        },
+        .complete => .{ .complete = idx },
         .error_too_large => ret: {
             bt.release(idx);
-            break :ret handler.Response.withCode(.request_entity_too_large);
+            break :ret .{ .response = handler.Response.withCode(.request_entity_too_large) };
         },
         .error_wrong_num => ret: {
             bt.release(idx);
-            break :ret handler.Response.withCode(.bad_request);
+            break :ret .{ .response = handler.Response.withCode(.bad_request) };
         },
     };
 }
@@ -1838,7 +1861,10 @@ fn makeContinueResponse(bv: coapz.BlockValue, arena: std.mem.Allocator) ?handler
         .more = false, // server echoes with M=0 in 2.31
         .szx = bv.szx,
     }).option(.block1, &b1_buf);
-    const opts = arena.dupe(coapz.Option, &.{b1_opt}) catch
+    // Duplicate the option value bytes onto the arena so they outlive this stack frame.
+    const val_dupe = arena.dupe(u8, b1_opt.value) catch
+        return .{ .code = .internal_server_error };
+    const opts = arena.dupe(coapz.Option, &.{.{ .kind = b1_opt.kind, .value = val_dupe }}) catch
         return .{ .code = .internal_server_error };
     return .{
         .code = .@"continue",

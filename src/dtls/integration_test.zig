@@ -217,6 +217,65 @@ test "DTLS: handshake fails with wrong PSK key" {
     try testing.expectError(error.HandshakeFailed, result);
 }
 
+var block1_received_len: usize = 0;
+var block1_first_byte: u8 = 0;
+var block1_last_byte: u8 = 0;
+
+fn block1BodyHandler(request: handler.Request) ?handler.Response {
+    const body = request.payload();
+    block1_received_len = body.len;
+    if (body.len > 0) {
+        block1_first_byte = body[0];
+        block1_last_byte = body[body.len - 1];
+    }
+    return handler.Response{
+        .code = .changed,
+        .payload = "ok",
+        .options = &.{},
+    };
+}
+
+test "Block1: handler receives full reassembled body" {
+    const port: u16 = 19770;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_block_transfers = 8,
+        .max_block_payload = 8192,
+    }, block1BodyHandler);
+    defer server.deinit();
+    try server.listen();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    // 2048-byte payload — requires multiple blocks at default szx=6 (1024 bytes).
+    const payload = [_]u8{0x42} ** 2048;
+    var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
+    block1_received_len = 0;
+    const result = try client.upload(testing.allocator, .put, &path_buf, &payload);
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(.changed, result.code);
+    // Handler should have received the FULL reassembled body (2048 bytes).
+    // Bug #81: handler only sees the last fragment (1024 bytes).
+    try testing.expectEqual(@as(usize, 2048), block1_received_len);
+    try testing.expectEqual(@as(u8, 0x42), block1_first_byte);
+    try testing.expectEqual(@as(u8, 0x42), block1_last_byte);
+}
+
 test "DTLS: NON cast over encrypted channel" {
     const port: u16 = 19755;
 
