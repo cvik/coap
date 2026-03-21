@@ -477,7 +477,7 @@ defer response.deinit(allocator);
 
 ### observe — RFC 7641
 
-Subscribe to resource notifications:
+**Client — subscribe to resource notifications:**
 
 ```zig
 var stream = try client.observe(&.{
@@ -492,9 +492,8 @@ while (try stream.next(allocator)) |notification| {
 try stream.cancel();
 ```
 
-CON notifications are automatically ACKed.
-
-For zero-allocation notification processing, use `nextBuf` with a caller-provided buffer:
+CON notifications are automatically ACKed. For zero-allocation processing,
+use `nextBuf` with a caller-provided buffer:
 
 ```zig
 var buf: [1500]u8 = undefined;
@@ -503,6 +502,69 @@ while (try stream.nextBuf(&buf)) |notification| {
     std.debug.print("update: {s}\n", .{notification.payload});
 }
 ```
+
+**Server — push notifications to subscribers:**
+
+```zig
+// Allocate a resource ID at startup.
+const temp_rid = server.allocateResource() orelse return error.Full;
+
+// In the handler, register the client as an observer.
+fn handler(req: coap.Request) ?coap.Response {
+    if (req.method() == .get) {
+        _ = req.observeResource(temp_rid);
+        return coap.Response.ok("22.5");
+    }
+    return coap.Response.methodNotAllowed();
+}
+
+// From any thread, push an update to all observers.
+server.notify(temp_rid, coap.Response.ok("23.1"));
+```
+
+`notify()` is thread-safe — call it from sensor loops, worker threads,
+or interrupt handlers. Notifications are queued and sent on the next
+server tick.
+
+**Reliability — CON notifications:**
+
+The server periodically sends CON (confirmable) notifications to verify
+that observers are still reachable. The interval is configurable:
+
+```zig
+.observe_con_interval = 20,  // every 20th notification is CON (default)
+```
+
+When a CON notification goes unacknowledged after retransmission (exponential
+backoff, up to 4 retries per RFC 7252 §4.2), the observer is automatically
+removed. This is how the server detects that a client has gone away.
+
+Set `observe_con_interval = 0` to disable CON notifications entirely
+(all notifications sent as NON). Set to `1` for maximum reliability
+(every notification is CON, higher overhead).
+
+**Client-side cancellation and failure detection:**
+
+- Call `stream.cancel()` to unsubscribe (sends Observe=1 deregister).
+- If the server sends a RST to any notification, the subscription is cancelled.
+- `stream.next()` returns `null` when cancelled.
+
+**Server-side cancellation:**
+
+To tell clients a resource is gone (sensor disconnected, resource deleted),
+send a non-2.xx notification. Per RFC 7641 §3.2, clients must deregister
+on error codes:
+
+```zig
+server.notify(temp_rid, coap.Response.notFound());  // 4.04 — resource gone
+```
+
+**Server-side observer eviction:**
+
+Observers are removed when:
+- The client sends RST to a notification (explicit rejection).
+- A CON notification times out after max retransmissions (client unreachable).
+- The handler calls `req.removeObserver(rid)` explicitly.
 
 ### upload — RFC 7959 Block1
 
@@ -534,6 +596,7 @@ var server = try coap.Server.init(allocator, .{
     .max_block_payload = 64 * 1024,   // max block transfer payload (bytes)
     .max_observers = 256,             // max total observer entries
     .max_observe_resources = 64,      // max observed resources
+    .observe_con_interval = 20,       // CON every Nth notification (0 = NON only)
     .well_known_core = null,          // RFC 6690 discovery payload
     .recognized_options = &.{},       // extra critical options to allow
     .thread_count = 1,                // server threads (SO_REUSEPORT)
@@ -614,6 +677,13 @@ Default: `65536` (64 KB).
 Maximum total observer entries and maximum observed resources for server-side
 Observe (RFC 7641). The observer list is partitioned evenly across resources.
 Set `max_observers` to `0` to disable. Defaults: `256` / `64`.
+
+### `observe_con_interval`
+
+Send a CON (confirmable) notification every N notifications per observer.
+CON notifications require client acknowledgement — unresponsive observers
+are removed after retransmission timeout. Set to `0` to send NON only.
+Default: `20`.
 
 ### `well_known_core`
 

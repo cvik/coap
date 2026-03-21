@@ -363,6 +363,70 @@ test "Observe: notification carries correct client token" {
     try testing.expectEqualSlices(u8, expected_token, notif.packet.token);
 }
 
+test "Observe: CON notification with ACK" {
+    const port: u16 = 19776;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_observers = 16,
+        .max_observe_resources = 4,
+        .observe_con_interval = 1, // Every notification is CON.
+    }, observeRegHandler);
+    defer server.deinit();
+
+    const rid = server.allocateResource() orelse return error.NoResource;
+    observe_resource_id = rid;
+
+    try server.listen();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "temp" }};
+    var stream = try client.observe(&path_buf);
+
+    // Push CON notification.
+    server.notify(rid, handler.Response{
+        .code = .content,
+        .payload = "23.0",
+        .options = &.{},
+    });
+
+    // Receive notification (client auto-ACKs CON).
+    const NextCtx = struct {
+        stream: *Client.ObserveStream,
+        result: ?Client.ObserveStream.Notification = null,
+        fn run(self: *@This()) void {
+            self.result = self.stream.next(testing.allocator) catch null;
+        }
+    };
+    var next_ctx = NextCtx{ .stream = &stream };
+    const next_thread = try std.Thread.spawn(.{}, NextCtx.run, .{&next_ctx});
+
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    stream.cancel() catch {};
+    next_thread.join();
+
+    // Should have received a notification (token check proves delivery).
+    const notif = next_ctx.result orelse return error.NoNotification;
+    defer notif.deinit(testing.allocator);
+
+    const sub = &client.observes[0];
+    try testing.expectEqualSlices(u8, sub.token[0..sub.token_len], notif.packet.token);
+}
+
 const Deferred = @import("../deferred.zig");
 
 var dtls_deferred_handle: ?Deferred.DeferredResponse = null;

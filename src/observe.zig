@@ -27,6 +27,12 @@ pub const Observer = struct {
     peer_address: std.net.Address,
     token: [8]u8,
     token_len: u8,
+    /// Notifications sent to this observer (for CON interval).
+    notify_count: u16 = 0,
+    /// Non-zero when a CON notification is outstanding.
+    pending_con_msg_id: u16 = 0,
+    retransmit_count: u4 = 0,
+    retransmit_deadline_ns: i64 = 0,
 };
 
 pub const Resource = struct {
@@ -158,6 +164,10 @@ pub fn addObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.Addr
             obs.token_len = @intCast(@min(token.len, 8));
             obs.token = .{0} ** 8;
             @memcpy(obs.token[0..obs.token_len], token[0..obs.token_len]);
+            obs.notify_count = 0;
+            obs.pending_con_msg_id = 0;
+            obs.retransmit_count = 0;
+            obs.retransmit_deadline_ns = 0;
             _ = self.resources[resource_id].observer_count.fetchAdd(1, .monotonic);
             return true;
         }
@@ -201,6 +211,12 @@ pub fn removeByPeer(self: *ObserverRegistry, peer: std.net.Address) void {
 
 /// Get the observer list for a resource (for tick loop to iterate).
 pub fn getObservers(self: *const ObserverRegistry, resource_id: u16) []const Observer {
+    const base = @as(usize, resource_id) * self.observers_per_resource;
+    return self.observers[base..][0..self.observers_per_resource];
+}
+
+/// Mutable version for tick-loop use (CON notification state updates).
+pub fn getObserversMut(self: *ObserverRegistry, resource_id: u16) []Observer {
     const base = @as(usize, resource_id) * self.observers_per_resource;
     return self.observers[base..][0..self.observers_per_resource];
 }
@@ -290,6 +306,18 @@ pub fn notifyData(self: *const ObserverRegistry, slot_idx: u16) []const u8 {
 pub fn notifyBuf(self: *const ObserverRegistry, slot: u16) []u8 {
     const offset = @as(usize, slot) * self.config.buffer_size;
     return self.notify_buffer[offset..][0..self.config.buffer_size];
+}
+
+/// Clear pending CON state when an ACK is received for a CON notification.
+pub fn ackConNotification(self: *ObserverRegistry, msg_id: u16, peer: std.net.Address) void {
+    for (self.observers) |*obs| {
+        if (!obs.active) continue;
+        if (obs.pending_con_msg_id != msg_id) continue;
+        if (!addrEqual(obs.peer_address, peer)) continue;
+        obs.pending_con_msg_id = 0;
+        obs.retransmit_count = 0;
+        return;
+    }
 }
 
 pub const NotifyMeta = struct {

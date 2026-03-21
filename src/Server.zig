@@ -66,6 +66,9 @@ pub const Config = struct {
     max_observers: u16 = 256,
     /// Maximum observed resources.
     max_observe_resources: u16 = 64,
+    /// Send a CON notification every N notifications per observer (RFC 7641 §4.5).
+    /// 0 = always NON (disable CON notifications).
+    observe_con_interval: u16 = 20,
     /// Link-format payload for GET /.well-known/core (RFC 6690).
     /// If null, requests pass through to the handler.
     well_known_core: ?[]const u8 = null,
@@ -790,8 +793,9 @@ pub fn tick(server: *Server) !void {
     // Drain deferred response queue and retransmit pending CONs.
     server.drainDeferred();
 
-    // Drain observe notification queue — send NON to all observers.
+    // Drain observe notification queue and retransmit pending CONs.
     server.drainNotifications();
+    server.retransmitObserveCons();
 
     // Compute load level based on buffer/exchange pool utilization.
     server.update_load_level();
@@ -932,6 +936,10 @@ fn handle_recv(
             if (pool.findByMsgId(packet.msg_id, recv.peer_address)) |idx| {
                 pool.release(idx);
             }
+        }
+        // ACK for a CON observe notification — clear pending state.
+        if (server.observers) |*reg| {
+            reg.ackConNotification(packet.msg_id, recv.peer_address);
         }
         return;
     }
@@ -2115,7 +2123,7 @@ fn drainNotifications(server: *Server) void {
         if (entry.response_len == 0) continue;
         const notify_buf = reg.notifyBuf(entry.queue_slot);
         const meta_data = notify_buf[0..entry.response_len];
-        const obs_list = reg.getObservers(entry.resource_id);
+        const obs_list = reg.getObserversMut(entry.resource_id);
 
         const meta = ObserverRegistry.decodeNotifyMeta(meta_data, arena) orelse continue;
 
@@ -2124,28 +2132,82 @@ fn drainNotifications(server: *Server) void {
         meta.options[0] = coapz.Option.uint(.observe, meta.obs_seq, &obs_val_buf);
 
         var sent: usize = 0;
+        const con_interval = server.config.observe_con_interval;
         for (obs_list) |*obs| {
             if (!obs.active) continue;
+            // Skip observers with an outstanding CON (wait for ACK/timeout).
+            if (obs.pending_con_msg_id != 0) continue;
+
+            obs.notify_count +%= 1;
+            const use_con = con_interval > 0 and (obs.notify_count % con_interval == 0);
+            const msg_id = server.nextMsgId();
+
             const pkt = coapz.Packet{
-                .kind = .non_confirmable,
+                .kind = if (use_con) .confirmable else .non_confirmable,
                 .code = meta.code,
-                .msg_id = server.nextMsgId(),
+                .msg_id = msg_id,
                 .token = obs.token[0..obs.token_len],
                 .options = meta.options,
                 .payload = meta.payload,
                 .data_buf = &.{},
             };
             const buf_idx = sent % batch;
-            if (server.dtls_sessions) |tbl| {
+            const wire: ?[]const u8 = if (server.dtls_sessions) |tbl| blk: {
                 if (tbl.lookup(obs.peer_address)) |session| {
-                    _ = server.send_dtls_packet(session, pkt, obs.peer_address, buf_idx) catch continue;
-                    sent += 1;
-                    continue;
+                    break :blk server.send_dtls_packet(session, pkt, obs.peer_address, buf_idx) catch continue;
                 }
+                break :blk null;
+            } else null;
+            const wire_data = wire orelse (server.send_packet(pkt, obs.peer_address, buf_idx) catch continue);
+
+            if (use_con) {
+                // Cache for retransmission and dedup.
+                const addr_key = Exchange.addrHash(obs.peer_address);
+                const key = Exchange.peerKey(obs.peer_address, msg_id);
+                _ = server.exchanges.insert(key, addr_key, msg_id, wire_data, server.tick_now_ns);
+                obs.pending_con_msg_id = msg_id;
+                obs.retransmit_count = 0;
+                const timeout_ms: i64 = @intCast(constants.ack_timeout_ms);
+                obs.retransmit_deadline_ns = server.tick_now_ns + timeout_ms * std.time.ns_per_ms;
             }
-            _ = server.send_packet(pkt, obs.peer_address, buf_idx) catch continue;
             sent += 1;
         }
+    }
+}
+
+/// Retransmit outstanding CON observe notifications and evict timed-out observers.
+fn retransmitObserveCons(server: *Server) void {
+    const reg = &(server.observers orelse return);
+    const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
+
+    for (reg.observers) |*obs| {
+        if (!obs.active or obs.pending_con_msg_id == 0) continue;
+        if (server.tick_now_ns < obs.retransmit_deadline_ns) continue;
+
+        obs.retransmit_count += 1;
+        if (obs.retransmit_count > constants.max_retransmit) {
+            // Timeout — remove observer (RFC 7641 §4.5).
+            log.debug("observe CON timeout, removing observer", .{});
+            obs.active = false;
+            obs.pending_con_msg_id = 0;
+            continue;
+        }
+
+        // Retransmit from exchange cache.
+        const key = Exchange.peerKey(obs.peer_address, obs.pending_con_msg_id);
+        if (server.exchanges.find(key)) |slot_idx| {
+            const cached = server.exchanges.cachedResponse(slot_idx);
+            const idx = @as(usize, obs.retransmit_count) % batch;
+            server.send_data(cached, obs.peer_address, idx) catch {};
+        } else {
+            // Cache evicted — give up on this CON.
+            obs.pending_con_msg_id = 0;
+            continue;
+        }
+
+        const backoff: u5 = @intCast(@min(obs.retransmit_count, constants.max_retransmit));
+        const timeout_ms: i64 = @as(i64, constants.ack_timeout_ms) << backoff;
+        obs.retransmit_deadline_ns = server.tick_now_ns + timeout_ms * std.time.ns_per_ms;
     }
 }
 
