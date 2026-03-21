@@ -162,6 +162,21 @@ pub fn findByToken(self: *const BlockTransfer, token: []const u8, peer: std.net.
     return null;
 }
 
+/// Find an active Block1 transfer by peer address and request-tag.
+/// Block1 subsequent blocks may use different tokens (RFC 7959 §2.5),
+/// so token matching is not used here.
+pub fn findBlock1ByPeer(self: *const BlockTransfer, peer: std.net.Address, request_tag: []const u8) ?u16 {
+    for (self.slots, 0..) |*slot, i| {
+        if (slot.state != .active) continue;
+        if (slot.kind != .block1_receiving) continue;
+        if (slot.request_tag_len != request_tag.len) continue;
+        if (!std.mem.eql(u8, slot.request_tag[0..slot.request_tag_len], request_tag)) continue;
+        if (!addrEqual(slot.peer_address, peer)) continue;
+        return @intCast(i);
+    }
+    return null;
+}
+
 /// Evict transfers older than `timeout_ns`.
 pub fn evictExpired(self: *BlockTransfer, now_ns: i64, timeout_ns: i64) u16 {
     var evicted: u16 = 0;

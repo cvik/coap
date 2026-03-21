@@ -46,6 +46,7 @@ pub const Request = struct {
     /// Route parameters captured by the router (e.g. `:id` segments).
     route_params: [max_route_params]RouteParam = [_]RouteParam{.{}} ** max_route_params,
     route_param_count: u8 = 0,
+    payload_override: ?[]const u8 = null,
 
     pub const max_route_params = 4;
     pub const RouteParam = struct {
@@ -154,7 +155,7 @@ pub const Request = struct {
 
     /// Request payload bytes. Empty slice if no payload.
     pub inline fn payload(self: Request) []const u8 {
-        return self.packet.payload;
+        return self.payload_override orelse self.packet.payload;
     }
 
     /// Iterator over URI-Path segments. Each call to `next()` returns

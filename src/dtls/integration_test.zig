@@ -217,6 +217,275 @@ test "DTLS: handshake fails with wrong PSK key" {
     try testing.expectError(error.HandshakeFailed, result);
 }
 
+var block1_received_len: usize = 0;
+var block1_first_byte: u8 = 0;
+var block1_last_byte: u8 = 0;
+
+fn block1BodyHandler(request: handler.Request) ?handler.Response {
+    const body = request.payload();
+    block1_received_len = body.len;
+    if (body.len > 0) {
+        block1_first_byte = body[0];
+        block1_last_byte = body[body.len - 1];
+    }
+    return handler.Response{
+        .code = .changed,
+        .payload = "ok",
+        .options = &.{},
+    };
+}
+
+test "Block1: handler receives full reassembled body" {
+    const port: u16 = 19770;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_block_transfers = 8,
+        .max_block_payload = 8192,
+    }, block1BodyHandler);
+    defer server.deinit();
+    try server.listen();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    // 2048-byte payload — requires multiple blocks at default szx=6 (1024 bytes).
+    const payload = [_]u8{0x42} ** 2048;
+    var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
+    block1_received_len = 0;
+    const result = try client.upload(testing.allocator, .put, &path_buf, &payload);
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(.changed, result.code);
+    // Handler should have received the FULL reassembled body (2048 bytes).
+    // Bug #81: handler only sees the last fragment (1024 bytes).
+    try testing.expectEqual(@as(usize, 2048), block1_received_len);
+    try testing.expectEqual(@as(u8, 0x42), block1_first_byte);
+    try testing.expectEqual(@as(u8, 0x42), block1_last_byte);
+}
+
+var observe_resource_id: ?u16 = null;
+
+fn observeRegHandler(request: handler.Request) ?handler.Response {
+    if (request.method() == .get) {
+        if (observe_resource_id) |rid| {
+            _ = request.observeResource(rid);
+        }
+        var obs_buf: [4]u8 = undefined;
+        const obs_opt = coapz.Option.uint(.observe, 1, &obs_buf);
+        const opts = request.arena.dupe(coapz.Option, &.{obs_opt}) catch
+            return handler.Response.withCode(.internal_server_error);
+        return handler.Response{
+            .code = .content,
+            .payload = "initial",
+            .options = opts,
+        };
+    }
+    return handler.Response.withCode(.method_not_allowed);
+}
+
+test "Observe: notification carries correct client token" {
+    const port: u16 = 19771;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_observers = 16,
+        .max_observe_resources = 4,
+    }, observeRegHandler);
+    defer server.deinit();
+
+    const rid = server.allocateResource() orelse return error.NoResource;
+    observe_resource_id = rid;
+
+    try server.listen();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    // Register observe.
+    var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "temp" }};
+    var stream = try client.observe(&path_buf);
+
+    // Push a notification from the server.
+    server.notify(rid, handler.Response{
+        .code = .content,
+        .payload = "22.5",
+        .options = &.{},
+    });
+
+    // stream.next() blocks — use a thread with cancel timeout.
+    const NextCtx = struct {
+        stream: *Client.ObserveStream,
+        result: ?Client.ObserveStream.Notification = null,
+        fn run(self: *@This()) void {
+            self.result = self.stream.next(testing.allocator) catch null;
+        }
+    };
+    var next_ctx = NextCtx{ .stream = &stream };
+    const next_thread = try std.Thread.spawn(.{}, NextCtx.run, .{&next_ctx});
+
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    stream.cancel() catch {};
+    next_thread.join();
+
+    const notif = next_ctx.result orelse return error.NoNotification;
+    defer notif.deinit(testing.allocator);
+
+    // Verify token matches client's observe subscription token.
+    // Bug #82: token was &.{0} instead of the real client token,
+    // which meant routeObserve never matched and next() blocked forever.
+    const sub = &client.observes[0];
+    const expected_token = sub.token[0..sub.token_len];
+    try testing.expectEqualSlices(u8, expected_token, notif.packet.token);
+}
+
+const Deferred = @import("../deferred.zig");
+
+var dtls_deferred_handle: ?Deferred.DeferredResponse = null;
+var dtls_deferred_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn dtlsDeferHandler(request: handler.Request) ?handler.Response {
+    dtls_deferred_handle = request.deferResponse();
+    dtls_deferred_ready.store(true, .release);
+    return null; // server sends empty ACK
+}
+
+test "DTLS: deferred response is encrypted" {
+    const port: u16 = 19772;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_deferred = 8,
+        .psk = test_psk,
+    }, dtlsDeferHandler);
+    defer server.deinit();
+    try server.listen();
+
+    dtls_deferred_ready.store(false, .release);
+    dtls_deferred_handle = null;
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .psk = test_psk,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    try client.handshake();
+    try testing.expectEqual(.established, client.dtls_session.?.state);
+
+    // Submit CON POST — handler defers.
+    const handle = try client.submit(.post, &.{coapz.Option{ .kind = .uri_path, .value = "deferred" }}, "request");
+
+    // Wait for handler to capture the deferred handle.
+    var attempts: u32 = 0;
+    while (!dtls_deferred_ready.load(.acquire)) : (attempts += 1) {
+        if (attempts > 200) return error.Timeout;
+        _ = client.poll(testing.allocator, 10) catch {};
+    }
+
+    // Deliver deferred response.
+    if (dtls_deferred_handle) |h| {
+        h.respond(handler.Response{
+            .code = .content,
+            .payload = "deferred-result",
+            .options = &.{},
+        });
+    } else return error.NoDeferredHandle;
+
+    // Client should receive the encrypted deferred response.
+    // If sent as plaintext (#83), client won't parse it (expects DTLS records).
+    var result: ?Client.Result = null;
+    for (0..100) |_| {
+        if (client.poll(testing.allocator, 20) catch null) |completion| {
+            if (completion.handle == handle) {
+                result = completion.result;
+                break;
+            }
+            completion.result.deinit(testing.allocator);
+        }
+    }
+    const r = result orelse return error.Timeout;
+    defer r.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, r.code);
+    try testing.expectEqualSlices(u8, "deferred-result", r.payload);
+}
+
+test "DTLS: Block1 upload delivers reassembled body" {
+    const port: u16 = 19773;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_block_transfers = 8,
+        .max_block_payload = 8192,
+        .psk = test_psk,
+    }, block1BodyHandler);
+    defer server.deinit();
+    try server.listen();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .psk = test_psk,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    try client.handshake();
+    try testing.expectEqual(.established, client.dtls_session.?.state);
+
+    const payload = [_]u8{0x42} ** 2048;
+    var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
+    block1_received_len = 0;
+    const result = try client.upload(testing.allocator, .put, &path_buf, &payload);
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(.changed, result.code);
+    try testing.expectEqual(@as(usize, 2048), block1_received_len);
+}
+
 test "DTLS: NON cast over encrypted channel" {
     const port: u16 = 19755;
 

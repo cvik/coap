@@ -232,35 +232,36 @@ pub fn notify(self: *ObserverRegistry, resource_id: u16, response: handler.Respo
 
     const buf = self.notifyBuf(slot_idx);
 
-    var obs_buf: [4]u8 = undefined;
-    const obs_opt = coapz.Option.uint(.observe, seq, &obs_buf);
-
-    var opts_buf: [16]coapz.Option = undefined;
-    opts_buf[0] = obs_opt;
-    const resp_opts = @min(response.options.len, opts_buf.len - 1);
-    for (response.options[0..resp_opts], 1..) |opt, i| {
-        opts_buf[i] = opt;
+    // Store notification metadata for per-observer encoding in drain phase.
+    // Layout: [code:1][obs_seq:4 LE][opts_count:1][opts...][payload...]
+    // Each option: [kind:2 LE][len:2 LE][value:len]
+    const resp_opts: u8 = @intCast(@min(response.options.len, 15));
+    buf[0] = @intFromEnum(response.code);
+    std.mem.writeInt(u32, buf[1..5], seq, .little);
+    buf[5] = resp_opts;
+    var buf_pos: usize = 6;
+    for (response.options[0..resp_opts]) |opt| {
+        if (buf_pos + 4 + opt.value.len > buf.len) {
+            qs.entry = .{ .resource_id = resource_id, .response_len = 0, .queue_slot = slot_idx };
+            qs.seq.store(pos +% 1, .release);
+            return;
+        }
+        std.mem.writeInt(u16, buf[buf_pos..][0..2], @intFromEnum(opt.kind), .little);
+        std.mem.writeInt(u16, buf[buf_pos + 2 ..][0..2], @intCast(opt.value.len), .little);
+        buf_pos += 4;
+        @memcpy(buf[buf_pos..][0..opt.value.len], opt.value);
+        buf_pos += opt.value.len;
     }
+    // Payload.
+    const payload_len = @min(response.payload.len, buf.len - buf_pos);
+    @memcpy(buf[buf_pos..][0..payload_len], response.payload[0..payload_len]);
+    buf_pos += payload_len;
 
-    const pkt = coapz.Packet{
-        .kind = .non_confirmable,
-        .code = response.code,
-        .msg_id = 0,
-        .token = &.{0},
-        .options = opts_buf[0 .. 1 + resp_opts],
-        .payload = response.payload,
-        .data_buf = &.{},
+    qs.entry = .{
+        .resource_id = resource_id,
+        .response_len = @intCast(buf_pos),
+        .queue_slot = slot_idx,
     };
-
-    if (pkt.writeBuf(buf)) |written| {
-        qs.entry = .{
-            .resource_id = resource_id,
-            .response_len = @intCast(written.len),
-            .queue_slot = slot_idx,
-        };
-    } else |_| {
-        qs.entry = .{ .resource_id = resource_id, .response_len = 0, .queue_slot = slot_idx };
-    }
     qs.seq.store(pos +% 1, .release); // publish
 }
 
@@ -289,6 +290,41 @@ pub fn notifyData(self: *const ObserverRegistry, slot_idx: u16) []const u8 {
 pub fn notifyBuf(self: *const ObserverRegistry, slot: u16) []u8 {
     const offset = @as(usize, slot) * self.config.buffer_size;
     return self.notify_buffer[offset..][0..self.config.buffer_size];
+}
+
+pub const NotifyMeta = struct {
+    code: coapz.Code,
+    obs_seq: u32,
+    /// Slot 0 is reserved for the Observe option (set by caller).
+    options: []coapz.Option,
+    payload: []const u8,
+};
+
+/// Decode notification metadata from a notify buffer slot.
+/// `arena` is used to allocate the options array.
+pub fn decodeNotifyMeta(data: []const u8, arena: std.mem.Allocator) ?NotifyMeta {
+    if (data.len < 6) return null;
+    const code: coapz.Code = @enumFromInt(data[0]);
+    const obs_seq = std.mem.readInt(u32, data[1..5], .little);
+    const opts_count = data[5];
+    var buf_pos: usize = 6;
+    // +1 for the observe option prepended by the caller.
+    const options = arena.alloc(coapz.Option, @as(usize, opts_count) + 1) catch return null;
+    for (0..opts_count) |i| {
+        if (buf_pos + 4 > data.len) return null;
+        const kind: coapz.OptionKind = @enumFromInt(std.mem.readInt(u16, data[buf_pos..][0..2], .little));
+        const vlen = std.mem.readInt(u16, data[buf_pos + 2 ..][0..2], .little);
+        buf_pos += 4;
+        if (buf_pos + vlen > data.len) return null;
+        options[i + 1] = .{ .kind = kind, .value = data[buf_pos..][0..vlen] };
+        buf_pos += vlen;
+    }
+    return .{
+        .code = code,
+        .obs_seq = obs_seq,
+        .options = options,
+        .payload = if (buf_pos < data.len) data[buf_pos..] else &.{},
+    };
 }
 
 fn addrEqual(a: std.net.Address, b: std.net.Address) bool {
