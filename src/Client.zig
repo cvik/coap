@@ -32,6 +32,10 @@ const log = std.log.scoped(.coap_client);
 
 const Client = @This();
 
+fn nanoTimestamp() i64 {
+    return @intCast(std.time.nanoTimestamp());
+}
+
 /// Client configuration. All fields have sensible defaults.
 pub const Config = struct {
     /// Server address (IPv4 or IPv6). Default: `"127.0.0.1"`.
@@ -117,7 +121,7 @@ const InFlightSlot = struct {
     token_len: u3,
     msg_id: u16,
     retransmit_count: u4,
-    next_retransmit_ns: i128,
+    next_retransmit_ns: i64,
     timeout_ns: u64,
     /// Offset into send_buf for retransmission data.
     send_offset: u32,
@@ -545,20 +549,21 @@ pub fn handshake(client: *Client) !void {
     };
     try client.sendDirect(last_flight);
 
-    const deadline_ns: i128 = std.time.nanoTimestamp() +
-        @as(i128, client.config.handshake_timeout_ms) * std.time.ns_per_ms;
+    const now_ns = nanoTimestamp();
+    const deadline_ns: i64 = now_ns +
+        @as(i64, client.config.handshake_timeout_ms) * std.time.ns_per_ms;
 
     // Retransmit timer (RFC 6347 §4.2.4): exponential backoff.
     var retransmit_timeout_ms: u32 = constants.dtls_retransmit_initial_ms;
-    var retransmit_deadline_ns: i128 = std.time.nanoTimestamp() +
-        @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+    var retransmit_deadline_ns: i64 = now_ns +
+        @as(i64, retransmit_timeout_ms) * std.time.ns_per_ms;
 
     // Loop: receive server messages, process, send responses.
     // A single UDP datagram may contain multiple DTLS records (a flight),
     // so we iterate through all records in each received datagram.
     var pt_buf: [512]u8 = undefined;
     while (client.dtls_client_hs_state != .complete) {
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
         if (now >= deadline_ns) return error.Timeout;
 
         // Retransmit last flight if timer expired.
@@ -567,7 +572,7 @@ pub fn handshake(client: *Client) !void {
                 return error.Timeout;
             client.sendDirect(last_flight) catch {};
             retransmit_timeout_ms = @min(retransmit_timeout_ms * 2, constants.dtls_retransmit_max_ms);
-            retransmit_deadline_ns = now + @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+            retransmit_deadline_ns = now + @as(i64, retransmit_timeout_ms) * std.time.ns_per_ms;
             continue;
         }
 
@@ -623,8 +628,8 @@ pub fn handshake(client: *Client) !void {
                     try client.sendDirect(sdata);
                     // Reset retransmit timer on new flight.
                     retransmit_timeout_ms = constants.dtls_retransmit_initial_ms;
-                    retransmit_deadline_ns = std.time.nanoTimestamp() +
-                        @as(i128, retransmit_timeout_ms) * std.time.ns_per_ms;
+                    retransmit_deadline_ns = nanoTimestamp() +
+                        @as(i64, retransmit_timeout_ms) * std.time.ns_per_ms;
                 },
                 .established => {
                     // Cache session for resumption.
@@ -781,7 +786,7 @@ pub fn submit(
 
     const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
     slot.timeout_ns = initial_timeout;
-    slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
+    slot.next_retransmit_ns = nanoTimestamp() + @as(i64, @intCast(initial_timeout));
 
     client.insertTable(slot_idx, client.tokenKey(token));
 
@@ -811,8 +816,8 @@ pub fn poll(
     if (client.count_active == 0) return null;
 
     // Check retransmissions for all active slots.
-    const now = std.time.nanoTimestamp();
-    var earliest_retransmit: i128 = now + 50 * std.time.ns_per_ms;
+    const now = nanoTimestamp();
+    var earliest_retransmit: i64 = now + 50 * std.time.ns_per_ms;
     for (client.slots, 0..) |*slot, i| {
         if (slot.state != .pending) continue;
         if (now >= slot.next_retransmit_ns) {
@@ -826,7 +831,7 @@ pub fn poll(
             client.sendCoap(wire) catch {};
             slot.retransmit_count += 1;
             slot.timeout_ns *= 2;
-            slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
+            slot.next_retransmit_ns = now + @as(i64, @intCast(slot.timeout_ns));
         }
         if (slot.next_retransmit_ns < earliest_retransmit) {
             earliest_retransmit = slot.next_retransmit_ns;
@@ -836,7 +841,7 @@ pub fn poll(
     // Compute effective timeout: min of caller's timeout and next retransmit.
     const effective_timeout: i32 = blk: {
         if (timeout_ms == 0) break :blk 0;
-        const retransmit_ms: i128 = @divTrunc(earliest_retransmit - now, std.time.ns_per_ms);
+        const retransmit_ms: i64 = @divTrunc(earliest_retransmit - now, std.time.ns_per_ms);
         break :blk @intCast(@max(1, @min(timeout_ms, retransmit_ms)));
     };
 
@@ -1077,11 +1082,11 @@ pub fn recvRaw(
     allocator: std.mem.Allocator,
     timeout_ms: u32,
 ) !?coapz.Packet {
-    const deadline = std.time.nanoTimestamp() +
-        @as(i128, timeout_ms) * std.time.ns_per_ms;
+    const deadline = nanoTimestamp() +
+        @as(i64, timeout_ms) * std.time.ns_per_ms;
 
     while (true) {
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
         if (now >= deadline) return null;
 
         const remaining_ms: i32 = @intCast(@max(1, @divTrunc(deadline - now, std.time.ns_per_ms)));
@@ -1171,7 +1176,7 @@ pub fn observe(
 
     const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
     slot.timeout_ns = initial_timeout;
-    slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
+    slot.next_retransmit_ns = nanoTimestamp() + @as(i64, @intCast(initial_timeout));
 
     client.insertTable(slot_idx, client.tokenKey(token));
     errdefer {
@@ -1452,7 +1457,7 @@ fn waitForResponse(
 
     while (true) {
         const slot = &client.slots[slot_idx];
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
 
         // Check retransmission timeout.
         if (slot.state == .pending and now >= slot.next_retransmit_ns) {
@@ -1464,7 +1469,7 @@ fn waitForResponse(
             client.sendCoap(wire) catch {};
             slot.retransmit_count += 1;
             slot.timeout_ns *= 2;
-            slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
+            slot.next_retransmit_ns = now + @as(i64, @intCast(slot.timeout_ns));
         }
 
         // Wait until next retransmit deadline or a short poll interval.
@@ -1614,7 +1619,7 @@ fn sendBlock2Request(
 
     const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
     new_slot.timeout_ns = initial_timeout;
-    new_slot.next_retransmit_ns = std.time.nanoTimestamp() + @as(i128, initial_timeout);
+    new_slot.next_retransmit_ns = nanoTimestamp() + @as(i64, @intCast(initial_timeout));
 
     client.insertTable(new_slot_idx, client.tokenKey(token));
     errdefer client.freeSlotAndTable(new_slot_idx);
@@ -1629,7 +1634,7 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
     const slot = &client.slots[slot_idx];
 
     while (true) {
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
 
         if (now >= slot.next_retransmit_ns) {
             if (slot.retransmit_count >= constants.max_retransmit) {
@@ -1640,7 +1645,7 @@ fn waitForAck(client: *Client, slot_idx: u16) !void {
             client.sendCoap(wire) catch {};
             slot.retransmit_count += 1;
             slot.timeout_ns *= 2;
-            slot.next_retransmit_ns = now + @as(i128, slot.timeout_ns);
+            slot.next_retransmit_ns = now + @as(i64, @intCast(slot.timeout_ns));
         }
 
         const retransmit_remaining_ns = slot.next_retransmit_ns - now;
@@ -2020,9 +2025,9 @@ test "submit returns handle without blocking" {
     });
     defer client.deinit();
 
-    const start = std.time.nanoTimestamp();
+    const start = nanoTimestamp();
     const handle = try client.submit(.get, &.{}, "hello");
-    const elapsed_us = @divTrunc(std.time.nanoTimestamp() - start, std.time.ns_per_us);
+    const elapsed_us = @divTrunc(nanoTimestamp() - start, std.time.ns_per_us);
 
     try testing.expect(elapsed_us < 5000);
     try testing.expect(handle < 4);
