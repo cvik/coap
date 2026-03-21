@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.2] - 2026-03-21
+- Fix: Block1 reassembled body now reaches handler (#81)
+- Fix: Observe notifications use correct per-observer token (#82)
+- Fix: DTLS deferred/observe responses sent encrypted (#83)
+- Fix: DTLS path handles Block1/Block2/Size1 (#84)
+- Fix: Client Block2 reassembly checks ETag consistency (#86)
+- Feat: CON observe notifications with configurable interval and retransmit (#87)
+- Client i128 timestamps narrowed to i64 (#88)
+- Shared block helpers: `handleBlock2Followup`, `checkSize1`, `blockifyResponse`
+- `Result.valid()` accessor for checking response status
+- README: RFC 9175 claim downgraded to Partial; expanded Observe documentation
+
 ## [0.7.1] - 2026-03-20
 - Fix: `response_buf` bounds check (#53)
 - Fix: `makeContinueResponse` returns 5.00 on OOM instead of null (#54)
