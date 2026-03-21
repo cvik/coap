@@ -445,6 +445,47 @@ test "DTLS: deferred response is encrypted" {
     try testing.expectEqualSlices(u8, "deferred-result", r.payload);
 }
 
+test "DTLS: Block1 upload delivers reassembled body" {
+    const port: u16 = 19773;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_block_transfers = 8,
+        .max_block_payload = 8192,
+        .psk = test_psk,
+    }, block1BodyHandler);
+    defer server.deinit();
+    try server.listen();
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .psk = test_psk,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    try client.handshake();
+    try testing.expectEqual(.established, client.dtls_session.?.state);
+
+    const payload = [_]u8{0x42} ** 2048;
+    var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
+    block1_received_len = 0;
+    const result = try client.upload(testing.allocator, .put, &path_buf, &payload);
+    defer result.deinit(testing.allocator);
+
+    try testing.expectEqual(.changed, result.code);
+    try testing.expectEqual(@as(usize, 2048), block1_received_len);
+}
+
 test "DTLS: NON cast over encrypted channel" {
     const port: u16 = 19755;
 

@@ -1020,49 +1020,16 @@ fn handle_recv(
 
     // Block2 follow-up: serve next block from cached transfer (skip handler).
     if (server.block_transfers) |*bt| {
-        if (packet.find_option(.block2)) |opt| {
-            if (opt.as_block()) |bv| {
-                if (bv.num > 0) {
-                    if (bt.findByToken(packet.token, recv.peer_address, &.{})) |bt_idx| {
-                        const block = bt.serveBlock2(bt_idx, bv.num, bv.szx);
-                        // Read payload_length before release (#45).
-                        const total_payload_len = bt.slots[bt_idx].payload_length;
-                        if (!block.more) bt.release(bt_idx);
-                        var b2_buf: [3]u8 = undefined;
-                        const b2_opt = (coapz.BlockValue{
-                            .num = bv.num,
-                            .more = block.more,
-                            .szx = bv.szx,
-                        }).option(.block2, &b2_buf);
-                        var sz2_buf: [4]u8 = undefined;
-                        const sz2_opt = coapz.Option.uint(.size2, total_payload_len, &sz2_buf);
-                        const opts = arena.dupe(coapz.Option, &.{ b2_opt, sz2_opt }) catch return;
-                        const resp = handler.Response{
-                            .code = .content,
-                            .options = opts,
-                            .payload = block.data,
-                        };
-                        server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
-                        return;
-                    }
-                }
-            }
+        if (handleBlock2Followup(bt, packet, recv.peer_address, arena)) |resp| {
+            server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
+            return;
         }
     }
 
     // Size1 check: reject requests that declare a body larger than max_block_payload.
-    if (packet.find_option(.size1)) |size1_opt| {
-        if (size1_opt.as_uint()) |declared_size| {
-            const max = if (server.block_transfers != null)
-                server.config.max_block_payload
-            else
-                server.config.buffer_size;
-            if (declared_size > max) {
-                const resp = handler.Response.withCode(.request_entity_too_large);
-                server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
-                return;
-            }
-        }
+    if (checkSize1(packet, server.block_transfers != null, server.config)) |resp| {
+        server.sendResponse(resp, packet, recv.peer_address, is_con, addr_key, &raw_header, index) catch return;
+        return;
     }
 
     // Block1 upload: reassemble fragments, call handler only on final block.
@@ -1122,31 +1089,10 @@ fn handle_recv(
 
     if (maybe_response) |response_raw| {
         // Block2 initiation: if response payload exceeds block size, start transfer.
-        const response = if (server.block_transfers) |*bt| blk: {
-            const default_szx: u3 = 6; // 1024 bytes
-            const block_size: u32 = @as(u32, 1) << (@as(u5, default_szx) + 4);
-            if (response_raw.payload.len > block_size) {
-                if (bt.allocate(packet.token, recv.peer_address, .block2_serving, default_szx, server.tick_now_ns, &.{})) |bt_idx| {
-                    bt.storeBlock2Payload(bt_idx, response_raw.payload);
-                    const block = bt.serveBlock2(bt_idx, 0, default_szx);
-                    var b2_buf: [3]u8 = undefined;
-                    const b2_opt = (coapz.BlockValue{
-                        .num = 0,
-                        .more = block.more,
-                        .szx = default_szx,
-                    }).option(.block2, &b2_buf);
-                    var sz2_buf: [4]u8 = undefined;
-                    const sz2_opt = coapz.Option.uint(.size2, @intCast(response_raw.payload.len), &sz2_buf);
-                    const opts = arena.dupe(coapz.Option, &.{ b2_opt, sz2_opt }) catch break :blk response_raw;
-                    break :blk handler.Response{
-                        .code = response_raw.code,
-                        .options = opts,
-                        .payload = block.data,
-                    };
-                }
-            }
-            break :blk response_raw;
-        } else response_raw;
+        const response = if (server.block_transfers) |*bt|
+            blockifyResponse(bt, response_raw, packet, recv.peer_address, arena, server.tick_now_ns)
+        else
+            response_raw;
 
         const response_kind: coapz.MessageKind = if (is_con)
             .acknowledgement
@@ -1592,13 +1538,49 @@ fn process_dtls_coap(
         };
     }
 
-    const request = handler.Request{
+    // Block2 follow-up (skip handler).
+    if (server.block_transfers) |*bt| {
+        if (handleBlock2Followup(bt, packet, peer, arena)) |resp| {
+            server.sendDtlsResponse(session, resp, packet, peer, is_con, addr_key, index);
+            return;
+        }
+    }
+
+    // Size1 check.
+    if (checkSize1(packet, server.block_transfers != null, server.config)) |resp| {
+        server.sendDtlsResponse(session, resp, packet, peer, is_con, addr_key, index);
+        return;
+    }
+
+    // Block1 reassembly.
+    var request = handler.Request{
         .packet = packet,
         .peer_address = peer,
         .arena = arena,
         .is_secure = true,
         .defer_ctx = dtls_defer_ctx,
         .observe_ctx = if (dtls_observe_ctx) |*ctx| ctx.* else null,
+    };
+
+    var block1_slot: ?u16 = null;
+    if (server.block_transfers) |*bt| {
+        if (packet.find_option(.block1)) |opt| {
+            if (opt.as_block()) |bv| {
+                if (server.handleBlock1(bt, bv, packet, peer, arena)) |b1| switch (b1) {
+                    .response => |resp| {
+                        server.sendDtlsResponse(session, resp, packet, peer, is_con, addr_key, index);
+                        return;
+                    },
+                    .complete => |bt_idx| {
+                        request.payload_override = bt.payloadSlice(bt_idx);
+                        block1_slot = bt_idx;
+                    },
+                };
+            }
+        }
+    }
+    defer if (block1_slot) |idx| {
+        if (server.block_transfers) |*bt| bt.release(idx);
     };
 
     const maybe_response = blk: {
@@ -1626,7 +1608,13 @@ fn process_dtls_coap(
         break :blk result;
     };
 
-    if (maybe_response) |response| {
+    if (maybe_response) |response_raw| {
+        // Block2 initiation.
+        const response = if (server.block_transfers) |*bt|
+            blockifyResponse(bt, response_raw, packet, peer, arena, server.tick_now_ns)
+        else
+            response_raw;
+
         const response_kind: coapz.MessageKind = if (is_con)
             .acknowledgement
         else
@@ -1683,6 +1671,42 @@ fn process_dtls_coap(
                 _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
             } else {
                 log.warn("exchange pool full ({d} active), cannot cache DTLS response", .{server.exchanges.count_active});
+            }
+        }
+    }
+}
+
+/// Send a handler response over DTLS, cache for CON dedup.
+fn sendDtlsResponse(
+    server: *Server,
+    session: *dtls.Session.Session,
+    response: handler.Response,
+    packet: coapz.Packet,
+    peer: std.net.Address,
+    is_con: bool,
+    addr_key: u32,
+    index: usize,
+) void {
+    const response_packet = coapz.Packet{
+        .kind = if (is_con) .acknowledgement else .non_confirmable,
+        .code = response.code,
+        .msg_id = if (is_con) packet.msg_id else server.nextMsgId(),
+        .token = packet.token,
+        .options = response.options,
+        .payload = response.payload,
+        .data_buf = &.{},
+    };
+    const wire = server.send_dtls_packet(session, response_packet, peer, index) catch |err| {
+        log.warn("DTLS response send failed: {}", .{err});
+        return;
+    };
+    if (is_con) {
+        const key = Exchange.peerKey(peer, packet.msg_id);
+        if (server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns) == null) {
+            const evicted = server.exchanges.evictExpired(server.tick_now_ns, server.exchange_lifetime_ms);
+            if (evicted > 0) {
+                server.last_eviction_ns = server.tick_now_ns;
+                _ = server.exchanges.insert(key, addr_key, packet.msg_id, wire, server.tick_now_ns);
             }
         }
     }
@@ -1893,6 +1917,101 @@ fn makeContinueResponse(bv: coapz.BlockValue, arena: std.mem.Allocator) ?handler
     return .{
         .code = .@"continue",
         .options = opts,
+    };
+}
+
+/// Handle a Block2 follow-up request (num > 0). Returns the block response
+/// if this is a valid follow-up, or null if not a follow-up.
+fn handleBlock2Followup(
+    bt: *BlockTransfer,
+    packet: coapz.Packet,
+    peer: std.net.Address,
+    arena: std.mem.Allocator,
+) ?handler.Response {
+    const opt = packet.find_option(.block2) orelse return null;
+    const bv = opt.as_block() orelse return null;
+    if (bv.num == 0) return null;
+    const bt_idx = bt.findByToken(packet.token, peer, &.{}) orelse return null;
+
+    const block = bt.serveBlock2(bt_idx, bv.num, bv.szx);
+    const total_payload_len = bt.slots[bt_idx].payload_length;
+    if (!block.more) bt.release(bt_idx);
+
+    var b2_buf: [3]u8 = undefined;
+    const b2_opt = (coapz.BlockValue{
+        .num = bv.num,
+        .more = block.more,
+        .szx = bv.szx,
+    }).option(.block2, &b2_buf);
+    var sz2_buf: [4]u8 = undefined;
+    const sz2_opt = coapz.Option.uint(.size2, total_payload_len, &sz2_buf);
+    const b2_val = arena.dupe(u8, b2_opt.value) catch return null;
+    const sz2_val = arena.dupe(u8, sz2_opt.value) catch return null;
+    const opts = arena.dupe(coapz.Option, &.{
+        .{ .kind = b2_opt.kind, .value = b2_val },
+        .{ .kind = sz2_opt.kind, .value = sz2_val },
+    }) catch return null;
+
+    return .{
+        .code = .content,
+        .options = opts,
+        .payload = block.data,
+    };
+}
+
+/// Check Size1 option; returns 4.13 response if declared size exceeds limit.
+fn checkSize1(
+    packet: coapz.Packet,
+    has_block_transfers: bool,
+    config: Config,
+) ?handler.Response {
+    const size1_opt = packet.find_option(.size1) orelse return null;
+    const declared_size = size1_opt.as_uint() orelse return null;
+    const max = if (has_block_transfers)
+        config.max_block_payload
+    else
+        config.buffer_size;
+    if (declared_size > max) {
+        return handler.Response.withCode(.request_entity_too_large);
+    }
+    return null;
+}
+
+/// If response payload exceeds block size, initiate Block2 transfer.
+fn blockifyResponse(
+    bt: *BlockTransfer,
+    response: handler.Response,
+    packet: coapz.Packet,
+    peer: std.net.Address,
+    arena: std.mem.Allocator,
+    now_ns: i64,
+) handler.Response {
+    const default_szx: u3 = 6;
+    const block_size: u32 = @as(u32, 1) << (@as(u5, default_szx) + 4);
+    if (response.payload.len <= block_size) return response;
+
+    const bt_idx = bt.allocate(packet.token, peer, .block2_serving, default_szx, now_ns, &.{}) orelse
+        return response;
+    bt.storeBlock2Payload(bt_idx, response.payload);
+    const block = bt.serveBlock2(bt_idx, 0, default_szx);
+    var b2_buf: [3]u8 = undefined;
+    const b2_opt = (coapz.BlockValue{
+        .num = 0,
+        .more = block.more,
+        .szx = default_szx,
+    }).option(.block2, &b2_buf);
+    var sz2_buf: [4]u8 = undefined;
+    const sz2_opt = coapz.Option.uint(.size2, @intCast(response.payload.len), &sz2_buf);
+    const b2_val = arena.dupe(u8, b2_opt.value) catch return response;
+    const sz2_val = arena.dupe(u8, sz2_opt.value) catch return response;
+    const opts = arena.dupe(coapz.Option, &.{
+        .{ .kind = b2_opt.kind, .value = b2_val },
+        .{ .kind = sz2_opt.kind, .value = sz2_val },
+    }) catch return response;
+    return .{
+        .code = response.code,
+        .options = opts,
+        .payload = block.data,
     };
 }
 
