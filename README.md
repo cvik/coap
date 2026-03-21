@@ -549,6 +549,16 @@ Set `observe_con_interval = 0` to disable CON notifications entirely
 - If the server sends a RST to any notification, the subscription is cancelled.
 - `stream.next()` returns `null` when cancelled.
 
+**Server-side cancellation:**
+
+To tell clients a resource is gone (sensor disconnected, resource deleted),
+send a non-2.xx notification. Per RFC 7641 §3.2, clients must deregister
+on error codes:
+
+```zig
+server.notify(temp_rid, coap.Response.notFound());  // 4.04 — resource gone
+```
+
 **Server-side observer eviction:**
 
 Observers are removed when:
