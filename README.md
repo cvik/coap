@@ -12,7 +12,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 
 ### RFC compliance
 
-Full compliance with the core CoAP protocol stack:
+RFC compliance:
 
 | RFC | Feature | Coverage |
 |-----|---------|----------|
@@ -20,9 +20,13 @@ Full compliance with the core CoAP protocol stack:
 | [7641](https://datatracker.ietf.org/doc/html/rfc7641) | Observe (client subscribe + server push) | Full |
 | [7959](https://datatracker.ietf.org/doc/html/rfc7959) | Block-wise transfers (client + server) | Full |
 | [6347](https://datatracker.ietf.org/doc/html/rfc6347) | DTLS 1.2 (PSK, flight retransmit) | Full |
-| [9175](https://datatracker.ietf.org/doc/html/rfc9175) | Echo option, Request-Tag | Full |
+| [9175](https://datatracker.ietf.org/doc/html/rfc9175) | Echo option, Request-Tag | Partial |
 | [6690](https://datatracker.ietf.org/doc/html/rfc6690) | .well-known/core discovery | Full |
 | [4279](https://datatracker.ietf.org/doc/html/rfc4279) | PSK key exchange | Full |
+
+RFC 9175: server-side Echo response and Block1 Request-Tag disambiguation
+are implemented. Client-side automatic Echo retry on 4.01 and client
+Request-Tag on Block1 uploads are not yet implemented.
 
 See the [protocol compliance roadmap](docs/ROADMAP.md) for planned features.
 
