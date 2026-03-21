@@ -82,12 +82,18 @@ pub const Result = struct {
     _owns_options: bool = false,
     _timeout: bool = false,
     _reset: bool = false,
+    _etag_mismatch: bool = false,
+
+    /// True if response is a normal server reply (not timeout, reset, or error).
+    pub fn valid(self: Result) bool {
+        return !self._timeout and !self._reset and !self._etag_mismatch;
+    }
 
     /// Free all memory associated with this result. Must be called with
     /// the same allocator that was passed to `call`/`get`/`post`/etc.
     /// Safe to call on timeout/reset sentinel results (no-op).
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
-        if (self._timeout or self._reset) return;
+        if (self._timeout or self._reset or self._etag_mismatch) return;
         if (self._owns_payload) {
             allocator.free(@constCast(self.payload));
         }
@@ -130,6 +136,8 @@ const InFlightSlot = struct {
     // Async Block2 reassembly state.
     block2_payload: std.ArrayListUnmanaged(u8),
     doing_block2: bool,
+    block2_etag: [8]u8,
+    block2_etag_len: u4,
     original_code: coapz.Code,
     original_options_buf: [16]coapz.Option,
     original_options_len: u5,
@@ -429,6 +437,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
                 empty_sentinel,
             .block2_payload = .empty,
             .doing_block2 = false,
+            .block2_etag = undefined,
+            .block2_etag_len = 0,
             .original_code = .empty,
             .original_options_buf = undefined,
             .original_options_len = 0,
@@ -882,6 +892,16 @@ pub fn poll(
     var blk2_it = response.find_options(.block2);
     if (blk2_it.next()) |blk2_opt| {
         if (blk2_opt.as_block()) |blk2| {
+            // ETag consistency check (RFC 7959 §2.4).
+            if (!checkBlock2Etag(slot, response)) {
+                slot.block2_payload.deinit(allocator);
+                slot.block2_payload = .empty;
+                slot.doing_block2 = false;
+                const orig_handle = slot.original_handle;
+                response.deinit(allocator);
+                client.freeSlotAndTable(slot_idx);
+                return .{ .handle = orig_handle, .result = etagMismatchResult() };
+            }
             if (blk2.more) {
                 slot.block2_payload.appendSlice(allocator, response.payload) catch {
                     response.deinit(allocator);
@@ -920,6 +940,8 @@ pub fn poll(
                 const new_slot = &client.slots[new_idx];
                 new_slot.block2_payload = saved_b2;
                 new_slot.doing_block2 = true;
+                new_slot.block2_etag = slot.block2_etag;
+                new_slot.block2_etag_len = slot.block2_etag_len;
                 new_slot.original_code = saved_code;
                 @memcpy(new_slot.original_options_buf[0..saved_olen], saved_opts[0..saved_olen]);
                 new_slot.original_options_len = saved_olen;
@@ -1027,6 +1049,24 @@ fn resetResult() Result {
             .data_buf = &.{},
         },
         ._reset = true,
+    };
+}
+
+fn etagMismatchResult() Result {
+    return .{
+        .code = .empty,
+        .options = &.{},
+        .payload = &.{},
+        .packet = .{
+            .kind = .reset,
+            .code = .empty,
+            .msg_id = 0,
+            .token = &.{},
+            .options = &.{},
+            .payload = &.{},
+            .data_buf = &.{},
+        },
+        ._etag_mismatch = true,
     };
 }
 
@@ -1506,6 +1546,13 @@ fn waitForResponse(
         var blk2_it = response.find_options(.block2);
         if (blk2_it.next()) |blk2_opt| {
             if (blk2_opt.as_block()) |blk2| {
+                // ETag consistency check (RFC 7959 §2.4).
+                slot.doing_block2 = doing_block2;
+                if (!checkBlock2Etag(slot, response)) {
+                    response.deinit(allocator);
+                    client.freeSlotAndTable(slot_idx);
+                    return error.EtagMismatch;
+                }
                 if (blk2.more) {
                     try assembled_payload.appendSlice(allocator, response.payload);
                     doing_block2 = true;
@@ -1806,6 +1853,30 @@ fn makeToken(client: *Client, buf: *[8]u8) []const u8 {
         buf[i] = @intCast((val >> (@as(u6, i) * 8)) & 0xFF);
     }
     return buf[0..len];
+}
+
+/// Check Block2 ETag consistency (RFC 7959 §2.4). On first block, captures
+/// the ETag into the slot. On subsequent blocks, compares and returns false
+/// on mismatch. Returns true if no ETag present or ETag matches.
+fn checkBlock2Etag(slot: *InFlightSlot, response: coapz.Packet) bool {
+    const etag_opt = response.find_option(.etag) orelse {
+        // No ETag — nothing to check. Clear any stored ETag.
+        if (!slot.doing_block2) slot.block2_etag_len = 0;
+        return true;
+    };
+    if (etag_opt.value.len > 8) return false;
+    const len: u4 = @intCast(etag_opt.value.len);
+
+    if (!slot.doing_block2) {
+        // First block — capture ETag.
+        @memcpy(slot.block2_etag[0..len], etag_opt.value);
+        slot.block2_etag_len = len;
+        return true;
+    }
+
+    // Subsequent block — compare.
+    if (slot.block2_etag_len != len) return false;
+    return std.mem.eql(u8, slot.block2_etag[0..len], etag_opt.value);
 }
 
 fn randomizedTimeout(client: *Client, base_ms: u32) u64 {
@@ -2181,4 +2252,53 @@ test "NSTART: call confirms peer, subsequent submits work" {
     _ = try client.submit(.get, &.{}, "a");
     _ = try client.submit(.get, &.{}, "b");
     _ = try client.submit(.get, &.{}, "c");
+}
+
+test "checkBlock2Etag captures and compares" {
+    var slot: InFlightSlot = .{
+        .state = .free,
+        .token = undefined,
+        .token_len = 0,
+        .msg_id = 0,
+        .retransmit_count = 0,
+        .next_retransmit_ns = 0,
+        .timeout_ns = 0,
+        .send_offset = 0,
+        .send_len = 0,
+        .next_free = 0xFFFF,
+        .block2_payload = .empty,
+        .doing_block2 = false,
+        .block2_etag = undefined,
+        .block2_etag_len = 0,
+        .original_code = .empty,
+        .original_options_buf = undefined,
+        .original_options_len = 0,
+        .original_handle = 0,
+    };
+
+    // Build a fake packet with ETag option.
+    const etag_a = [_]u8{ 0xAA, 0xBB };
+    const etag_b = [_]u8{ 0xCC, 0xDD };
+    var opt_a = [1]coapz.Option{.{ .kind = .etag, .value = &etag_a }};
+    var opt_b = [1]coapz.Option{.{ .kind = .etag, .value = &etag_b }};
+    const pkt_a = coapz.Packet{
+        .kind = .acknowledgement, .code = .content, .msg_id = 0,
+        .token = &.{}, .options = &opt_a, .payload = &.{}, .data_buf = &.{},
+    };
+    const pkt_b = coapz.Packet{
+        .kind = .acknowledgement, .code = .content, .msg_id = 0,
+        .token = &.{}, .options = &opt_b, .payload = &.{}, .data_buf = &.{},
+    };
+
+    // First block — captures ETag.
+    try testing.expect(checkBlock2Etag(&slot, pkt_a));
+    try testing.expectEqual(@as(u4, 2), slot.block2_etag_len);
+    try testing.expectEqualSlices(u8, &etag_a, slot.block2_etag[0..2]);
+
+    // Subsequent block — same ETag passes.
+    slot.doing_block2 = true;
+    try testing.expect(checkBlock2Etag(&slot, pkt_a));
+
+    // Different ETag fails.
+    try testing.expect(!checkBlock2Etag(&slot, pkt_b));
 }
