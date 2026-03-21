@@ -1966,19 +1966,34 @@ fn drainNotifications(server: *Server) void {
     var entries: [64]ObserverRegistry.NotifyEntry = undefined;
     const drained = reg.drainNotifyQueue(&entries);
 
+    const arena = server.arena.allocator();
+
     for (drained) |entry| {
-        if (entry.response_len == 0) continue; // encoding failed
+        if (entry.response_len == 0) continue;
         const notify_buf = reg.notifyBuf(entry.queue_slot);
-        const template = notify_buf[0..entry.response_len];
+        const meta_data = notify_buf[0..entry.response_len];
         const obs_list = reg.getObservers(entry.resource_id);
+
+        const meta = ObserverRegistry.decodeNotifyMeta(meta_data, arena) orelse continue;
+
+        // Observe option goes in slot 0.
+        var obs_val_buf: [4]u8 = undefined;
+        meta.options[0] = coapz.Option.uint(.observe, meta.obs_seq, &obs_val_buf);
 
         var sent: usize = 0;
         for (obs_list) |*obs| {
             if (!obs.active) continue;
-            // Patch token and msg_id in the template for each observer.
-            // For simplicity, send the template as-is (token=placeholder).
-            // TODO: per-observer token patching for correctness.
-            server.send_data(template, obs.peer_address, sent % batch) catch continue;
+            const pkt = coapz.Packet{
+                .kind = .non_confirmable,
+                .code = meta.code,
+                .msg_id = server.nextMsgId(),
+                .token = obs.token[0..obs.token_len],
+                .options = meta.options,
+                .payload = meta.payload,
+                .data_buf = &.{},
+            };
+            const buf_idx = sent % batch;
+            _ = server.send_packet(pkt, obs.peer_address, buf_idx) catch continue;
             sent += 1;
         }
     }
