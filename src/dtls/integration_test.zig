@@ -363,6 +363,88 @@ test "Observe: notification carries correct client token" {
     try testing.expectEqualSlices(u8, expected_token, notif.packet.token);
 }
 
+const Deferred = @import("../deferred.zig");
+
+var dtls_deferred_handle: ?Deferred.DeferredResponse = null;
+var dtls_deferred_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn dtlsDeferHandler(request: handler.Request) ?handler.Response {
+    dtls_deferred_handle = request.deferResponse();
+    dtls_deferred_ready.store(true, .release);
+    return null; // server sends empty ACK
+}
+
+test "DTLS: deferred response is encrypted" {
+    const port: u16 = 19772;
+
+    var server = try Server.init(testing.allocator, .{
+        .port = port,
+        .buffer_count = 16,
+        .buffer_size = 1280,
+        .exchange_count = 16,
+        .rate_limit_ip_count = 0,
+        .max_deferred = 8,
+        .psk = test_psk,
+    }, dtlsDeferHandler);
+    defer server.deinit();
+    try server.listen();
+
+    dtls_deferred_ready.store(false, .release);
+    dtls_deferred_handle = null;
+
+    var runner = ServerRunner{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(server_thread);
+
+    var client = try Client.init(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .psk = test_psk,
+        .max_in_flight = 4,
+    });
+    defer client.deinit();
+
+    try client.handshake();
+    try testing.expectEqual(.established, client.dtls_session.?.state);
+
+    // Submit CON POST — handler defers.
+    const handle = try client.submit(.post, &.{coapz.Option{ .kind = .uri_path, .value = "deferred" }}, "request");
+
+    // Wait for handler to capture the deferred handle.
+    var attempts: u32 = 0;
+    while (!dtls_deferred_ready.load(.acquire)) : (attempts += 1) {
+        if (attempts > 200) return error.Timeout;
+        _ = client.poll(testing.allocator, 10) catch {};
+    }
+
+    // Deliver deferred response.
+    if (dtls_deferred_handle) |h| {
+        h.respond(handler.Response{
+            .code = .content,
+            .payload = "deferred-result",
+            .options = &.{},
+        });
+    } else return error.NoDeferredHandle;
+
+    // Client should receive the encrypted deferred response.
+    // If sent as plaintext (#83), client won't parse it (expects DTLS records).
+    var result: ?Client.Result = null;
+    for (0..100) |_| {
+        if (client.poll(testing.allocator, 20) catch null) |completion| {
+            if (completion.handle == handle) {
+                result = completion.result;
+                break;
+            }
+            completion.result.deinit(testing.allocator);
+        }
+    }
+    const r = result orelse return error.Timeout;
+    defer r.deinit(testing.allocator);
+
+    try testing.expectEqual(.content, r.code);
+    try testing.expectEqualSlices(u8, "deferred-result", r.payload);
+}
+
 test "DTLS: NON cast over encrypted channel" {
     const port: u16 = 19755;
 

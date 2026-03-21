@@ -1750,6 +1750,30 @@ fn send_dtls_alert(
     server.send_data(record, peer, index) catch {};
 }
 
+/// Send pre-encoded CoAP data, encrypting if the peer has a DTLS session.
+fn sendMaybeEncrypted(server: *Server, data: []const u8, peer: std.net.Address, index: usize) !void {
+    if (server.dtls_sessions) |tbl| {
+        if (tbl.lookup(peer)) |session| {
+            const buf = server.response_buf(index);
+            const overhead = dtls.types.record_overhead;
+            if (buf.len <= overhead or data.len > buf.len - overhead) return error.BufferTooSmall;
+            const dest = buf[overhead..][0..data.len];
+            @memcpy(dest, data);
+            const encrypted = dtls.Record.encodeEncrypted(
+                .application_data,
+                dest,
+                session.server_write_key,
+                session.server_write_iv,
+                session.write_epoch,
+                &session.write_sequence,
+                buf,
+            );
+            return server.send_raw(encrypted, peer, index);
+        }
+    }
+    return server.send_data(data, peer, index);
+}
+
 /// Send a pre-allocated empty ACK when OOM prevents normal response.
 /// Extracts msg_id from raw CoAP header bytes (first 4 bytes of payload).
 fn send_emergency_ack(
@@ -1993,6 +2017,13 @@ fn drainNotifications(server: *Server) void {
                 .data_buf = &.{},
             };
             const buf_idx = sent % batch;
+            if (server.dtls_sessions) |tbl| {
+                if (tbl.lookup(obs.peer_address)) |session| {
+                    _ = server.send_dtls_packet(session, pkt, obs.peer_address, buf_idx) catch continue;
+                    sent += 1;
+                    continue;
+                }
+            }
             _ = server.send_packet(pkt, obs.peer_address, buf_idx) catch continue;
             sent += 1;
         }
@@ -2011,7 +2042,7 @@ fn drainDeferred(server: *Server) void {
     for (drained) |slot_idx| {
         const slot = &pool.slots[slot_idx];
         const data = pool.responseBuf(slot_idx)[0..slot.response_length];
-        server.send_data(data, slot.peer_address, @as(usize, slot_idx) % batch) catch {
+        server.sendMaybeEncrypted(data, slot.peer_address, @as(usize, slot_idx) % batch) catch {
             pool.release(slot_idx);
             continue;
         };
@@ -2033,7 +2064,7 @@ fn drainDeferred(server: *Server) void {
         }
 
         const data = pool.responseBuf(@intCast(i))[0..slot.response_length];
-        server.send_data(data, slot.peer_address, i % batch) catch continue;
+        server.sendMaybeEncrypted(data, slot.peer_address, i % batch) catch continue;
 
         const backoff: u5 = @intCast(@min(slot.retransmit_count, constants.max_retransmit));
         const timeout_ms: i64 = @as(i64, constants.ack_timeout_ms) << backoff;
