@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+- Require Zig 0.16.0; replace public peer addresses with `std.Io.net.IpAddress`
+- Retain the Linux io_uring backend with native-address conversion at syscall boundaries
+- Use monotonic clocks for protocol deadlines and timing
+- Update allocator examples, benchmark argument handling, OpenSSL process APIs and CI
+- Vectorize full-block CCM CBC-MAC XOR; add independent boundary test vectors
+- Add `--payload-only` benchmark filtering and document migration performance measurements
+
 ## [0.7.2] - 2026-03-21
 - Fix: Block1 reassembled body now reaches handler (#81)
 - Fix: Observe notifications use correct per-observer token (#82)

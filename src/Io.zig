@@ -3,8 +3,9 @@
 /// Manages the ring, provided buffer pool, multishot recvmsg, and
 /// sendmsg operations. All buffers are allocated upfront at init.
 const std = @import("std");
+const platform = @import("platform.zig");
 const linux = std.os.linux;
-const posix = std.posix;
+const posix = platform;
 const Cqe = linux.io_uring_cqe;
 const constants = @import("constants.zig");
 
@@ -73,8 +74,8 @@ pub fn deinit(io: *Io, allocator: std.mem.Allocator) void {
 
 /// Bind a UDP socket and provide buffers to the kernel pool.
 pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
-    const address = try std.net.Address.parseIp(bind_address, port);
-    const family = address.any.family;
+    const address = try platform.parseIp(bind_address, port);
+    const family = platform.family(address);
 
     const fd = try posix.socket(family, posix.SOCK.DGRAM, 0);
     io.fd_socket = fd;
@@ -98,7 +99,7 @@ pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
         log.debug("SO_RCVBUF: {}", .{err});
     };
 
-    try posix.bind(fd, &address.any, address.getOsSockLen());
+    try posix.bind(fd, address);
 
     for (io.iovecs, 0..) |*iov, i| {
         iov.* = .{
@@ -181,7 +182,7 @@ pub fn release_buffer(io: *Io, buffer_id: u16) !void {
 
 /// Extract the peer address and payload from a recv CQE.
 pub const RecvResult = struct {
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     payload: []const u8,
     buffer_id: u16,
 };
@@ -205,12 +206,16 @@ pub fn decode_recv(io: *const Io, cqe: *const Cqe) !RecvResult {
     // Determine address family from the first 2 bytes of the name area.
     const peer_family = std.mem.readInt(u16, io.buffers[name_offset..][0..2], .little);
 
-    const net_address: std.net.Address = if (peer_family == posix.AF.INET)
-        .{ .in = .{ .sa = @as(*const linux.sockaddr.in, @ptrCast(@alignCast(io.buffers.ptr + name_offset))).* } }
-    else if (peer_family == posix.AF.INET6)
-        .{ .in6 = .{ .sa = @as(*const linux.sockaddr.in6, @ptrCast(@alignCast(io.buffers.ptr + name_offset))).* } }
-    else
-        return error.UnsupportedAddressFamily;
+    var peer: platform.SocketAddress = undefined;
+    const address_len: usize = switch (peer_family) {
+        posix.AF.INET => @sizeOf(linux.sockaddr.in),
+        posix.AF.INET6 => @sizeOf(linux.sockaddr.in6),
+        else => return error.UnsupportedAddressFamily,
+    };
+    if (recvmsg_out.namelen < address_len or name_offset + address_len > buffer_end)
+        return error.PayloadOutOfBounds;
+    @memcpy(std.mem.asBytes(&peer)[0..address_len], io.buffers[name_offset..][0..address_len]);
+    const net_address = try peer.address();
 
     return .{
         .peer_address = net_address,

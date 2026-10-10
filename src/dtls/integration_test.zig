@@ -1,6 +1,7 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const testing = std.testing;
-const posix = std.posix;
+const posix = platform;
 const linux = std.os.linux;
 
 const dtls = @import("dtls.zig");
@@ -30,11 +31,11 @@ const ServerRunner = struct {
         // Send a dummy packet to wake the server from blocking wait_cqes.
         const fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
         defer posix.close(fd);
-        const dest = std.net.Address.parseIp(
+        const dest = std.Io.net.IpAddress.parse(
             "127.0.0.1",
             self.server.config.port,
         ) catch return;
-        _ = posix.sendto(fd, &[_]u8{0}, 0, &dest.any, dest.getOsSockLen()) catch {};
+        _ = posix.sendto(fd, &[_]u8{0}, 0, dest) catch {};
         thread.join();
     }
 };
@@ -348,7 +349,7 @@ test "Observe: notification carries correct client token" {
     var next_ctx = NextCtx{ .stream = &stream };
     const next_thread = try std.Thread.spawn(.{}, NextCtx.run, .{&next_ctx});
 
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    platform.sleep(300 * std.time.ns_per_ms);
     stream.cancel() catch {};
     next_thread.join();
 
@@ -415,7 +416,7 @@ test "Observe: CON notification with ACK" {
     var next_ctx = NextCtx{ .stream = &stream };
     const next_thread = try std.Thread.spawn(.{}, NextCtx.run, .{&next_ctx});
 
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    platform.sleep(300 * std.time.ns_per_ms);
     stream.cancel() catch {};
     next_thread.join();
 

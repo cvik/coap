@@ -6,7 +6,7 @@
 /// complete payload. Block2: handler returns a full (large) payload,
 /// server serves blocks on demand as the client requests them.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
 const coapz = @import("coapz");
 
 const BlockTransfer = @This();
@@ -27,7 +27,7 @@ pub const Slot = struct {
     token_len: u8,
     request_tag: [8]u8,
     request_tag_len: u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     payload_length: u32,
     next_num: u32,
     szx: u3,
@@ -69,7 +69,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !BlockTransfer {
             .token_len = 0,
             .request_tag = .{0} ** 8,
             .request_tag_len = 0,
-            .peer_address = std.mem.zeroes(std.net.Address),
+            .peer_address = platform.ip4(.{ 0, 0, 0, 0 }, 0),
             .payload_length = 0,
             .next_num = 0,
             .szx = 0,
@@ -99,7 +99,7 @@ pub fn deinit(self: *BlockTransfer, allocator: std.mem.Allocator) void {
 pub fn allocate(
     self: *BlockTransfer,
     token: []const u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     kind: TransferKind,
     szx: u3,
     now_ns: i64,
@@ -149,7 +149,7 @@ pub fn release(self: *BlockTransfer, idx: u16) void {
 }
 
 /// Find an active transfer by token, peer address, and request tag.
-pub fn findByToken(self: *const BlockTransfer, token: []const u8, peer: std.net.Address, request_tag: []const u8) ?u16 {
+pub fn findByToken(self: *const BlockTransfer, token: []const u8, peer: std.Io.net.IpAddress, request_tag: []const u8) ?u16 {
     for (self.slots, 0..) |*slot, i| {
         if (slot.state != .active) continue;
         if (slot.token_len != token.len) continue;
@@ -165,7 +165,7 @@ pub fn findByToken(self: *const BlockTransfer, token: []const u8, peer: std.net.
 /// Find an active Block1 transfer by peer address and request-tag.
 /// Block1 subsequent blocks may use different tokens (RFC 7959 §2.5),
 /// so token matching is not used here.
-pub fn findBlock1ByPeer(self: *const BlockTransfer, peer: std.net.Address, request_tag: []const u8) ?u16 {
+pub fn findBlock1ByPeer(self: *const BlockTransfer, peer: std.Io.net.IpAddress, request_tag: []const u8) ?u16 {
     for (self.slots, 0..) |*slot, i| {
         if (slot.state != .active) continue;
         if (slot.kind != .block1_receiving) continue;
@@ -244,13 +244,8 @@ fn payloadBuf(self: *const BlockTransfer, idx: u16) []u8 {
     return self.payload_buffer[offset..][0..self.config.max_payload];
 }
 
-fn addrEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        posix.AF.INET => std.mem.eql(u8, std.mem.asBytes(&a.in), std.mem.asBytes(&b.in)),
-        posix.AF.INET6 => std.mem.eql(u8, std.mem.asBytes(&a.in6), std.mem.asBytes(&b.in6)),
-        else => false,
-    };
+fn addrEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    return platform.addressEqual(a, b);
 }
 
 // ── Tests ──
@@ -267,7 +262,7 @@ test "allocate and release" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 2, .max_payload = 1024 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
     try testing.expectEqual(@as(u16, 1), pool.count_active);
@@ -281,7 +276,7 @@ test "pool exhaustion" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 2, .max_payload = 256 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     try testing.expect(pool.allocate(&.{0x01}, addr, .block1_receiving, 6, 0, &.{}) != null);
     try testing.expect(pool.allocate(&.{0x02}, addr, .block1_receiving, 6, 0, &.{}) != null);
     try testing.expect(pool.allocate(&.{0x03}, addr, .block1_receiving, 6, 0, &.{}) == null);
@@ -291,8 +286,8 @@ test "findByToken" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 256 });
     defer pool.deinit(testing.allocator);
 
-    const addr1 = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const addr2 = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 5683);
+    const addr1 = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
+    const addr2 = platform.ip4(.{ 10, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{ 0xAA, 0xBB }, addr1, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -305,7 +300,7 @@ test "block1: reassemble three fragments" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 4096 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -324,7 +319,7 @@ test "block1: error on wrong block number" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 4096 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -336,7 +331,7 @@ test "block1: error on payload too large" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 100 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -348,7 +343,7 @@ test "block2: store payload and serve blocks" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 4096 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const payload = [_]u8{0x42} ** 2500;
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
@@ -375,7 +370,7 @@ test "block2: smaller SZX negotiation" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 4096 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const payload = [_]u8{0x42} ** 600;
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
@@ -400,7 +395,7 @@ test "block2: out of range block number" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 4096 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -418,7 +413,7 @@ test "block2: payload_length readable after release for Size2" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 1, .max_payload = 4096 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -449,7 +444,7 @@ test "evictExpired" {
     var pool = try BlockTransfer.init(testing.allocator, .{ .max_transfers = 4, .max_payload = 256 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     _ = pool.allocate(&.{0x01}, addr, .block1_receiving, 6, 1000, &.{});
     _ = pool.allocate(&.{0x02}, addr, .block1_receiving, 6, 5000, &.{});
 

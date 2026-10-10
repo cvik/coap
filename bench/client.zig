@@ -4,7 +4,8 @@
 /// sizes) and prints a compact summary table. Forks embedded echo servers
 /// as needed, grouped by (thread_count, use_dtls) to minimize restarts.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("coap").platform;
+const posix = platform;
 const coapz = @import("coapz");
 const coap = @import("coap");
 
@@ -24,6 +25,7 @@ const SuiteConfig = struct {
     embedded_server: bool = true,
     thread_count: u16 = 0, // 0 = nproc
     count_override: ?u32 = null,
+    payload_filter: ?u16 = null,
     filter_plain: bool = true,
     filter_dtls: bool = true,
     filter_con: bool = true,
@@ -83,12 +85,12 @@ const scenario_templates = [_]Scenario{
 
 // ── Main ───────────────────────────────────────────────────────────────
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const config = parse_args();
+    const config = parse_args(init.args);
     const cpu_count: u16 = if (config.thread_count > 0)
         config.thread_count
     else
@@ -97,6 +99,9 @@ pub fn main() !void {
     var scenarios: [scenario_templates.len]?Scenario = .{null} ** scenario_templates.len;
     var total: u16 = 0;
     for (scenario_templates, 0..) |tmpl, i| {
+        if (config.payload_filter) |size| {
+            if (tmpl.payload_size != size) continue;
+        }
         if (tmpl.use_dtls and !config.filter_dtls) continue;
         if (!tmpl.use_dtls and !config.filter_plain) continue;
         if (tmpl.use_confirmable and !config.filter_con) continue;
@@ -133,7 +138,8 @@ pub fn main() !void {
             .{
                 config.host,
                 config.port,
-                cpu_count, cpu_count,
+                cpu_count,
+                cpu_count,
                 config.window_size,
                 fmtInt(&warmup_buf, config.warmup_count),
                 count_str,
@@ -167,7 +173,7 @@ pub fn main() !void {
                 kill_server(&server_pid);
                 const psk: ?coap.Psk = if (s.use_dtls) bench_psk else null;
                 server_pid = try fork_server(port, srv_tc, psk, counters, config.bind_address);
-                std.Thread.sleep(150 * std.time.ns_per_ms);
+                platform.sleep(150 * std.time.ns_per_ms);
                 current_group = group;
             }
         }
@@ -297,7 +303,7 @@ fn run_scenario_plain_non(
     for (threads) |t| t.join();
 
     // Small drain delay so server processes remaining packets.
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    platform.sleep(50 * std.time.ns_per_ms);
 
     var total_errors: u64 = main_errors;
     for (send_errors[0..extra]) |e| total_errors += e;
@@ -376,7 +382,7 @@ fn run_scenario_plain_con(
         allocator.free(worker_results);
     }
 
-    const start = std.time.nanoTimestamp();
+    const start = platform.nanoTimestamp();
 
     for (0..extra) |j| {
         worker_results[j] = .{};
@@ -392,7 +398,7 @@ fn run_scenario_plain_con(
 
     for (threads) |t| t.join();
 
-    const elapsed_ns = std.time.nanoTimestamp() - start;
+    const elapsed_ns = platform.nanoTimestamp() - start;
     return aggregate_plain(allocator, worker_results, elapsed_ns);
 }
 
@@ -484,15 +490,22 @@ fn run_scenario_dtls(
     for (0..extra) |j| {
         worker_results[j] = .{};
         threads[j] = try std.Thread.spawn(.{}, dtls_worker, .{
-            allocator, config.host, port, window, s.payload_size,
-            s.use_confirmable, per_thread, config.warmup_count, &worker_results[j],
+            allocator,         config.host, port,                window,             s.payload_size,
+            s.use_confirmable, per_thread,  config.warmup_count, &worker_results[j],
         });
     }
 
     worker_results[extra] = .{};
     dtls_worker(
-        allocator, config.host, port, window, s.payload_size,
-        s.use_confirmable, per_thread + remainder, config.warmup_count, &worker_results[extra],
+        allocator,
+        config.host,
+        port,
+        window,
+        s.payload_size,
+        s.use_confirmable,
+        per_thread + remainder,
+        config.warmup_count,
+        &worker_results[extra],
     );
 
     for (threads) |t| t.join();
@@ -573,7 +586,7 @@ fn dtls_worker_con(
     var total_sent: u32 = 0;
     var in_flight: u16 = 0;
 
-    const bench_start = std.time.nanoTimestamp();
+    const bench_start = platform.nanoTimestamp();
 
     while (received + errors < count) {
         while (in_flight < window and total_sent < count) {
@@ -582,7 +595,7 @@ fn dtls_worker_con(
                 total_sent += 1;
                 continue;
             };
-            timestamps[handle] = std.time.nanoTimestamp();
+            timestamps[handle] = platform.nanoTimestamp();
             total_sent += 1;
             in_flight += 1;
             sent += 1;
@@ -609,7 +622,7 @@ fn dtls_worker_con(
 
         const ts = timestamps[completion.handle];
         if (ts > 0) {
-            const latency = std.time.nanoTimestamp() - ts;
+            const latency = platform.nanoTimestamp() - ts;
             if (latency_count < count) {
                 latencies[latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
                 latency_count += 1;
@@ -618,7 +631,7 @@ fn dtls_worker_con(
         }
     }
 
-    out.bench_elapsed_ns = std.time.nanoTimestamp() - bench_start;
+    out.bench_elapsed_ns = platform.nanoTimestamp() - bench_start;
     out.sent = sent;
     out.errors = errors;
     out.latencies = latencies;
@@ -634,7 +647,7 @@ fn dtls_worker_non(
     var sent: u64 = 0;
     var errors: u64 = 0;
 
-    const bench_start = std.time.nanoTimestamp();
+    const bench_start = platform.nanoTimestamp();
 
     for (0..count) |_| {
         client.cast(.get, &.{}, payload) catch {
@@ -644,7 +657,7 @@ fn dtls_worker_non(
         sent += 1;
     }
 
-    out.bench_elapsed_ns = std.time.nanoTimestamp() - bench_start;
+    out.bench_elapsed_ns = platform.nanoTimestamp() - bench_start;
     out.sent = sent;
     out.errors = errors;
 }
@@ -757,7 +770,7 @@ fn run_bench(
             send_buf[4] = id_hi;
             send_buf[5] = id_lo;
 
-            timestamps[msg_id % window] = std.time.nanoTimestamp();
+            timestamps[msg_id % window] = platform.nanoTimestamp();
 
             _ = posix.send(fd, send_buf[0..template.len], 0) catch {
                 result.errors += 1;
@@ -800,7 +813,7 @@ fn run_bench(
             const slot = token % window;
             const ts = timestamps[slot];
             if (ts > 0) {
-                const latency = std.time.nanoTimestamp() - ts;
+                const latency = platform.nanoTimestamp() - ts;
                 result.latency_sum_ns += latency;
                 if (latency < result.latency_min_ns) result.latency_min_ns = latency;
                 if (latency > result.latency_max_ns) result.latency_max_ns = latency;
@@ -818,10 +831,10 @@ fn run_bench(
 // ── Helpers ────────────────────────────────────────────────────────────
 
 fn make_client_socket(host: []const u8, port: u16) !posix.socket_t {
-    const dest = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM, 0);
+    const dest = try platform.parseIp(host, port);
+    const fd = try posix.socket(platform.family(dest), posix.SOCK.DGRAM, 0);
     errdefer posix.close(fd);
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    try posix.connect(fd, dest);
 
     const buf_size = std.mem.toBytes(@as(c_int, 4 * 1024 * 1024));
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
@@ -855,7 +868,7 @@ const ServerCounters = struct {
 };
 
 fn counting_handler(counters: *ServerCounters, request: coap.Request) ?coap.Response {
-    const now: i64 = @truncate(std.time.nanoTimestamp());
+    const now: i64 = @truncate(platform.nanoTimestamp());
     _ = @atomicRmw(u64, &counters.count.raw, .Add, 1, .monotonic);
     // Set first_ns only on the first request (CAS from 0).
     _ = @cmpxchgWeak(i64, &counters.first_ns.raw, 0, now, .monotonic, .monotonic);
@@ -867,7 +880,7 @@ fn alloc_shared_counters() !*ServerCounters {
     const page = try posix.mmap(
         null,
         @max(@sizeOf(ServerCounters), 4096),
-        posix.PROT.READ | posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         .{ .TYPE = .SHARED, .ANONYMOUS = true },
         -1,
         0,
@@ -940,7 +953,7 @@ fn kill_server(pid: *?posix.pid_t) void {
         _ = posix.waitpid(p, 0);
         pid.* = null;
         // Let kernel fully reclaim io_uring ring memory before next server.
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        platform.sleep(100 * std.time.ns_per_ms);
     }
 }
 
@@ -1091,7 +1104,11 @@ fn print_scenario_tree(
                 // Leaf data starts at col 25, so pad 14 cols after the type name.
                 // µ is 2 bytes / 1 col → each latency header needs {s:>9} for 8 display cols.
                 std.debug.print("  " ++ D ++ "{s}{s}" ++ Z ++ " {s}" ++ D ++ "              {s:>10}  {s:>9}  {s:>9}  {s:>9}  {s:>6}" ++ Z ++ "\n", .{
-                    tr_cont, ty_branch, ty.name, "req/s", "p50 µs", "p99 µs", "p99.9 µs", "errs",
+                    tr_cont, ty_branch, ty.name, "req/s",
+                    "p50 µs",
+                    "p99 µs",
+                    "p99.9 µs",
+                    "errs",
                 });
                 header_printed = true;
             } else {
@@ -1148,33 +1165,32 @@ fn print_scenario_tree(
 // ── CLI ────────────────────────────────────────────────────────────────
 
 fn print_usage() void {
-    std.debug.print(
-        "Usage: bench [options]\n\n" ++
-            "Options:\n" ++
-            "  --host <addr>     Server address (default: 127.0.0.1)\n" ++
-            "  --port <port>     Server port (default: 5683)\n" ++
-            "  --count <n>       Override request count per scenario\n" ++
-            "  --warmup <n>      Warmup requests (default: 1000)\n" ++
-            "  --window <n>      Client sliding window size (default: 256)\n" ++
-            "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
-            "  --no-server       Don't fork embedded echo server\n" ++
-            "  --ipv6            Use IPv6 loopback (::1) instead of IPv4\n" ++
-            "\n" ++
-            "Filters:\n" ++
-            "  --plain-only      Skip DTLS scenarios\n" ++
-            "  --dtls-only       Skip plain UDP scenarios\n" ++
-            "  --con-only        Skip NON scenarios\n" ++
-            "  --non-only        Skip CON scenarios\n" ++
-            "  --single-only     Skip multi-threaded scenarios\n" ++
-            "  --multi-only      Skip single-threaded scenarios\n" ++
-            "\n" ++
-            "  -h, --help        Show this help\n"
-    , .{});
+    std.debug.print("Usage: bench [options]\n\n" ++
+        "Options:\n" ++
+        "  --host <addr>     Server address (default: 127.0.0.1)\n" ++
+        "  --port <port>     Server port (default: 5683)\n" ++
+        "  --count <n>       Override request count per scenario\n" ++
+        "  --warmup <n>      Warmup requests (default: 1000)\n" ++
+        "  --window <n>      Client sliding window size (default: 256)\n" ++
+        "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
+        "  --no-server       Don't fork embedded echo server\n" ++
+        "  --ipv6            Use IPv6 loopback (::1) instead of IPv4\n" ++
+        "\n" ++
+        "Filters:\n" ++
+        "  --payload-only <n> Only payload size 0, 100, or 1000 bytes\n" ++
+        "  --plain-only      Skip DTLS scenarios\n" ++
+        "  --dtls-only       Skip plain UDP scenarios\n" ++
+        "  --con-only        Skip NON scenarios\n" ++
+        "  --non-only        Skip CON scenarios\n" ++
+        "  --single-only     Skip multi-threaded scenarios\n" ++
+        "  --multi-only      Skip single-threaded scenarios\n" ++
+        "\n" ++
+        "  -h, --help        Show this help\n", .{});
 }
 
-fn parse_args() SuiteConfig {
+fn parse_args(process_args: std.process.Args) SuiteConfig {
     var config = SuiteConfig{};
-    var args = std.process.args();
+    var args = process_args.iterate();
     _ = args.next();
 
     while (args.next()) |arg| {
@@ -1189,6 +1205,17 @@ fn parse_args() SuiteConfig {
         } else if (std.mem.eql(u8, arg, "--count")) {
             const val = args.next() orelse "100000";
             config.count_override = std.fmt.parseInt(u32, val, 10) catch null;
+        } else if (std.mem.eql(u8, arg, "--payload-only")) {
+            const val = args.next() orelse {
+                std.debug.print("error: --payload-only requires 0, 100, or 1000\n", .{});
+                std.process.exit(1);
+            };
+            const size = std.fmt.parseInt(u16, val, 10) catch 65535;
+            if (size != 0 and size != 100 and size != 1000) {
+                std.debug.print("error: --payload-only requires 0, 100, or 1000\n", .{});
+                std.process.exit(1);
+            }
+            config.payload_filter = size;
         } else if (std.mem.eql(u8, arg, "--warmup")) {
             const val = args.next() orelse "1000";
             config.warmup_count = std.fmt.parseInt(u32, val, 10) catch 1_000;

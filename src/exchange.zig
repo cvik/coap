@@ -5,7 +5,7 @@
 /// table keyed on (peer_address, message_id) for O(1) lookups and an
 /// intrusive free list for O(1) slot allocation.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
 const constants = @import("constants.zig");
 
 const Exchange = @This();
@@ -112,9 +112,10 @@ pub fn deinit(exchange: *Exchange, allocator: std.mem.Allocator) void {
 }
 
 /// Hash peer address only (no message ID) for peer-based eviction.
-pub fn addrHash(address: std.net.Address) u32 {
+pub fn addrHash(address: std.Io.net.IpAddress) u32 {
     var hash: u32 = 0x811c9dc5; // FNV-1a 32-bit offset basis
-    for (addrBytes(&address)) |b| {
+    const sa = platform.SocketAddress.init(address);
+    for (sa.bytes()) |b| {
         hash ^= b;
         hash *%= 0x01000193; // FNV-1a 32-bit prime
     }
@@ -122,24 +123,16 @@ pub fn addrHash(address: std.net.Address) u32 {
 }
 
 /// Compute a hash key from peer address and message ID.
-pub fn peerKey(address: std.net.Address, message_id: u16) u64 {
+pub fn peerKey(address: std.Io.net.IpAddress, message_id: u16) u64 {
     var hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-    for (addrBytes(&address)) |b| {
+    const sa = platform.SocketAddress.init(address);
+    for (sa.bytes()) |b| {
         hash ^= b;
         hash *%= 0x100000001b3; // FNV-1a prime
     }
     hash ^= @as(u64, message_id);
     hash *%= 0x100000001b3;
     return hash;
-}
-
-/// Extract the relevant address bytes for hashing (family-aware).
-fn addrBytes(address: *const std.net.Address) []const u8 {
-    return switch (address.any.family) {
-        posix.AF.INET => std.mem.asBytes(&address.in),
-        posix.AF.INET6 => std.mem.asBytes(&address.in6),
-        else => std.mem.asBytes(&address.any),
-    };
 }
 
 /// Look up an exchange by peer address and message ID.
@@ -347,7 +340,7 @@ test "insert and find" {
     });
     defer pool.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
     const key = Exchange.peerKey(addr, 0x1234);
 
     try testing.expect(pool.find(key) == null);
@@ -372,7 +365,7 @@ test "duplicate detection" {
     });
     defer pool.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
     const key = Exchange.peerKey(addr, 0xAAAA);
 
     _ = pool.insert(key, 0, 0xAAAA, "first", 0);
@@ -395,7 +388,7 @@ test "pool exhaustion" {
     });
     defer pool.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
     const k1 = Exchange.peerKey(addr, 1);
     const k2 = Exchange.peerKey(addr, 2);
     const k3 = Exchange.peerKey(addr, 3);
@@ -413,7 +406,7 @@ test "evict expired" {
     });
     defer pool.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
     const k1 = Exchange.peerKey(addr, 1);
     const k2 = Exchange.peerKey(addr, 2);
 
@@ -444,7 +437,7 @@ test "remove is public" {
     });
     defer pool.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5683);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
     const key = Exchange.peerKey(addr, 0x0001);
 
     const slot = pool.insert(key, 0, 0x0001, "data", 0);
@@ -536,8 +529,8 @@ test "evictPeer removes all exchanges for a peer" {
     });
     defer pool.deinit(testing.allocator);
 
-    const addr_a = try std.net.Address.parseIp("10.0.0.1", 5683);
-    const addr_b = try std.net.Address.parseIp("10.0.0.2", 5683);
+    const addr_a = try std.Io.net.IpAddress.parse("10.0.0.1", 5683);
+    const addr_b = try std.Io.net.IpAddress.parse("10.0.0.2", 5683);
     const ak_a = Exchange.addrHash(addr_a);
     const ak_b = Exchange.addrHash(addr_b);
 
@@ -555,19 +548,19 @@ test "evictPeer removes all exchanges for a peer" {
 }
 
 test "addrHash differentiates IPv4 and IPv6" {
-    const v4 = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const v6 = try std.net.Address.parseIp("::1", 5683);
+    const v4 = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
+    const v6 = try std.Io.net.IpAddress.parse("::1", 5683);
     try testing.expect(Exchange.addrHash(v4) != Exchange.addrHash(v6));
 }
 
 test "peerKey differentiates IPv4 and IPv6" {
-    const v4 = try std.net.Address.parseIp("127.0.0.1", 5683);
-    const v6 = try std.net.Address.parseIp("::1", 5683);
+    const v4 = try std.Io.net.IpAddress.parse("127.0.0.1", 5683);
+    const v6 = try std.Io.net.IpAddress.parse("::1", 5683);
     try testing.expect(Exchange.peerKey(v4, 0x1234) != Exchange.peerKey(v6, 0x1234));
 }
 
 test "addrHash different IPv6 addresses produce different hashes" {
-    const a = try std.net.Address.parseIp("::1", 5683);
-    const b = try std.net.Address.parseIp("fe80::1", 5683);
+    const a = try std.Io.net.IpAddress.parse("::1", 5683);
+    const b = try std.Io.net.IpAddress.parse("fe80::1", 5683);
     try testing.expect(Exchange.addrHash(a) != Exchange.addrHash(b));
 }

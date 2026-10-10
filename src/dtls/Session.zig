@@ -3,7 +3,7 @@
 /// Pre-allocated open-addressed hash table with intrusive LRU doubly-linked
 /// list and free list. Provides O(1) lookup, allocation, and eviction.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("../platform.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const State = enum(u8) {
@@ -30,7 +30,7 @@ pub const Config = struct {
 pub const Session = struct {
     state: State,
     peer_hash: u64,
-    addr: std.net.Address,
+    addr: std.Io.net.IpAddress,
 
     // Crypto state
     client_write_key: [16]u8,
@@ -144,7 +144,7 @@ pub const SessionTable = struct {
     }
 
     /// Look up a session by peer address.
-    pub fn lookup(self: *SessionTable, addr: std.net.Address) ?*Session {
+    pub fn lookup(self: *SessionTable, addr: std.Io.net.IpAddress) ?*Session {
         const hash = addrHash(addr);
         var idx: u32 = @intCast(hash & self.table_mask);
         var probes: u32 = 0;
@@ -179,7 +179,7 @@ pub const SessionTable = struct {
 
     /// Allocate a new session for the given address.
     /// Evicts LRU if no free slots remain. Returns null if capacity == 0.
-    pub fn allocate(self: *SessionTable, addr: std.net.Address, now_ns: i64) ?*Session {
+    pub fn allocate(self: *SessionTable, addr: std.Io.net.IpAddress, now_ns: i64) ?*Session {
         if (self.config.capacity == 0) return null;
 
         // Get a free slot — either from free list or by evicting LRU.
@@ -369,12 +369,9 @@ pub const SessionTable = struct {
     }
 };
 
-fn addrHash(addr: std.net.Address) u64 {
-    const bytes = switch (addr.any.family) {
-        posix.AF.INET => std.mem.asBytes(&addr.in),
-        posix.AF.INET6 => std.mem.asBytes(&addr.in6),
-        else => std.mem.asBytes(&addr.any),
-    };
+fn addrHash(addr: std.Io.net.IpAddress) u64 {
+    const sa = platform.SocketAddress.init(addr);
+    const bytes = sa.bytes();
     var hash: u64 = 0xcbf29ce484222325; // FNV-1a 64-bit offset basis
     for (bytes) |b| {
         hash ^= b;
@@ -383,13 +380,8 @@ fn addrHash(addr: std.net.Address) u64 {
     return hash;
 }
 
-fn addrEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        posix.AF.INET => std.mem.eql(u8, std.mem.asBytes(&a.in), std.mem.asBytes(&b.in)),
-        posix.AF.INET6 => std.mem.eql(u8, std.mem.asBytes(&a.in6), std.mem.asBytes(&b.in6)),
-        else => false,
-    };
+fn addrEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    return platform.addressEqual(a, b);
 }
 
 fn wrappingDistance(from: u32, to: u32, mask: u32) u32 {
@@ -411,7 +403,7 @@ test "allocate and lookup" {
     var tbl = try SessionTable.init(testing.allocator, .{ .capacity = 8 });
     defer tbl.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5684);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5684);
     const session = tbl.allocate(addr, 0).?;
 
     try testing.expectEqual(State.handshaking, session.state);
@@ -426,7 +418,7 @@ test "lookup returns null for unknown" {
     var tbl = try SessionTable.init(testing.allocator, .{ .capacity = 8 });
     defer tbl.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("10.0.0.1", 5684);
+    const addr = try std.Io.net.IpAddress.parse("10.0.0.1", 5684);
     try testing.expect(tbl.lookup(addr) == null);
 }
 
@@ -434,7 +426,7 @@ test "release zeros key material" {
     var tbl = try SessionTable.init(testing.allocator, .{ .capacity = 8 });
     defer tbl.deinit(testing.allocator);
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 5684);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 5684);
     const session = tbl.allocate(addr, 0).?;
 
     @memset(&session.client_write_key, 0xFF);
@@ -457,9 +449,9 @@ test "LRU eviction when table full" {
     var tbl = try SessionTable.init(testing.allocator, .{ .capacity = 4 });
     defer tbl.deinit(testing.allocator);
 
-    var addrs: [4]std.net.Address = undefined;
+    var addrs: [4]std.Io.net.IpAddress = undefined;
     for (0..4) |i| {
-        addrs[i] = try std.net.Address.parseIp("10.0.0.1", @intCast(6000 + i));
+        addrs[i] = try std.Io.net.IpAddress.parse("10.0.0.1", @intCast(6000 + i));
         _ = tbl.allocate(addrs[i], @intCast(i));
     }
     try testing.expectEqual(@as(u32, 4), tbl.count_active);
@@ -468,7 +460,7 @@ test "LRU eviction when table full" {
     const oldest_addr = addrs[0];
 
     // Allocate 5th — should evict oldest (LRU tail).
-    const new_addr = try std.net.Address.parseIp("10.0.0.2", 7000);
+    const new_addr = try std.Io.net.IpAddress.parse("10.0.0.2", 7000);
     _ = tbl.allocate(new_addr, 100).?;
 
     try testing.expectEqual(@as(u32, 4), tbl.count_active);
@@ -480,10 +472,10 @@ test "promote moves to LRU head" {
     var tbl = try SessionTable.init(testing.allocator, .{ .capacity = 4 });
     defer tbl.deinit(testing.allocator);
 
-    var addrs: [4]std.net.Address = undefined;
+    var addrs: [4]std.Io.net.IpAddress = undefined;
     var sessions: [4]*Session = undefined;
     for (0..4) |i| {
-        addrs[i] = try std.net.Address.parseIp("10.0.0.1", @intCast(6000 + i));
+        addrs[i] = try std.Io.net.IpAddress.parse("10.0.0.1", @intCast(6000 + i));
         sessions[i] = tbl.allocate(addrs[i], @intCast(i)).?;
     }
     // LRU order (tail → head): 0, 1, 2, 3
@@ -493,7 +485,7 @@ test "promote moves to LRU head" {
     // LRU order (tail → head): 1, 2, 3, 0
 
     // Next eviction candidate is sessions[1] (addr index 1).
-    const addr_new = try std.net.Address.parseIp("10.0.0.2", 7000);
+    const addr_new = try std.Io.net.IpAddress.parse("10.0.0.2", 7000);
     _ = tbl.allocate(addr_new, 200).?;
 
     // sessions[0] was promoted — should survive.

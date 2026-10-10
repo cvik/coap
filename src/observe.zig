@@ -5,7 +5,7 @@
 /// notifications. The tick loop drains the MPSC queue and sends NON
 /// notifications to all registered observers.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
 const coapz = @import("coapz");
 const handler = @import("handler.zig");
 
@@ -24,7 +24,7 @@ pub const Config = struct {
 
 pub const Observer = struct {
     active: bool = false,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     token: [8]u8,
     token_len: u8,
     /// Notifications sent to this observer (for CON interval).
@@ -79,7 +79,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !ObserverRegistry {
     errdefer allocator.free(observers);
     for (observers) |*obs| {
         obs.* = .{
-            .peer_address = std.mem.zeroes(std.net.Address),
+            .peer_address = platform.ip4(.{ 0, 0, 0, 0 }, 0),
             .token = .{0} ** 8,
             .token_len = 0,
         };
@@ -140,7 +140,7 @@ pub fn allocateResource(self: *ObserverRegistry) ?u16 {
 
 /// Register a client as an observer of a resource. Idempotent — if the
 /// same peer+token is already registered, returns true without duplicating.
-pub fn addObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.Address, token: []const u8) bool {
+pub fn addObserver(self: *ObserverRegistry, resource_id: u16, peer: std.Io.net.IpAddress, token: []const u8) bool {
     if (resource_id >= self.resources.len or !self.resources[resource_id].active) return false;
 
     const base = @as(usize, resource_id) * self.observers_per_resource;
@@ -176,7 +176,7 @@ pub fn addObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.Addr
 }
 
 /// Remove a specific observer by peer address and token.
-pub fn removeObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.Address, token: []const u8) void {
+pub fn removeObserver(self: *ObserverRegistry, resource_id: u16, peer: std.Io.net.IpAddress, token: []const u8) void {
     if (resource_id >= self.resources.len or !self.resources[resource_id].active) return;
 
     const base = @as(usize, resource_id) * self.observers_per_resource;
@@ -195,7 +195,7 @@ pub fn removeObserver(self: *ObserverRegistry, resource_id: u16, peer: std.net.A
 }
 
 /// Remove all observers from a given peer address (e.g. on RST).
-pub fn removeByPeer(self: *ObserverRegistry, peer: std.net.Address) void {
+pub fn removeByPeer(self: *ObserverRegistry, peer: std.Io.net.IpAddress) void {
     for (self.resources, 0..) |*res, ri| {
         if (!res.active) continue;
         const base = ri * self.observers_per_resource;
@@ -309,7 +309,7 @@ pub fn notifyBuf(self: *const ObserverRegistry, slot: u16) []u8 {
 }
 
 /// Clear pending CON state when an ACK is received for a CON notification.
-pub fn ackConNotification(self: *ObserverRegistry, msg_id: u16, peer: std.net.Address) void {
+pub fn ackConNotification(self: *ObserverRegistry, msg_id: u16, peer: std.Io.net.IpAddress) void {
     for (self.observers) |*obs| {
         if (!obs.active) continue;
         if (obs.pending_con_msg_id != msg_id) continue;
@@ -355,13 +355,8 @@ pub fn decodeNotifyMeta(data: []const u8, arena: std.mem.Allocator) ?NotifyMeta 
     };
 }
 
-fn addrEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        posix.AF.INET => std.mem.eql(u8, std.mem.asBytes(&a.in), std.mem.asBytes(&b.in)),
-        posix.AF.INET6 => std.mem.eql(u8, std.mem.asBytes(&a.in6), std.mem.asBytes(&b.in6)),
-        else => false,
-    };
+fn addrEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    return platform.addressEqual(a, b);
 }
 
 // ── Tests ──
@@ -401,7 +396,7 @@ test "add and remove observer" {
     defer reg.deinit(testing.allocator);
 
     const rid = reg.allocateResource() orelse return error.Full;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
 
     try testing.expect(reg.addObserver(rid, addr, &.{ 0xAA, 0xBB }));
     try testing.expectEqual(@as(u16, 1), reg.resources[rid].observer_count.load(.acquire));
@@ -418,7 +413,7 @@ test "duplicate observer is idempotent" {
     defer reg.deinit(testing.allocator);
 
     const rid = reg.allocateResource() orelse return error.Full;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
 
     try testing.expect(reg.addObserver(rid, addr, &.{0xAA}));
     try testing.expect(reg.addObserver(rid, addr, &.{0xAA})); // duplicate
@@ -434,8 +429,8 @@ test "removeByPeer removes all observers for that peer" {
 
     const r0 = reg.allocateResource() orelse return error.Full;
     const r1 = reg.allocateResource() orelse return error.Full;
-    const addr1 = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
-    const addr2 = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 5683);
+    const addr1 = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
+    const addr2 = platform.ip4(.{ 10, 0, 0, 1 }, 5683);
 
     _ = reg.addObserver(r0, addr1, &.{0x01});
     _ = reg.addObserver(r1, addr1, &.{0x02});
@@ -456,7 +451,7 @@ test "notify enqueues and drain processes" {
     defer reg.deinit(testing.allocator);
 
     const rid = reg.allocateResource() orelse return error.Full;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     _ = reg.addObserver(rid, addr, &.{0xAA});
 
     reg.notify(rid, .{ .code = .content, .payload = "22.5" });
@@ -476,7 +471,7 @@ test "notify increments sequence number" {
     defer reg.deinit(testing.allocator);
 
     const rid = reg.allocateResource() orelse return error.Full;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     _ = reg.addObserver(rid, addr, &.{0xAA});
 
     reg.notify(rid, .{ .code = .content, .payload = "v1" });

@@ -22,8 +22,9 @@
 /// try server.run();
 /// ```
 const std = @import("std");
+const platform = @import("platform.zig");
 const linux = std.os.linux;
-const posix = std.posix;
+const posix = platform;
 const coapz = @import("coapz");
 const Io = @import("Io.zig");
 const Exchange = @import("exchange.zig");
@@ -131,7 +132,7 @@ exchange_lifetime_ms: u32,
 running: std.atomic.Value(bool),
 
 // Pre-allocated per-CQE response state.
-addrs_response: []std.net.Address,
+addrs_response: []platform.SocketAddress,
 msgs_response: []linux.msghdr_const,
 iovs_response: []posix.iovec,
 buffer_response: []u8,
@@ -316,7 +317,7 @@ fn init_raw(
     );
 
     const addrs_response = try allocator.alloc(
-        std.net.Address,
+        platform.SocketAddress,
         batch,
     );
     errdefer allocator.free(addrs_response);
@@ -364,8 +365,8 @@ fn init_raw(
         });
         errdefer tbl_ptr.deinit(allocator);
         dtls_sessions = tbl_ptr;
-        std.crypto.random.bytes(&dtls_cookie_secret);
-        std.crypto.random.bytes(&dtls_cookie_secret_prev);
+        platform.randomBytes(&dtls_cookie_secret);
+        platform.randomBytes(&dtls_cookie_secret_prev);
     }
 
     return .{
@@ -393,7 +394,7 @@ fn init_raw(
         .msg_recv = std.mem.zeroes(linux.msghdr),
         .last_eviction_ns = 0,
         .tick_count = 0,
-        .next_msg_id = std.crypto.random.int(u16),
+        .next_msg_id = platform.randomInt(u16),
         .force_free_all = false,
         .load_level = .normal,
         .buffers_outstanding = 0,
@@ -443,8 +444,8 @@ pub fn listen(server: *Server) !void {
 
     server.msg_recv.name = @ptrCast(&server.addr_recv);
     // Set name buffer size based on actual socket family.
-    const bind_addr = try std.net.Address.parseIp(server.config.bind_address, server.config.port);
-    server.msg_recv.namelen = bind_addr.getOsSockLen();
+    const bind_addr = try platform.parseIp(server.config.bind_address, server.config.port);
+    server.msg_recv.namelen = platform.addressLen(bind_addr);
     server.msg_recv.controllen = 0;
 
     try server.io.recv_multishot(&server.msg_recv);
@@ -632,7 +633,7 @@ fn run_worker(
             state.restart_count,
             backoff_ms,
         });
-        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+        platform.sleep(backoff_ms * std.time.ns_per_ms);
     }
 
     if (config.cpu_affinity) |cores| {
@@ -704,7 +705,7 @@ pub fn tick(server: *Server) !void {
     const batch_max = constants.completion_batch_max;
     var cqes: [batch_max]Cqe = std.mem.zeroes([batch_max]Cqe);
 
-    server.tick_now_ns = @intCast(std.time.nanoTimestamp());
+    server.tick_now_ns = @intCast(platform.nanoTimestamp());
 
     // Submit a timeout so wait_cqes unblocks periodically, allowing
     // the run loop to check the shutdown flag even when idle.
@@ -770,7 +771,7 @@ pub fn tick(server: *Server) !void {
         const rotation_ns: i64 = @as(i64, constants.dtls_cookie_secret_rotation_s) * std.time.ns_per_s;
         if (server.tick_now_ns - server.dtls_cookie_rotation_ns > rotation_ns) {
             server.dtls_cookie_secret_prev = server.dtls_cookie_secret;
-            std.crypto.random.bytes(&server.dtls_cookie_secret);
+            platform.randomBytes(&server.dtls_cookie_secret);
             server.dtls_cookie_rotation_ns = server.tick_now_ns;
         }
 
@@ -1083,10 +1084,10 @@ fn handle_recv(
                 });
             }
         }
-        const before = if (server.config.handler_warn_ns > 0) std.time.nanoTimestamp() else 0;
+        const before = if (server.config.handler_warn_ns > 0) platform.nanoTimestamp() else 0;
         const result = server.handler_fn(server.handler_context, request);
         if (server.config.handler_warn_ns > 0) {
-            const after = std.time.nanoTimestamp();
+            const after = platform.nanoTimestamp();
             const elapsed: u64 = @intCast(@max(0, after - before));
             if (elapsed > server.config.handler_warn_ns) {
                 log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
@@ -1470,7 +1471,7 @@ fn process_dtls_coap(
     server: *Server,
     coap_payload: []const u8,
     session: *dtls.Session.Session,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     index: usize,
 ) void {
     const arena = server.arena.allocator();
@@ -1604,10 +1605,10 @@ fn process_dtls_coap(
                 });
             }
         }
-        const before = if (server.config.handler_warn_ns > 0) std.time.nanoTimestamp() else 0;
+        const before = if (server.config.handler_warn_ns > 0) platform.nanoTimestamp() else 0;
         const result = server.handler_fn(server.handler_context, request);
         if (server.config.handler_warn_ns > 0) {
-            const after = std.time.nanoTimestamp();
+            const after = platform.nanoTimestamp();
             const elapsed: u64 = @intCast(@max(0, after - before));
             if (elapsed > server.config.handler_warn_ns) {
                 log.warn("slow handler: {d}ms", .{elapsed / std.time.ns_per_ms});
@@ -1690,7 +1691,7 @@ fn sendDtlsResponse(
     session: *dtls.Session.Session,
     response: handler.Response,
     packet: coapz.Packet,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     is_con: bool,
     addr_key: u32,
     index: usize,
@@ -1733,7 +1734,7 @@ fn send_dtls_packet(
     server: *Server,
     session: *dtls.Session.Session,
     pkt: coapz.Packet,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     index: usize,
 ) ![]const u8 {
     const buf = server.response_buf(index);
@@ -1766,7 +1767,7 @@ fn send_dtls_alert(
     level: dtls.types.AlertLevel,
     desc: dtls.types.AlertDescription,
     index: usize,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
 ) void {
     var alert_payload: [2]u8 = undefined;
     dtls.types.encodeAlert(level, desc, &alert_payload);
@@ -1783,7 +1784,7 @@ fn send_dtls_alert(
 }
 
 /// Send pre-encoded CoAP data, encrypting if the peer has a DTLS session.
-fn sendMaybeEncrypted(server: *Server, data: []const u8, peer: std.net.Address, index: usize) !void {
+fn sendMaybeEncrypted(server: *Server, data: []const u8, peer: std.Io.net.IpAddress, index: usize) !void {
     if (server.dtls_sessions) |tbl| {
         if (tbl.lookup(peer)) |session| {
             const buf = server.response_buf(index);
@@ -1811,7 +1812,7 @@ fn sendMaybeEncrypted(server: *Server, data: []const u8, peer: std.net.Address, 
 fn send_emergency_ack(
     server: *Server,
     raw_payload: []const u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     index: usize,
 ) void {
     if (coapz.Packet.peekKind(raw_payload) != .confirmable) return;
@@ -1828,7 +1829,7 @@ fn send_emergency_ack(
 fn send_rst(
     server: *Server,
     raw_header: []const u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     index: usize,
 ) void {
     const msg_id = coapz.Packet.peekMsgId(raw_header) orelse return;
@@ -1843,7 +1844,6 @@ fn send_rst(
 /// Drain deferred response queue and retransmit pending separate CONs.
 /// Handle a Block1 upload fragment. Returns a response to send (2.31 Continue
 /// or error), or null if the upload is complete and the handler should be called.
-
 const Block1Result = union(enum) {
     response: handler.Response,
     complete: u16,
@@ -1854,7 +1854,7 @@ fn handleBlock1(
     bt: *BlockTransfer,
     bv: coapz.BlockValue,
     packet: coapz.Packet,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     arena: std.mem.Allocator,
 ) ?Block1Result {
     // Extract Request-Tag (RFC 9175 §3) for Block1 disambiguation.
@@ -1933,7 +1933,7 @@ fn makeContinueResponse(bv: coapz.BlockValue, arena: std.mem.Allocator) ?handler
 fn handleBlock2Followup(
     bt: *BlockTransfer,
     packet: coapz.Packet,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     arena: std.mem.Allocator,
 ) ?handler.Response {
     const opt = packet.find_option(.block2) orelse return null;
@@ -1990,7 +1990,7 @@ fn blockifyResponse(
     bt: *BlockTransfer,
     response: handler.Response,
     packet: coapz.Packet,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     arena: std.mem.Allocator,
     now_ns: i64,
 ) handler.Response {
@@ -2028,7 +2028,7 @@ fn sendResponse(
     server: *Server,
     response: handler.Response,
     packet: coapz.Packet,
-    peer: std.net.Address,
+    peer: std.Io.net.IpAddress,
     is_con: bool,
     addr_key: u32,
     raw_header: *const [4]u8,
@@ -2310,7 +2310,7 @@ fn response_buf(server: *Server, index: usize) []u8 {
 fn send_packet(
     server: *Server,
     pkt: coapz.Packet,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     index: usize,
 ) ![]const u8 {
     const buf = server.response_buf(index);
@@ -2323,7 +2323,7 @@ fn send_packet(
 fn send_data(
     server: *Server,
     data: []const u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     index: usize,
 ) !void {
     const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
@@ -2354,10 +2354,10 @@ fn send_data(
 fn send_raw(
     server: *Server,
     data: []const u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     index: usize,
 ) !void {
-    server.addrs_response[index] = peer_address;
+    server.addrs_response[index] = platform.SocketAddress.init(peer_address);
 
     server.iovs_response[index] = .{
         .base = @ptrCast(@constCast(data.ptr)),
@@ -2366,7 +2366,7 @@ fn send_raw(
 
     server.msgs_response[index] = .{
         .name = @ptrCast(&server.addrs_response[index]),
-        .namelen = peer_address.getOsSockLen(),
+        .namelen = platform.addressLen(peer_address),
         .iov = @ptrCast(&server.iovs_response[index]),
         .iovlen = 1,
         .control = null,
@@ -2410,11 +2410,27 @@ fn is_well_known_core(packet: coapz.Packet) bool {
 fn isRecognizedOption(kind: coapz.OptionKind) bool {
     return switch (kind) {
         .unknown => false,
-        .if_match, .uri_host, .etag, .if_none_match, .observe,
-        .uri_port, .location_path, .oscore, .uri_path,
-        .content_format, .max_age, .uri_query, .accept,
-        .location_query, .block2, .block1, .size2,
-        .proxy_uri, .proxy_scheme, .size1, .no_response,
+        .if_match,
+        .uri_host,
+        .etag,
+        .if_none_match,
+        .observe,
+        .uri_port,
+        .location_path,
+        .oscore,
+        .uri_path,
+        .content_format,
+        .max_age,
+        .uri_query,
+        .accept,
+        .location_query,
+        .block2,
+        .block1,
+        .size2,
+        .proxy_uri,
+        .proxy_scheme,
+        .size1,
+        .no_response,
         => true,
         _ => false,
     };
@@ -2475,8 +2491,8 @@ fn test_client(port: u16) !posix.socket_t {
         std.mem.asBytes(&timeout),
     );
 
-    const dest = try std.net.Address.parseIp("127.0.0.1", port);
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    const dest = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    try posix.connect(fd, dest);
 
     return fd;
 }
@@ -3120,11 +3136,11 @@ test "recognized_options allows custom critical options" {
 }
 
 fn test_client_ip(host: []const u8, port: u16) !posix.socket_t {
-    const dest = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM, 0);
+    const dest = try std.Io.net.IpAddress.parse(host, port);
+    const fd = try posix.socket(platform.family(dest), posix.SOCK.DGRAM, 0);
     const timeout = posix.timeval{ .sec = 1, .usec = 0 };
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    try posix.connect(fd, dest);
     return fd;
 }
 

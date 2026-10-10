@@ -24,7 +24,8 @@
 /// std.debug.print("{s}\n", .{result.payload});
 /// ```
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
+const posix = platform;
 const coapz = @import("coapz");
 const constants = @import("constants.zig");
 const dtls = @import("dtls/dtls.zig");
@@ -33,7 +34,7 @@ const log = std.log.scoped(.coap_client);
 const Client = @This();
 
 fn nanoTimestamp() i64 {
-    return @intCast(std.time.nanoTimestamp());
+    return @intCast(platform.nanoTimestamp());
 }
 
 /// Client configuration. All fields have sensible defaults.
@@ -398,11 +399,11 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         effective_config.port = constants.coaps_port_default;
     }
 
-    const dest = try std.net.Address.parseIp(effective_config.host, effective_config.port);
+    const dest = try platform.parseIp(effective_config.host, effective_config.port);
 
-    const fd = try posix.socket(dest.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    const fd = try posix.socket(platform.family(dest), posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(fd);
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    try posix.connect(fd, dest);
 
     const buf_size = std.mem.toBytes(@as(c_int, 2 * 1024 * 1024));
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &buf_size) catch {};
@@ -458,7 +459,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
     @memset(slot_table, empty_sentinel);
 
     var seed: u64 = undefined;
-    std.crypto.random.bytes(std.mem.asBytes(&seed));
+    platform.randomBytes(std.mem.asBytes(&seed));
     var rng = std.Random.DefaultPrng.init(seed);
 
     const initial_msg_id: u16 = rng.random().int(u16);
@@ -489,9 +490,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         .peer_confirmed = false,
         .observes = observes,
         .next_msg_id_val = initial_msg_id,
-        .next_token_val = std.crypto.random.int(u64),
+        .next_token_val = platform.randomInt(u64),
         .rng = rng,
-        .dtls_session = if (effective_config.psk != null) std.mem.zeroes(dtls.Session.Session) else null,
+        .dtls_session = if (effective_config.psk != null) std.mem.zeroInit(dtls.Session.Session, .{ .addr = platform.ip4(.{ 0, 0, 0, 0 }, 0) }) else null,
         .dtls_client_hs_state = .idle,
         .dtls_cached_session_id = .{0} ** 32,
         .dtls_cached_session_id_len = 0,
@@ -1912,11 +1913,11 @@ const ServerRunner = struct {
         // Send a dummy packet to wake the server from blocking wait_cqes.
         const fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
         defer posix.close(fd);
-        const dest = std.net.Address.parseIp(
+        const dest = std.Io.net.IpAddress.parse(
             "127.0.0.1",
             self.server.config.port,
         ) catch return;
-        _ = posix.sendto(fd, &[_]u8{0}, 0, &dest.any, dest.getOsSockLen()) catch {};
+        _ = posix.sendto(fd, &[_]u8{0}, 0, dest) catch {};
         thread.join();
     }
 };
@@ -2282,12 +2283,22 @@ test "checkBlock2Etag captures and compares" {
     var opt_a = [1]coapz.Option{.{ .kind = .etag, .value = &etag_a }};
     var opt_b = [1]coapz.Option{.{ .kind = .etag, .value = &etag_b }};
     const pkt_a = coapz.Packet{
-        .kind = .acknowledgement, .code = .content, .msg_id = 0,
-        .token = &.{}, .options = &opt_a, .payload = &.{}, .data_buf = &.{},
+        .kind = .acknowledgement,
+        .code = .content,
+        .msg_id = 0,
+        .token = &.{},
+        .options = &opt_a,
+        .payload = &.{},
+        .data_buf = &.{},
     };
     const pkt_b = coapz.Packet{
-        .kind = .acknowledgement, .code = .content, .msg_id = 0,
-        .token = &.{}, .options = &opt_b, .payload = &.{}, .data_buf = &.{},
+        .kind = .acknowledgement,
+        .code = .content,
+        .msg_id = 0,
+        .token = &.{},
+        .options = &opt_b,
+        .payload = &.{},
+        .data_buf = &.{},
     };
 
     // First block — captures ETag.

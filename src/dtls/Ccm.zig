@@ -91,7 +91,7 @@ pub fn decrypt(ciphertext_and_tag: []const u8, ad: []const u8, nonce: [nonce_len
 fn makeCtrBlock(nonce: [nonce_len]u8, counter: u24) [block_len]u8 {
     var block: [block_len]u8 = undefined;
     block[0] = ctr_flags;
-    @memcpy(block[1..1 + nonce_len], &nonce);
+    @memcpy(block[1 .. 1 + nonce_len], &nonce);
     // 3-byte big-endian counter at bytes 13..15
     block[13] = @intCast((counter >> 16) & 0xFF);
     block[14] = @intCast((counter >> 8) & 0xFF);
@@ -145,7 +145,7 @@ fn computeCbcMac(aes: AesEncryptCtx(Aes128), plaintext: []const u8, ad: []const 
     // Build and process B0
     var b0: [block_len]u8 = undefined;
     b0[0] = if (ad.len > 0) b0_flags_ad else b0_flags_no_ad;
-    @memcpy(b0[1..1 + nonce_len], &nonce);
+    @memcpy(b0[1 .. 1 + nonce_len], &nonce);
     // 3-byte big-endian message length at bytes 13..15
     const msg_len = plaintext.len;
     b0[13] = @intCast((msg_len >> 16) & 0xFF);
@@ -187,13 +187,21 @@ fn computeCbcMac(aes: AesEncryptCtx(Aes128), plaintext: []const u8, ad: []const 
         }
     }
 
-    // Process plaintext in 16-byte blocks
+    // Keep the full-block XOR fixed-width. A variable-sized byte loop here
+    // prevents efficient vectorization with Zig 0.16 for large DTLS records.
     var pt_offset: usize = 0;
-    while (pt_offset < plaintext.len) : (pt_offset += block_len) {
-        const chunk_len = @min(block_len, plaintext.len - pt_offset);
+    while (plaintext.len - pt_offset >= block_len) : (pt_offset += block_len) {
+        const block = plaintext[pt_offset..][0..block_len].*;
+        x = @bitCast(@as(@Vector(block_len, u8), @bitCast(x)) ^
+            @as(@Vector(block_len, u8), @bitCast(block)));
         var tmp: [block_len]u8 = undefined;
-        for (0..chunk_len) |i| x[i] ^= plaintext[pt_offset + i];
-        // Remaining bytes: no XOR needed (XOR with 0 = identity), already in x
+        aes.encrypt(&tmp, &x);
+        x = tmp;
+    }
+    // A partial final block is zero-padded (XOR with 0 leaves x unchanged).
+    if (pt_offset < plaintext.len) {
+        for (plaintext[pt_offset..], 0..) |b, i| x[i] ^= b;
+        var tmp: [block_len]u8 = undefined;
         aes.encrypt(&tmp, &x);
         x = tmp;
     }
@@ -202,6 +210,39 @@ fn computeCbcMac(aes: AesEncryptCtx(Aes128), plaintext: []const u8, ad: []const 
 }
 
 // ----- Tests -----
+
+test "CCM block and wide-block boundaries match independent AESCCM vectors" {
+    // SHA-256 of ciphertext || 8-byte tag generated with Python cryptography
+    // AESCCM(bytes([7])*16, tag_length=8), nonce=[3]*12, AD=[4]*13,
+    // plaintext bytes(i % 251 for i in range(length)).
+    const vectors = .{
+        .{ 0, "23e5275fe2c79b4c7ba252a04f56f30c93f4d0edf02517f81a764ca46bd26185" },
+        .{ 15, "b23a972fce8ddaf03e8c30ec1b61fefea2fa854d61b0e22b910f75495426ffd8" },
+        .{ 16, "0b04ca33593266ffe3c722c1b7516c3da58f82071460918f80eb0b7e47d6c388" },
+        .{ 17, "50ef503d90e06d78ea02dcb69c9e640cf61e3a5269d5348039d7e2a940b8333c" },
+        .{ 31, "d8f5f2762708f9801214e4b6c53b5a2b7ec99fb23587e00a4fcc0347852854af" },
+        .{ 32, "81590d94418e6b4122ec882becb4787b9beb50ecaeaaed3fd2e057ef101ad7f2" },
+        .{ 33, "bdfb34b2589bb131ec90d7ab22c3e0cc2abf357e61b59fa6423bffa605441266" },
+        .{ 100, "31cc0dc3f1088012bc4d5621fef191d29a3066253fb7b1bb634f02daae9a1281" },
+        .{ 1000, "380b19c3ee26288dd91955fec5cb5ff370baa9b95fbf8d97c77f000dbb7da2b0" },
+        .{ 1024, "7d181bca0e31a073d7e6cf80572e6df2042a4679e4fd402c7d6ad7ca16b3f9b6" },
+    };
+    var plaintext: [1024]u8 = undefined;
+    for (&plaintext, 0..) |*b, i| b.* = @intCast(i % 251);
+    var ciphertext: [1032]u8 = undefined;
+    var recovered: [1024]u8 = undefined;
+    inline for (vectors) |v| {
+        const len = v[0];
+        encrypt(plaintext[0..len], &(.{4} ** 13), .{3} ** 12, .{7} ** 16, ciphertext[0 .. len + tag_len]);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(ciphertext[0 .. len + tag_len], &digest, .{});
+        var expected: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected, v[1]);
+        try std.testing.expectEqualSlices(u8, &expected, &digest);
+        try decrypt(ciphertext[0 .. len + tag_len], &(.{4} ** 13), .{3} ** 12, .{7} ** 16, recovered[0..len]);
+        try std.testing.expectEqualSlices(u8, plaintext[0..len], recovered[0..len]);
+    }
+}
 
 const testing = std.testing;
 

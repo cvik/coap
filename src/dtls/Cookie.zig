@@ -2,41 +2,37 @@
 ///
 /// Cookie = HMAC-SHA256(server_secret, client_addr_bytes || client_random)
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("../platform.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Generate a stateless DTLS cookie.
-pub fn generate(server_secret: [32]u8, client_addr: std.net.Address, client_random: [32]u8) [32]u8 {
+pub fn generate(server_secret: [32]u8, client_addr: std.Io.net.IpAddress, client_random: [32]u8) [32]u8 {
     var mac: [32]u8 = undefined;
     var h = HmacSha256.init(&server_secret);
-    // Hash the full sockaddr for the active family. Use pointer to
-    // client_addr directly (not a copy) to avoid dangling slice.
-    switch (client_addr.any.family) {
-        posix.AF.INET => h.update(std.mem.asBytes(&client_addr.in)),
-        posix.AF.INET6 => h.update(std.mem.asBytes(&client_addr.in6)),
-        else => h.update(std.mem.asBytes(&client_addr.in)),
-    }
+    // Canonical socket bytes avoid hashing padding in native address types.
+    const sa = platform.SocketAddress.init(client_addr);
+    h.update(sa.bytes());
     h.update(&client_random);
     h.final(&mac);
     return mac;
 }
 
 /// Verify a DTLS cookie against a single server secret.
-pub fn verify(server_secret: [32]u8, client_addr: std.net.Address, client_random: [32]u8, cookie: []const u8) bool {
+pub fn verify(server_secret: [32]u8, client_addr: std.Io.net.IpAddress, client_random: [32]u8, cookie: []const u8) bool {
     if (cookie.len != 32) return false;
     const expected = generate(server_secret, client_addr, client_random);
     return std.crypto.timing_safe.eql([32]u8, expected, cookie[0..32].*);
 }
 
 /// Verify with rotation: try current secret, then previous.
-pub fn verifyWithRotation(current_secret: [32]u8, previous_secret: [32]u8, client_addr: std.net.Address, client_random: [32]u8, cookie: []const u8) bool {
+pub fn verifyWithRotation(current_secret: [32]u8, previous_secret: [32]u8, client_addr: std.Io.net.IpAddress, client_random: [32]u8, cookie: []const u8) bool {
     return verify(current_secret, client_addr, client_random, cookie) or
         verify(previous_secret, client_addr, client_random, cookie);
 }
 
 test "generate and verify round-trip" {
     const secret = [_]u8{0x42} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
     const random = [_]u8{0xab} ** 32;
 
     const cookie = generate(secret, addr, random);
@@ -45,8 +41,8 @@ test "generate and verify round-trip" {
 
 test "verify fails with wrong address" {
     const secret = [_]u8{0x01} ** 32;
-    const addr1 = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
-    const addr2 = std.net.Address.initIp4([4]u8{ 192, 168, 1, 1 }, 5684);
+    const addr1 = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr2 = platform.ip4([4]u8{ 192, 168, 1, 1 }, 5684);
     const random = [_]u8{0x22} ** 32;
 
     const cookie = generate(secret, addr1, random);
@@ -56,7 +52,7 @@ test "verify fails with wrong address" {
 test "verify fails with wrong secret" {
     const secret1 = [_]u8{0x01} ** 32;
     const secret2 = [_]u8{0x02} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
     const random = [_]u8{0x33} ** 32;
 
     const cookie = generate(secret1, addr, random);
@@ -65,7 +61,7 @@ test "verify fails with wrong secret" {
 
 test "verify fails with wrong length (truncated cookie)" {
     const secret = [_]u8{0x55} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
     const random = [_]u8{0x66} ** 32;
 
     const cookie = generate(secret, addr, random);
@@ -76,7 +72,7 @@ test "verify fails with wrong length (truncated cookie)" {
 
 test "verify fails with wrong client_random" {
     const secret = [_]u8{0x77} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
     const random1 = [_]u8{0x88} ** 32;
     const random2 = [_]u8{0x99} ** 32;
 
@@ -87,7 +83,7 @@ test "verify fails with wrong client_random" {
 test "verifyWithRotation accepts cookie from previous secret" {
     const current = [_]u8{0xaa} ** 32;
     const previous = [_]u8{0xbb} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
     const random = [_]u8{0xcc} ** 32;
 
     const cookie = generate(previous, addr, random);
@@ -101,7 +97,7 @@ test "verifyWithRotation rejects cookie from neither secret" {
     const current = [_]u8{0xdd} ** 32;
     const previous = [_]u8{0xee} ** 32;
     const other = [_]u8{0xff} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
     const random = [_]u8{0x11} ** 32;
 
     const cookie = generate(other, addr, random);

@@ -3,6 +3,7 @@
 /// Implements key derivation (RFC 4279), handshake message framing (RFC 6347),
 /// and both server-side and client-side state machines for PSK-only cipher suites.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const types = @import("types.zig");
 const Prf = @import("Prf.zig");
 const Record = @import("Record.zig");
@@ -195,7 +196,7 @@ pub fn isClientHelloWithValidCookie(
     payload: []const u8,
     cookie_secret: [32]u8,
     cookie_secret_prev: [32]u8,
-    peer_addr: std.net.Address,
+    peer_addr: std.Io.net.IpAddress,
 ) bool {
     const msg = decodeHandshakeMessage(payload) orelse return false;
     if (msg.msg_type != .client_hello) return false;
@@ -232,7 +233,7 @@ pub fn isClientHelloWithValidCookie(
 pub fn buildStatelessHvr(
     payload: []const u8,
     cookie_secret: [32]u8,
-    peer_addr: std.net.Address,
+    peer_addr: std.Io.net.IpAddress,
     send_buf: []u8,
 ) ?[]const u8 {
     const msg = decodeHandshakeMessage(payload) orelse return null;
@@ -337,14 +338,14 @@ fn serverHandleClientHello(
     session.message_seq = 0;
 
     // Generate server_random.
-    std.crypto.random.bytes(&session.server_random);
+    platform.randomBytes(&session.server_random);
 
     // Generate or reuse session_id.
     if (resumption) |r| {
         session.session_id = r.session_id;
         session.session_id_len = r.session_id_len;
     } else {
-        std.crypto.random.bytes(&session.session_id);
+        platform.randomBytes(&session.session_id);
         session.session_id_len = 32;
     }
 
@@ -637,7 +638,7 @@ pub fn clientBuildInitialHello(
         return .{ .failed = .internal_error };
 
     // Generate client_random.
-    std.crypto.random.bytes(&session.client_random);
+    platform.randomBytes(&session.client_random);
 
     // Reset handshake hash.
     session.handshake_hash = Sha256.init(.{});
@@ -1033,7 +1034,7 @@ test "full server handshake" {
     const psk_key = "test-key-value";
     const psk = types.Psk{ .identity = psk_identity, .key = psk_key };
     const cookie_secret = [_]u8{0x42} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
 
     // Create a server session.
     var server_session: Session.Session = undefined;
@@ -1041,7 +1042,7 @@ test "full server handshake" {
 
     var send_buf: [2048]u8 = undefined;
     var client_random: [32]u8 = undefined;
-    std.crypto.random.bytes(&client_random);
+    platform.randomBytes(&client_random);
 
     // Step 1: ClientHello without cookie → expect HelloVerifyRequest
     {
@@ -1140,7 +1141,7 @@ test "full client-server handshake integration" {
     const psk_key = "my-secret-key";
     const psk = types.Psk{ .identity = psk_identity, .key = psk_key };
     const cookie_secret = [_]u8{0xAA} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
 
     var server_session: Session.Session = undefined;
     initTestSession(&server_session, addr);
@@ -1315,7 +1316,7 @@ test "full client-server handshake integration" {
     try testing.expectEqualSlices(u8, &server_session.server_write_key, &client_session.server_write_key);
 }
 
-fn initTestSession(session: *Session.Session, addr: std.net.Address) void {
+fn initTestSession(session: *Session.Session, addr: std.Io.net.IpAddress) void {
     session.* = .{
         .state = .handshaking,
         .peer_hash = 0,
@@ -1352,13 +1353,13 @@ fn initTestSession(session: *Session.Session, addr: std.net.Address) void {
 test "session resumption: server abbreviated path with ResumptionData" {
     const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
     const cookie_secret = [_]u8{0xAA} ** 32;
-    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
 
     // Simulate a previously established session with known master_secret.
     var saved_master_secret: [48]u8 = undefined;
-    std.crypto.random.bytes(&saved_master_secret);
+    platform.randomBytes(&saved_master_secret);
     var saved_session_id: [32]u8 = undefined;
-    std.crypto.random.bytes(&saved_session_id);
+    platform.randomBytes(&saved_session_id);
 
     // Build a ClientHello with the cached session_id.
     var client_session: Session.Session = undefined;
@@ -1367,7 +1368,10 @@ test "session resumption: server abbreviated path with ResumptionData" {
     var send_buf: [2048]u8 = undefined;
 
     const action1 = clientBuildInitialHello(
-        &client_session, &client_hs_state, psk, &send_buf,
+        &client_session,
+        &client_hs_state,
+        psk,
+        &send_buf,
         &saved_session_id,
     );
     const client_hello_data = switch (action1) {
@@ -1390,8 +1394,14 @@ test "session resumption: server abbreviated path with ResumptionData" {
     {
         const rec = Record.decodePlaintext(client_hello_data) orelse return error.TestUnexpectedNull;
         const hvr_action = serverProcessMessage(
-            &server_session, rec.content_type, rec.payload,
-            psk, cookie_secret, cookie_secret, &send_buf2, resumption,
+            &server_session,
+            rec.content_type,
+            rec.payload,
+            psk,
+            cookie_secret,
+            cookie_secret,
+            &send_buf2,
+            resumption,
         );
         // First ClientHello has no cookie → HelloVerifyRequest
         switch (hvr_action) {
@@ -1417,8 +1427,14 @@ test "session resumption: server abbreviated path with ResumptionData" {
     initTestSession(&server_session, addr);
 
     const action = serverProcessMessage(
-        &server_session, .handshake, rec[13..], // strip record header, pass payload
-        psk, cookie_secret, cookie_secret, &send_buf2, resumption,
+        &server_session,
+        .handshake,
+        rec[13..], // strip record header, pass payload
+        psk,
+        cookie_secret,
+        cookie_secret,
+        &send_buf2,
+        resumption,
     );
 
     // With valid cookie + resumption data → abbreviated handshake.
@@ -1438,7 +1454,7 @@ test "session resumption: server abbreviated path with ResumptionData" {
 
 test "session resumption: client sends cached session_id" {
     const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
-    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
 
     var session: Session.Session = undefined;
     initTestSession(&session, addr);
@@ -1447,7 +1463,7 @@ test "session resumption: client sends cached session_id" {
 
     // Build ClientHello with a cached session_id.
     var cached_sid: [32]u8 = undefined;
-    std.crypto.random.bytes(&cached_sid);
+    platform.randomBytes(&cached_sid);
 
     const action = clientBuildInitialHello(&session, &hs_state, psk, &send_buf, &cached_sid);
     const data = switch (action) {
@@ -1467,7 +1483,7 @@ test "session resumption: client sends cached session_id" {
 
 test "session resumption: empty session_id produces full handshake" {
     const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
-    const addr = std.net.Address.initIp4([4]u8{ 10, 0, 0, 1 }, 5684);
+    const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
 
     var session: Session.Session = undefined;
     initTestSession(&session, addr);

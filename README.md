@@ -39,7 +39,7 @@ const std = @import("std");
 const coap = @import("coap");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     var server = try coap.Server.init(gpa.allocator(), .{}, echo);
@@ -66,7 +66,7 @@ const router = coap.Router(.{
 });
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     var server = try coap.Server.init(gpa.allocator(), .{}, router.handler());
     defer server.deinit();
     try server.run();
@@ -99,7 +99,7 @@ const std = @import("std");
 const coap = @import("coap");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -192,7 +192,7 @@ The request provides convenience accessors and the underlying packet:
 - `deferResponse()` — defer the response for async handling (separate response)
 - `observeResource(rid)` / `removeObserver(rid)` — observe registration
 - `packet` — the full parsed CoAP packet for advanced use
-- `peer_address` — source address of the client (`std.net.Address`)
+- `peer_address` — source address of the client (`std.Io.net.IpAddress`)
 - `arena` — per-request arena allocator (resets after handler returns)
 
 ### Response
@@ -892,12 +892,23 @@ zig build bench -Doptimize=ReleaseFast
 ```
 
 Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
-`--single-only`, `--multi-only`, `--ipv6`. Use `--help` for all options.
+`--single-only`, `--multi-only`, `--payload-only <0|100|1000>`, `--ipv6`.
+Use `--help` for all options. For performance comparisons, run one scenario
+per invocation to avoid outstanding NON traffic affecting the next scenario's
+server-side counters. See [the Zig 0.16 migration measurements](docs/ZIG_016_PERFORMANCE.md).
 
 ## Requirements
 
 - Linux (io_uring support, kernel 5.13+ for multishot recvmsg)
-- Zig 0.15.1+
+- Zig 0.16.0 (the currently supported toolchain)
+
+### Migrating from Zig 0.15
+
+The public peer address type is now `std.Io.net.IpAddress`. Use
+`IpAddress.parse(host, port)` instead of `std.net.Address.parseIp`, access
+IPv4/IPv6 values through `.ip4`/`.ip6`, and use `.getPort()` for ports.
+The server still uses preallocated Linux io_uring operations; the server/client
+initialization signatures and handler interface are unchanged.
 
 ## Roadmap
 
