@@ -2,7 +2,8 @@
 """Compare response storage using matched common-wall benchmark generators.
 
 The control uses the unmodified base library and con-buffers-control.patch on
-this revision's benchmark source. Both binaries must be ReleaseFast builds.
+this revision's benchmark source. Both binaries must be fast builds
+(ReleaseFast on Zig 0.16).
 """
 import argparse
 import hashlib
@@ -56,7 +57,7 @@ def main():
     data = {
         "machine": platform.platform(),
         "zig": subprocess.check_output(["zig", "version"], text=True).strip(),
-        "build_mode": "ReleaseFast", "allocators": args.allocators,
+        "build_mode": "fast", "allocators": args.allocators,
         "base_library_commit": "51d6d76dcfc1be0c345602f4eef95991065c8730",
         "binary_sha256": {key: hashlib.sha256(path.read_bytes()).hexdigest() for key, path in binaries.items()},
         "control_patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
@@ -78,7 +79,8 @@ def main():
                                    "--window", "32", "--payload-only", str(payload), "--count", str(args.count),
                                    "--warmup", "1000", "--allocator", allocator, "--port", "29680"]
                         output = run(command)
-                        if f"build ReleaseFast; client allocator {allocator};" not in output:
+                        if not any(f"build {mode}; client allocator {allocator};" in output
+                                   for mode in ("fast", "ReleaseFast")):
                             raise RuntimeError("Build/allocator mismatch: " + output)
                         matches = list(ROW.finditer(output))
                         if len(matches) != 1:

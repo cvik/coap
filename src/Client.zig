@@ -512,9 +512,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         .rng = rng,
         .dtls_session = if (effective_config.psk != null) std.mem.zeroInit(dtls.Session.Session, .{ .addr = platform.ip4(.{ 0, 0, 0, 0 }, 0) }) else null,
         .dtls_client_hs_state = .idle,
-        .dtls_cached_session_id = .{0} ** 32,
+        .dtls_cached_session_id = @splat(0),
         .dtls_cached_session_id_len = 0,
-        .dtls_cached_master_secret = .{0} ** 48,
+        .dtls_cached_master_secret = @splat(0),
     };
 }
 
@@ -925,7 +925,7 @@ fn processResponse(client: *Client, idx: u16, data: []const u8) !?Completion {
     };
     client.peer_confirmed = true;
     if (packet.kind == .confirmable) client.sendAck(packet.msg_id, &.{}) catch |err| return client.finish(idx, err);
-    if (@intFromEnum(packet.code) >> 5 != 2)
+    if (@backingInt(packet.code) >> 5 != 2)
         return client.finish(idx, .{ .code = packet.code, .options = packet.options, .payload = packet.payload, .packet = packet });
     if (packet.find_option(.block2)) |option| {
         const block = option.as_block() orelse return client.finish(idx, error.InvalidBlock2);
@@ -969,7 +969,7 @@ fn continueBlock2(client: *Client, idx: u16, num: u32, szx: u3) !void {
     count += 1;
     const Order = struct {
         fn less(_: void, a: coapz.Option, b: coapz.Option) bool {
-            return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+            return @backingInt(a.kind) < @backingInt(b.kind);
         }
     };
     std.mem.sort(coapz.Option, options[0..count], {}, Order.less);
@@ -1197,7 +1197,7 @@ pub fn upload(
         combined[opt_count] = block_opt;
         std.mem.sort(coapz.Option, combined[0 .. opt_count + 1], {}, struct {
             fn less(_: void, a: coapz.Option, b: coapz.Option) bool {
-                return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+                return @backingInt(a.kind) < @backingInt(b.kind);
             }
         }.less);
 
@@ -1787,7 +1787,7 @@ test "plain and DTLS Block1/Block2 responses are bounded and allocation-free" {
         const uploaded = try client.upload(upload_storage.buffers(), .put, &.{
             .{ .kind = .uri_path, .value = "large" },
             .{ .kind = .size1, .value = &.{ 8, 0 } },
-        }, &([_]u8{7} ** 2048));
+        }, &@as([2048]u8, @splat(7)));
         try testing.expectEqualSlices(u8, &bounded_test_body, uploaded.payload);
         // The second reassembly must not overwrite the first result or metadata.
         try testing.expectEqualSlices(u8, &bounded_test_body, result.packet.payload);
@@ -1815,7 +1815,7 @@ test "cancel, timeout, and serialization failure release caller buffer borrows" 
     try testing.expectEqual(again, completion.handle);
     try testing.expectError(error.Timeout, completion.result);
     try testing.expectEqual(@as(u16, 0), client.count_active);
-    try testing.expectError(error.BufferTooSmall, client.submit(storage.buffers(), .get, &.{}, &([_]u8{0} ** 2000)));
+    try testing.expectError(error.BufferTooSmall, client.submit(storage.buffers(), .get, &.{}, &@as([2000]u8, @splat(0))));
     try testing.expectEqual(@as(u16, 0), client.count_active);
     const valid = try client.submit(storage.buffers(), .get, &.{}, "reused");
     client.cancel(valid);
@@ -1850,7 +1850,7 @@ test "Block2 handles reduced SZX, duplicate separate blocks, and retained option
         .{ .kind = .size1, .value = &.{55} },
     }, &.{});
     const token = client.slots[h].token;
-    try testing.expect((try injectTestBlock(&client, h, 0, 1, true, &([_]u8{1} ** 32), "tag", .acknowledgement)) == null);
+    try testing.expect((try injectTestBlock(&client, h, 0, 1, true, &@as([32]u8, @splat(1)), "tag", .acknowledgement)) == null);
     try testing.expectEqualSlices(u8, token[0..client.config.token_len], client.slots[h].token[0..client.config.token_len]);
     var decoded_options: [17]coapz.Option = undefined;
     const pending = &client.slots[h];
@@ -1860,13 +1860,13 @@ test "Block2 handles reduced SZX, duplicate separate blocks, and retained option
     try testing.expectEqual(.block2, continuation.options[2].kind);
     try testing.expectEqual(.size1, continuation.options[3].kind);
     // Retransmitted separate block: ACK it without duplicate assembly.
-    try testing.expect((try injectTestBlock(&client, h, 0, 1, true, &([_]u8{1} ** 32), "tag", .confirmable)) == null);
+    try testing.expect((try injectTestBlock(&client, h, 0, 1, true, &@as([32]u8, @splat(1)), "tag", .confirmable)) == null);
     try testing.expectEqual(@as(usize, 32), client.slots[h].block2_length);
-    try testing.expect((try injectTestBlock(&client, h, 2, 0, true, &([_]u8{2} ** 16), "tag", .acknowledgement)) == null);
+    try testing.expect((try injectTestBlock(&client, h, 2, 0, true, &@as([16]u8, @splat(2)), "tag", .acknowledgement)) == null);
     const completion = (try injectTestBlock(&client, h, 3, 0, false, "1234567", "tag", .acknowledgement)).?;
     try testing.expectEqual(h, completion.handle);
     const result = try completion.result;
-    try testing.expectEqualSlices(u8, &([_]u8{1} ** 32 ++ [_]u8{2} ** 16 ++ "1234567".*), result.payload);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(1)) ++ @as([16]u8, @splat(2)) ++ "1234567".*), result.payload);
     const next = try client.submit(.{ .packet = &.{}, .options = &.{} }, .get, &.{}, &.{});
     client.cancel(next);
     try testing.expectEqualSlices(u8, "tag", result.packet.find_option(.etag).?.value);
@@ -1881,20 +1881,20 @@ test "Block2 ETag mismatch and invalid offsets complete with correlated errors" 
     defer client.deinit();
     var storage: ResponseStorage(64) = .{};
     const h = try client.submit(storage.buffers(), .get, &.{}, &.{});
-    try testing.expect((try injectTestBlock(&client, h, 0, 0, true, &([_]u8{1} ** 16), "a", .acknowledgement)) == null);
+    try testing.expect((try injectTestBlock(&client, h, 0, 0, true, &@as([16]u8, @splat(1)), "a", .acknowledgement)) == null);
     const mismatch = (try injectTestBlock(&client, h, 1, 0, false, "end", "b", .acknowledgement)).?;
     try testing.expectEqual(h, mismatch.handle);
     try testing.expectError(error.EtagMismatch, mismatch.result);
     try testing.expectEqual(@as(u16, 0), client.count_active);
     const h2 = try client.submit(storage.buffers(), .get, &.{}, &.{});
-    const invalid = (try injectTestBlock(&client, h2, 1, 0, true, &([_]u8{1} ** 16), "a", .acknowledgement)).?;
+    const invalid = (try injectTestBlock(&client, h2, 1, 0, true, &@as([16]u8, @splat(1)), "a", .acknowledgement)).?;
     try testing.expectEqual(h2, invalid.handle);
     try testing.expectError(error.InvalidBlock2, invalid.result);
     try testing.expectEqual(@as(u16, 0), client.count_active);
     var block_buf: [3]u8 = undefined;
     const last = (coapz.BlockValue{ .num = 0xfffff, .szx = 0, .more = false }).option(.block2, &block_buf);
     const h3 = try client.submit(storage.buffers(), .get, &.{last}, &.{});
-    const exhausted = (try injectTestBlock(&client, h3, 0xfffff, 0, true, &([_]u8{1} ** 16), "a", .acknowledgement)).?;
+    const exhausted = (try injectTestBlock(&client, h3, 0xfffff, 0, true, &@as([16]u8, @splat(1)), "a", .acknowledgement)).?;
     try testing.expectEqual(h3, exhausted.handle);
     try testing.expectError(error.InvalidBlock2, exhausted.result);
     try testing.expectEqual(@as(u16, 0), client.count_active);

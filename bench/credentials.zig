@@ -30,7 +30,7 @@ pub const Credentials = struct {
     }
     pub fn load(path: []const u8) !Credentials {
         var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const zpath = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{path});
+        const zpath = try std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{path}, 0);
         const fd = try coap.platform.open(zpath, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         defer coap.platform.close(fd);
         var buffer: [2049]u8 = undefined;

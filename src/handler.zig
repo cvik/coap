@@ -45,7 +45,7 @@ pub const Request = struct {
     /// Observe context. Non-null when the server has an observer registry.
     observe_ctx: ?ObserveContext = null,
     /// Route parameters captured by the router (e.g. `:id` segments).
-    route_params: [max_route_params]RouteParam = [_]RouteParam{.{}} ** max_route_params,
+    route_params: [max_route_params]RouteParam = @splat(.{}),
     route_param_count: u8 = 0,
     payload_override: ?[]const u8 = null,
 
@@ -128,7 +128,7 @@ pub const Request = struct {
     /// Return the Echo option value from this request, if present (RFC 9175 §2).
     /// The handler can compare this with a previously sent Echo to verify freshness.
     pub fn echoOption(self: Request) ?[]const u8 {
-        const echo_kind: coapz.OptionKind = @enumFromInt(252);
+        const echo_kind: coapz.OptionKind = @fromBackingInt(@intCast(252));
         if (self.packet.find_option(echo_kind)) |opt| return opt.value;
         return null;
     }
@@ -292,7 +292,7 @@ pub const Response = struct {
     /// verification. The client must reflect the Echo value in subsequent
     /// requests. Generates a random 8-byte Echo value.
     pub fn withEcho(self: Response, arena: std.mem.Allocator) Response {
-        const echo_kind: coapz.OptionKind = @enumFromInt(252);
+        const echo_kind: coapz.OptionKind = @fromBackingInt(@intCast(252));
         var echo_val: [8]u8 = undefined;
         platform.randomBytes(&echo_val);
         const echo_opt = coapz.Option{ .kind = echo_kind, .value = arena.dupe(u8, &echo_val) catch return self };

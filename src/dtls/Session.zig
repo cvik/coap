@@ -203,10 +203,10 @@ pub const SessionTable = struct {
             .state = .handshaking,
             .peer_hash = hash,
             .addr = addr,
-            .client_write_key = .{0} ** 16,
-            .server_write_key = .{0} ** 16,
-            .client_write_iv = .{0} ** 4,
-            .server_write_iv = .{0} ** 4,
+            .client_write_key = @splat(0),
+            .server_write_key = @splat(0),
+            .client_write_iv = @splat(0),
+            .server_write_iv = @splat(0),
             .read_epoch = 0,
             .write_epoch = 0,
             .read_sequence = 0,
@@ -214,16 +214,16 @@ pub const SessionTable = struct {
             .replay_window = 0,
             .handshake_state = .idle,
             .handshake_hash = Sha256.init(.{}),
-            .client_random = .{0} ** 32,
-            .server_random = .{0} ** 32,
+            .client_random = @splat(0),
+            .server_random = @splat(0),
             .message_seq = 0,
             .retransmit_deadline_ns = 0,
             .retransmit_count = 0,
             .retransmit_timeout_ms = 0,
-            .last_flight = .{0} ** 256,
+            .last_flight = @splat(0),
             .last_flight_len = 0,
-            .master_secret = .{0} ** 48,
-            .session_id = .{0} ** 32,
+            .master_secret = @splat(0),
+            .session_id = @splat(0),
             .session_id_len = 0,
             .last_activity_ns = now_ns,
             .lru_prev = empty_sentinel,
@@ -437,9 +437,9 @@ test "release zeros key material" {
 
     try testing.expectEqual(@as(u32, 0), tbl.count_active);
     // Keys should be zeroed by zeroKeys().
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &session.client_write_key);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &session.server_write_key);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 48), &session.master_secret);
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &session.client_write_key);
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &session.server_write_key);
+    try testing.expectEqualSlices(u8, &@as([48]u8, @splat(0)), &session.master_secret);
 
     // Lookup should find nothing.
     try testing.expect(tbl.lookup(addr) == null);

@@ -129,7 +129,7 @@ fn ctrEncrypt(aes: AesEncryptCtx(Aes128), nonce: [nonce_len]u8, src: []const u8,
 
     // Final partial block.
     if (offset < src.len) {
-        var pad: [block_len]u8 = .{0} ** block_len;
+        var pad: [block_len]u8 = @splat(0);
         const tail = src.len - offset;
         @memcpy(pad[0..tail], src[offset..][0..tail]);
         aes.xor(&pad, &pad, makeCtrBlock(nonce, counter));
@@ -166,7 +166,7 @@ fn computeCbcMac(aes: AesEncryptCtx(Aes128), plaintext: []const u8, ad: []const 
         var tmp: [block_len]u8 = undefined;
 
         // Build the first AD block: [len_hi, len_lo, ad[0..14 or less]]
-        var ad_block: [block_len]u8 = [_]u8{0} ** block_len;
+        var ad_block: [block_len]u8 = @splat(0);
         ad_block[0] = @intCast((ad.len >> 8) & 0xFF);
         ad_block[1] = @intCast(ad.len & 0xFF);
         const first_chunk = @min(block_len - 2, ad.len);
@@ -187,13 +187,14 @@ fn computeCbcMac(aes: AesEncryptCtx(Aes128), plaintext: []const u8, ad: []const 
         }
     }
 
-    // Keep the full-block XOR fixed-width. A variable-sized byte loop here
-    // prevents efficient vectorization with Zig 0.16 for large DTLS records.
+    // Keep the XOR fixed-width and reinterpret byte storage directly.
+    // Zig 0.17's logical array/vector bitCast can otherwise scalarize the
+    // loop-carried MAC into costly byte extractions and insertions.
     var pt_offset: usize = 0;
     while (plaintext.len - pt_offset >= block_len) : (pt_offset += block_len) {
-        const block = plaintext[pt_offset..][0..block_len].*;
-        x = @bitCast(@as(@Vector(block_len, u8), @bitCast(x)) ^
-            @as(@Vector(block_len, u8), @bitCast(block)));
+        const mac: *align(1) @Vector(block_len, u8) = @ptrCast(&x);
+        const block: *align(1) const @Vector(block_len, u8) = @ptrCast(plaintext[pt_offset..][0..block_len]);
+        mac.* ^= block.*;
         var tmp: [block_len]u8 = undefined;
         aes.encrypt(&tmp, &x);
         x = tmp;
@@ -227,28 +228,55 @@ test "CCM block and wide-block boundaries match independent AESCCM vectors" {
         .{ 1000, "380b19c3ee26288dd91955fec5cb5ff370baa9b95fbf8d97c77f000dbb7da2b0" },
         .{ 1024, "7d181bca0e31a073d7e6cf80572e6df2042a4679e4fd402c7d6ad7ca16b3f9b6" },
     };
+    const ad: [13]u8 = @splat(4);
+    const nonce: [nonce_len]u8 = @splat(3);
+    const key: [key_len]u8 = @splat(7);
     var plaintext: [1024]u8 = undefined;
     for (&plaintext, 0..) |*b, i| b.* = @intCast(i % 251);
     var ciphertext: [1032]u8 = undefined;
     var recovered: [1024]u8 = undefined;
     inline for (vectors) |v| {
         const len = v[0];
-        encrypt(plaintext[0..len], &(.{4} ** 13), .{3} ** 12, .{7} ** 16, ciphertext[0 .. len + tag_len]);
+        encrypt(plaintext[0..len], &ad, nonce, key, ciphertext[0 .. len + tag_len]);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(ciphertext[0 .. len + tag_len], &digest, .{});
         var expected: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(&expected, v[1]);
         try std.testing.expectEqualSlices(u8, &expected, &digest);
-        try decrypt(ciphertext[0 .. len + tag_len], &(.{4} ** 13), .{3} ** 12, .{7} ** 16, recovered[0..len]);
+        try decrypt(ciphertext[0 .. len + tag_len], &ad, nonce, key, recovered[0..len]);
         try std.testing.expectEqualSlices(u8, plaintext[0..len], recovered[0..len]);
     }
 }
 
 const testing = std.testing;
 
+test "CCM full-block vector views support unaligned buffers" {
+    var storage: [1001]u8 align(16) = undefined;
+    var encrypted: [1009]u8 align(16) = undefined;
+    var recovered: [1001]u8 align(16) = undefined;
+    const plaintext = storage[1..];
+    const ciphertext = encrypted[1..];
+    const output = recovered[1..];
+    for (plaintext, 0..) |*b, i| b.* = @intCast(i % 251);
+    const key: [key_len]u8 = @splat(7);
+    const nonce: [nonce_len]u8 = @splat(3);
+    const ad: [13]u8 = @splat(4);
+    encrypt(plaintext, &ad, nonce, key, ciphertext);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ciphertext, &digest, .{});
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "380b19c3ee26288dd91955fec5cb5ff370baa9b95fbf8d97c77f000dbb7da2b0");
+    try testing.expectEqualSlices(u8, &expected, &digest);
+    try decrypt(ciphertext, &ad, nonce, key, output);
+    try testing.expectEqualSlices(u8, plaintext, output);
+    ciphertext[ciphertext.len - 1] ^= 1;
+    try testing.expectError(error.AuthenticationFailed, decrypt(ciphertext, &ad, nonce, key, output));
+    try testing.expectEqualSlices(u8, &@as([1000]u8, @splat(0)), output);
+}
+
 test "round-trip: basic encrypt/decrypt" {
-    const key = [_]u8{0x01} ** key_len;
-    const nonce = [_]u8{0x02} ** nonce_len;
+    const key: [key_len]u8 = @splat(0x01);
+    const nonce: [nonce_len]u8 = @splat(0x02);
     const plaintext = "Hello, DTLS!";
     const ad = "additional data";
 
@@ -261,8 +289,8 @@ test "round-trip: basic encrypt/decrypt" {
 }
 
 test "authentication failure on tampered ciphertext" {
-    const key = [_]u8{0xAB} ** key_len;
-    const nonce = [_]u8{0xCD} ** nonce_len;
+    const key: [key_len]u8 = @splat(0xAB);
+    const nonce: [nonce_len]u8 = @splat(0xCD);
     const plaintext = "secret message";
     const ad = "header";
 
@@ -278,8 +306,8 @@ test "authentication failure on tampered ciphertext" {
 }
 
 test "authentication failure on tampered tag" {
-    const key = [_]u8{0x11} ** key_len;
-    const nonce = [_]u8{0x22} ** nonce_len;
+    const key: [key_len]u8 = @splat(0x11);
+    const nonce: [nonce_len]u8 = @splat(0x22);
     const plaintext = "data";
     const ad = "ad";
 
@@ -295,8 +323,8 @@ test "authentication failure on tampered tag" {
 }
 
 test "empty plaintext (tag only)" {
-    const key = [_]u8{0x42} ** key_len;
-    const nonce = [_]u8{0x99} ** nonce_len;
+    const key: [key_len]u8 = @splat(0x42);
+    const nonce: [nonce_len]u8 = @splat(0x99);
     const plaintext = "";
     const ad = "some header";
 
@@ -310,8 +338,8 @@ test "empty plaintext (tag only)" {
 }
 
 test "empty plaintext empty ad" {
-    const key = [_]u8{0x55} ** key_len;
-    const nonce = [_]u8{0x66} ** nonce_len;
+    const key: [key_len]u8 = @splat(0x55);
+    const nonce: [nonce_len]u8 = @splat(0x66);
 
     var ciphertext: [tag_len]u8 = undefined;
     encrypt("", "", nonce, key, &ciphertext);
@@ -321,8 +349,8 @@ test "empty plaintext empty ad" {
 }
 
 test "1-byte plaintext" {
-    const key = [_]u8{0xAA} ** key_len;
-    const nonce = [_]u8{0xBB} ** nonce_len;
+    const key: [key_len]u8 = @splat(0xAA);
+    const nonce: [nonce_len]u8 = @splat(0xBB);
     const plaintext = [_]u8{0xFF};
     const ad = "hdr";
 
@@ -335,9 +363,9 @@ test "1-byte plaintext" {
 }
 
 test "16-byte plaintext (exact block)" {
-    const key = [_]u8{0x12} ** key_len;
-    const nonce = [_]u8{0x34} ** nonce_len;
-    const plaintext = [_]u8{0x56} ** block_len;
+    const key: [key_len]u8 = @splat(0x12);
+    const nonce: [nonce_len]u8 = @splat(0x34);
+    const plaintext: [block_len]u8 = @splat(0x56);
     const ad = "block-aligned";
 
     var ciphertext: [plaintext.len + tag_len]u8 = undefined;
@@ -349,9 +377,9 @@ test "16-byte plaintext (exact block)" {
 }
 
 test "17-byte plaintext (crosses block boundary)" {
-    const key = [_]u8{0x78} ** key_len;
-    const nonce = [_]u8{0x9A} ** nonce_len;
-    const plaintext = [_]u8{0xBC} ** 17;
+    const key: [key_len]u8 = @splat(0x78);
+    const nonce: [nonce_len]u8 = @splat(0x9A);
+    const plaintext: [17]u8 = @splat(0xBC);
     const ad = "cross-block";
 
     var ciphertext: [plaintext.len + tag_len]u8 = undefined;
@@ -363,9 +391,9 @@ test "17-byte plaintext (crosses block boundary)" {
 }
 
 test "32-byte plaintext (two full blocks)" {
-    const key = [_]u8{0xDE} ** key_len;
-    const nonce = [_]u8{0xAD} ** nonce_len;
-    const plaintext = [_]u8{0xBE} ** 32;
+    const key: [key_len]u8 = @splat(0xDE);
+    const nonce: [nonce_len]u8 = @splat(0xAD);
+    const plaintext: [32]u8 = @splat(0xBE);
     const ad = "two blocks";
 
     var ciphertext: [plaintext.len + tag_len]u8 = undefined;
@@ -377,8 +405,8 @@ test "32-byte plaintext (two full blocks)" {
 }
 
 test "wrong AD causes authentication failure" {
-    const key = [_]u8{0x33} ** key_len;
-    const nonce = [_]u8{0x44} ** nonce_len;
+    const key: [key_len]u8 = @splat(0x33);
+    const nonce: [nonce_len]u8 = @splat(0x44);
     const plaintext = "payload";
     const ad = "correct-ad";
 
@@ -391,8 +419,8 @@ test "wrong AD causes authentication failure" {
 }
 
 test "output zeroed on auth failure" {
-    const key = [_]u8{0x77} ** key_len;
-    const nonce = [_]u8{0x88} ** nonce_len;
+    const key: [key_len]u8 = @splat(0x77);
+    const nonce: [nonce_len]u8 = @splat(0x88);
     const plaintext = "sensitive";
     const ad = "hdr";
 
@@ -402,16 +430,16 @@ test "output zeroed on auth failure" {
     // Tamper
     ciphertext[0] ^= 0x01;
 
-    var recovered: [plaintext.len]u8 = [_]u8{0xFF} ** plaintext.len;
+    var recovered: [plaintext.len]u8 = @splat(0xFF);
     _ = decrypt(&ciphertext, ad, nonce, key, &recovered) catch {};
     // After auth failure, output should be zeroed
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** plaintext.len), &recovered);
+    try testing.expectEqualSlices(u8, &@as([plaintext.len]u8, @splat(0)), &recovered);
 }
 
 test "different nonces produce different ciphertexts" {
-    const key = [_]u8{0xEE} ** key_len;
-    const nonce1 = [_]u8{0x01} ** nonce_len;
-    const nonce2 = [_]u8{0x02} ** nonce_len;
+    const key: [key_len]u8 = @splat(0xEE);
+    const nonce1: [nonce_len]u8 = @splat(0x01);
+    const nonce2: [nonce_len]u8 = @splat(0x02);
     const plaintext = "same plaintext";
     const ad = "same ad";
 

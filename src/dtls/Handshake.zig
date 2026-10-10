@@ -80,7 +80,7 @@ pub fn encodeHandshakeMessage(msg_type: types.HandshakeType, message_seq: u16, b
     const total = handshake_header_len + body.len;
     std.debug.assert(out.len >= total);
     const body_len: u24 = @intCast(body.len);
-    out[0] = @intFromEnum(msg_type);
+    out[0] = @backingInt(msg_type);
     out[1] = @intCast((body_len >> 16) & 0xFF);
     out[2] = @intCast((body_len >> 8) & 0xFF);
     out[3] = @intCast(body_len & 0xFF);
@@ -103,7 +103,7 @@ pub fn decodeHandshakeMessage(buf: []const u8) ?HandshakeMessage {
     if (frag_offset != 0 or frag_len != body_len) return null;
     if (buf.len < handshake_header_len + body_len) return null;
     return .{
-        .msg_type = @enumFromInt(buf[0]),
+        .msg_type = @fromBackingInt(@intCast(buf[0])),
         .message_seq = std.mem.readInt(u16, buf[4..6], .big),
         .body = buf[handshake_header_len..][0..body_len],
     };
@@ -362,7 +362,7 @@ fn serverHandleClientHello(
         sh_body[34] = session.session_id_len;
         @memcpy(sh_body[35..][0..session.session_id_len], session.session_id[0..session.session_id_len]);
         const cs_off = 35 + @as(usize, session.session_id_len);
-        std.mem.writeInt(u16, sh_body[cs_off..][0..2], @intFromEnum(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
+        std.mem.writeInt(u16, sh_body[cs_off..][0..2], @backingInt(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
         sh_body[cs_off + 2] = 0; // compression = null
         const sh_len = cs_off + 3;
 
@@ -952,7 +952,7 @@ fn buildClientHelloBody(client_random: [32]u8, cookie: []const u8, session_id: [
     // cipher_suites: length(2) + TLS_PSK_WITH_AES_128_CCM_8(2)
     std.mem.writeInt(u16, out[off..][0..2], 2, .big);
     off += 2;
-    std.mem.writeInt(u16, out[off..][0..2], @intFromEnum(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
+    std.mem.writeInt(u16, out[off..][0..2], @backingInt(types.CipherSuite.tls_psk_with_aes_128_ccm_8), .big);
     off += 2;
 
     // compression_methods: length(1) + null(1)
@@ -980,7 +980,7 @@ test "buildPreMasterSecret: known PSK" {
     // First 2 bytes: PSK length (9) in big-endian.
     try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, pms[0..2], .big));
     // Next 9 bytes: zeroes.
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 9), pms[2..11]);
+    try testing.expectEqualSlices(u8, &@as([9]u8, @splat(0)), pms[2..11]);
     // Next 2 bytes: PSK length again.
     try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, pms[11..13], .big));
     // Final 9 bytes: PSK value.
@@ -992,8 +992,8 @@ test "deriveKeys: deterministic and distinct" {
     var pms_buf: [256]u8 = undefined;
     const pms = buildPreMasterSecret(psk, &pms_buf);
 
-    const client_random = [_]u8{0x11} ** 32;
-    const server_random = [_]u8{0x22} ** 32;
+    const client_random: [32]u8 = @splat(0x11);
+    const server_random: [32]u8 = @splat(0x22);
 
     const master = deriveMasterSecret(pms, client_random, server_random);
     const keys1 = deriveKeys(master, server_random, client_random);
@@ -1025,7 +1025,7 @@ test "handshake message encode/decode round-trip" {
 }
 
 test "decodeHandshakeMessage: too short" {
-    const short = [_]u8{0} ** 11;
+    const short: [11]u8 = @splat(0);
     try testing.expect(decodeHandshakeMessage(&short) == null);
 }
 
@@ -1033,7 +1033,7 @@ test "full server handshake" {
     const psk_identity = "test-identity";
     const psk_key = "test-key-value";
     const psk = types.Psk{ .identity = psk_identity, .key = psk_key };
-    const cookie_secret = [_]u8{0x42} ** 32;
+    const cookie_secret: [32]u8 = @splat(0x42);
     const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
 
     // Create a server session.
@@ -1140,7 +1140,7 @@ test "full client-server handshake integration" {
     const psk_identity = "my-device";
     const psk_key = "my-secret-key";
     const psk = types.Psk{ .identity = psk_identity, .key = psk_key };
-    const cookie_secret = [_]u8{0xAA} ** 32;
+    const cookie_secret: [32]u8 = @splat(0xAA);
     const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
 
     var server_session: Session.Session = undefined;
@@ -1321,10 +1321,10 @@ fn initTestSession(session: *Session.Session, addr: std.Io.net.IpAddress) void {
         .state = .handshaking,
         .peer_hash = 0,
         .addr = addr,
-        .client_write_key = .{0} ** 16,
-        .server_write_key = .{0} ** 16,
-        .client_write_iv = .{0} ** 4,
-        .server_write_iv = .{0} ** 4,
+        .client_write_key = @splat(0),
+        .server_write_key = @splat(0),
+        .client_write_iv = @splat(0),
+        .server_write_iv = @splat(0),
         .read_epoch = 0,
         .write_epoch = 0,
         .read_sequence = 0,
@@ -1332,16 +1332,16 @@ fn initTestSession(session: *Session.Session, addr: std.Io.net.IpAddress) void {
         .replay_window = 0,
         .handshake_state = .idle,
         .handshake_hash = Sha256.init(.{}),
-        .client_random = .{0} ** 32,
-        .server_random = .{0} ** 32,
+        .client_random = @splat(0),
+        .server_random = @splat(0),
         .message_seq = 0,
         .retransmit_deadline_ns = 0,
         .retransmit_count = 0,
         .retransmit_timeout_ms = 0,
-        .last_flight = .{0} ** 256,
+        .last_flight = @splat(0),
         .last_flight_len = 0,
-        .master_secret = .{0} ** 48,
-        .session_id = .{0} ** 32,
+        .master_secret = @splat(0),
+        .session_id = @splat(0),
         .session_id_len = 0,
         .last_activity_ns = 0,
         .lru_prev = 0xFFFFFFFF,
@@ -1352,7 +1352,7 @@ fn initTestSession(session: *Session.Session, addr: std.Io.net.IpAddress) void {
 
 test "session resumption: server abbreviated path with ResumptionData" {
     const psk = types.Psk{ .identity = "test-device", .key = "my-secret-key" };
-    const cookie_secret = [_]u8{0xAA} ** 32;
+    const cookie_secret: [32]u8 = @splat(0xAA);
     const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
 
     // Simulate a previously established session with known master_secret.
@@ -1449,7 +1449,7 @@ test "session resumption: server abbreviated path with ResumptionData" {
     try testing.expectEqualSlices(u8, &saved_session_id, &server_session.session_id);
     try testing.expectEqualSlices(u8, &saved_master_secret, &server_session.master_secret);
     try testing.expect(server_session.write_epoch == 1); // CCS was sent
-    try testing.expect(!std.mem.eql(u8, &server_session.server_write_key, &([_]u8{0} ** 16))); // keys derived
+    try testing.expect(!std.mem.eql(u8, &server_session.server_write_key, &@as([16]u8, @splat(0)))); // keys derived
 }
 
 test "session resumption: client sends cached session_id" {

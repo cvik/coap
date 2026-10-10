@@ -80,7 +80,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !ObserverRegistry {
     for (observers) |*obs| {
         obs.* = .{
             .peer_address = platform.ip4(.{ 0, 0, 0, 0 }, 0),
-            .token = .{0} ** 8,
+            .token = @splat(0),
             .token_len = 0,
         };
     }
@@ -162,7 +162,7 @@ pub fn addObserver(self: *ObserverRegistry, resource_id: u16, peer: std.Io.net.I
             obs.active = true;
             obs.peer_address = peer;
             obs.token_len = @intCast(@min(token.len, 8));
-            obs.token = .{0} ** 8;
+            obs.token = @splat(0);
             @memcpy(obs.token[0..obs.token_len], token[0..obs.token_len]);
             obs.notify_count = 0;
             obs.pending_con_msg_id = 0;
@@ -252,7 +252,7 @@ pub fn notify(self: *ObserverRegistry, resource_id: u16, response: handler.Respo
     // Layout: [code:1][obs_seq:4 LE][opts_count:1][opts...][payload...]
     // Each option: [kind:2 LE][len:2 LE][value:len]
     const resp_opts: u8 = @intCast(@min(response.options.len, 15));
-    buf[0] = @intFromEnum(response.code);
+    buf[0] = @backingInt(response.code);
     std.mem.writeInt(u32, buf[1..5], seq, .little);
     buf[5] = resp_opts;
     var buf_pos: usize = 6;
@@ -262,7 +262,7 @@ pub fn notify(self: *ObserverRegistry, resource_id: u16, response: handler.Respo
             qs.seq.store(pos +% 1, .release);
             return;
         }
-        std.mem.writeInt(u16, buf[buf_pos..][0..2], @intFromEnum(opt.kind), .little);
+        std.mem.writeInt(u16, buf[buf_pos..][0..2], @backingInt(opt.kind), .little);
         std.mem.writeInt(u16, buf[buf_pos + 2 ..][0..2], @intCast(opt.value.len), .little);
         buf_pos += 4;
         @memcpy(buf[buf_pos..][0..opt.value.len], opt.value);
@@ -332,7 +332,7 @@ pub const NotifyMeta = struct {
 /// `arena` is used to allocate the options array.
 pub fn decodeNotifyMeta(data: []const u8, arena: std.mem.Allocator) ?NotifyMeta {
     if (data.len < 6) return null;
-    const code: coapz.Code = @enumFromInt(data[0]);
+    const code: coapz.Code = @fromBackingInt(@intCast(data[0]));
     const obs_seq = std.mem.readInt(u32, data[1..5], .little);
     const opts_count = data[5];
     var buf_pos: usize = 6;
@@ -340,7 +340,7 @@ pub fn decodeNotifyMeta(data: []const u8, arena: std.mem.Allocator) ?NotifyMeta 
     const options = arena.alloc(coapz.Option, @as(usize, opts_count) + 1) catch return null;
     for (0..opts_count) |i| {
         if (buf_pos + 4 > data.len) return null;
-        const kind: coapz.OptionKind = @enumFromInt(std.mem.readInt(u16, data[buf_pos..][0..2], .little));
+        const kind: coapz.OptionKind = @fromBackingInt(@intCast(std.mem.readInt(u16, data[buf_pos..][0..2], .little)));
         const vlen = std.mem.readInt(u16, data[buf_pos + 2 ..][0..2], .little);
         buf_pos += 4;
         if (buf_pos + vlen > data.len) return null;

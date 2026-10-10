@@ -60,9 +60,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run benchmark client");
     bench_step.dependOn(&run_bench.step);
 

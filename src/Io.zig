@@ -137,7 +137,7 @@ pub fn recv_multishot(
     const sqe = try io.ring.get_sqe();
     sqe.prep_recvmsg_multishot(0, msg_header, MSG_TRUNC);
     sqe.flags |= linux.IOSQE_BUFFER_SELECT | linux.IOSQE_FIXED_FILE;
-    sqe.user_data = @intFromEnum(UserData.recv_msg);
+    sqe.user_data = @backingInt(UserData.recv_msg);
     sqe.buf_index = constants.buffer_group_id;
 }
 
@@ -150,7 +150,7 @@ pub fn send_msg(
     const sqe = try io.ring.get_sqe();
     sqe.prep_sendmsg(0, msg_header, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
-    sqe.user_data = @intFromEnum(UserData.send_msg);
+    sqe.user_data = @backingInt(UserData.send_msg);
 }
 
 /// Wait for at least `wait_count` completions. Does not submit.
@@ -205,8 +205,8 @@ pub fn decode_recv(io: *const Io, cqe: *const Cqe) !RecvResult {
         return error.PayloadOutOfBounds;
     }
 
-    // Determine address family from the first 2 bytes of the name area.
-    const peer_family = std.mem.readInt(u16, io.buffers[name_offset..][0..2], .little);
+    // sockaddr's family is native-endian, unlike its network-endian port.
+    const peer_family = std.mem.bytesToValue(u16, io.buffers[name_offset..][0..2]);
 
     var peer: platform.SocketAddress = undefined;
     const address_len: usize = switch (peer_family) {
@@ -230,17 +230,17 @@ pub fn decode_recv(io: *const Io, cqe: *const Cqe) !RecvResult {
 /// Ensures `wait_cqes` unblocks periodically so the server can
 /// check shutdown flags even when no packets arrive.
 pub fn queue_timeout(io: *Io, ts: *const linux.kernel_timespec) !void {
-    _ = try io.ring.timeout(@intFromEnum(UserData.tick_timeout), ts, 0, 0);
+    _ = try io.ring.timeout(@backingInt(UserData.tick_timeout), ts, 0, 0);
 }
 
 /// Check whether a CQE is a recv_msg completion.
 pub fn is_recv(cqe: *const Cqe) bool {
-    return cqe.user_data == @intFromEnum(UserData.recv_msg);
+    return cqe.user_data == @backingInt(UserData.recv_msg);
 }
 
 /// Check whether a CQE is a tick timeout completion.
 pub fn is_timeout(cqe: *const Cqe) bool {
-    return cqe.user_data == @intFromEnum(UserData.tick_timeout);
+    return cqe.user_data == @backingInt(UserData.tick_timeout);
 }
 
 /// Check whether a CQE completed successfully.
@@ -259,6 +259,37 @@ fn checkInitAllocation(allocator: std.mem.Allocator) !void {
 
 test "provided ring init cleans up after allocation failures" {
     try testing.checkAllAllocationFailures(testing.allocator, checkInitAllocation, .{});
+}
+
+test "decode_recv preserves IPv4 and scoped IPv6 socket addresses" {
+    const addresses = [_]std.Io.net.IpAddress{
+        platform.ip4(.{ 1, 2, 3, 4 }, 0x1234),
+        try platform.parseIp("fe80::1%3", 5684),
+    };
+    for (addresses) |address| {
+        var buffer: [64]u8 align(@alignOf(linux.io_uring_recvmsg_out)) = @splat(0);
+        const sa = platform.SocketAddress.init(address);
+        const header: *linux.io_uring_recvmsg_out = @ptrCast(&buffer);
+        header.* = .{ .namelen = sa.len(), .controllen = 0, .payloadlen = 4, .flags = 0 };
+        const name_offset = @sizeOf(linux.io_uring_recvmsg_out);
+        @memcpy(buffer[name_offset..][0..sa.len()], sa.bytes());
+        @memcpy(buffer[name_offset + sa.len() ..][0..4], "ping");
+        const io: Io = .{
+            .ring = undefined,
+            .buffers = &buffer,
+            .iovecs = &.{},
+            .buffer_count = 1,
+            .buffer_size = buffer.len,
+            .fd_socket = null,
+            .buffer_ring = undefined,
+            .buffer_ring_entries = 0,
+        };
+        const cqe: Cqe = .{ .user_data = 0, .res = 0, .flags = linux.IORING_CQE_F_BUFFER };
+        const result = try io.decode_recv(&cqe);
+        try testing.expect(platform.addressEqual(address, result.peer_address));
+        try testing.expectEqualStrings("ping", result.payload);
+        try testing.expectEqual(@as(u16, 0), result.buffer_id);
+    }
 }
 
 test "SO_REUSEPORT allows two instances on same port" {

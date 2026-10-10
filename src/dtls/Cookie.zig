@@ -31,38 +31,38 @@ pub fn verifyWithRotation(current_secret: [32]u8, previous_secret: [32]u8, clien
 }
 
 test "generate and verify round-trip" {
-    const secret = [_]u8{0x42} ** 32;
+    const secret: [32]u8 = @splat(0x42);
     const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
-    const random = [_]u8{0xab} ** 32;
+    const random: [32]u8 = @splat(0xab);
 
     const cookie = generate(secret, addr, random);
     try std.testing.expect(verify(secret, addr, random, &cookie));
 }
 
 test "verify fails with wrong address" {
-    const secret = [_]u8{0x01} ** 32;
+    const secret: [32]u8 = @splat(0x01);
     const addr1 = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
     const addr2 = platform.ip4([4]u8{ 192, 168, 1, 1 }, 5684);
-    const random = [_]u8{0x22} ** 32;
+    const random: [32]u8 = @splat(0x22);
 
     const cookie = generate(secret, addr1, random);
     try std.testing.expect(!verify(secret, addr2, random, &cookie));
 }
 
 test "verify fails with wrong secret" {
-    const secret1 = [_]u8{0x01} ** 32;
-    const secret2 = [_]u8{0x02} ** 32;
+    const secret1: [32]u8 = @splat(0x01);
+    const secret2: [32]u8 = @splat(0x02);
     const addr = platform.ip4([4]u8{ 10, 0, 0, 1 }, 5684);
-    const random = [_]u8{0x33} ** 32;
+    const random: [32]u8 = @splat(0x33);
 
     const cookie = generate(secret1, addr, random);
     try std.testing.expect(!verify(secret2, addr, random, &cookie));
 }
 
 test "verify fails with wrong length (truncated cookie)" {
-    const secret = [_]u8{0x55} ** 32;
+    const secret: [32]u8 = @splat(0x55);
     const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
-    const random = [_]u8{0x66} ** 32;
+    const random: [32]u8 = @splat(0x66);
 
     const cookie = generate(secret, addr, random);
     try std.testing.expect(!verify(secret, addr, random, cookie[0..16]));
@@ -71,20 +71,20 @@ test "verify fails with wrong length (truncated cookie)" {
 }
 
 test "verify fails with wrong client_random" {
-    const secret = [_]u8{0x77} ** 32;
+    const secret: [32]u8 = @splat(0x77);
     const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
-    const random1 = [_]u8{0x88} ** 32;
-    const random2 = [_]u8{0x99} ** 32;
+    const random1: [32]u8 = @splat(0x88);
+    const random2: [32]u8 = @splat(0x99);
 
     const cookie = generate(secret, addr, random1);
     try std.testing.expect(!verify(secret, addr, random2, &cookie));
 }
 
 test "verifyWithRotation accepts cookie from previous secret" {
-    const current = [_]u8{0xaa} ** 32;
-    const previous = [_]u8{0xbb} ** 32;
+    const current: [32]u8 = @splat(0xaa);
+    const previous: [32]u8 = @splat(0xbb);
     const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
-    const random = [_]u8{0xcc} ** 32;
+    const random: [32]u8 = @splat(0xcc);
 
     const cookie = generate(previous, addr, random);
     try std.testing.expect(verifyWithRotation(current, previous, addr, random, &cookie));
@@ -94,11 +94,11 @@ test "verifyWithRotation accepts cookie from previous secret" {
 }
 
 test "verifyWithRotation rejects cookie from neither secret" {
-    const current = [_]u8{0xdd} ** 32;
-    const previous = [_]u8{0xee} ** 32;
-    const other = [_]u8{0xff} ** 32;
+    const current: [32]u8 = @splat(0xdd);
+    const previous: [32]u8 = @splat(0xee);
+    const other: [32]u8 = @splat(0xff);
     const addr = platform.ip4([4]u8{ 127, 0, 0, 1 }, 5684);
-    const random = [_]u8{0x11} ** 32;
+    const random: [32]u8 = @splat(0x11);
 
     const cookie = generate(other, addr, random);
     try std.testing.expect(!verifyWithRotation(current, previous, addr, random, &cookie));

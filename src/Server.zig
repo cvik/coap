@@ -364,8 +364,8 @@ fn init_raw(
     errdefer if (rate_limiter) |*rl| rl.deinit(allocator);
 
     var dtls_sessions: ?*dtls.Session.SessionTable = null;
-    var dtls_cookie_secret: [32]u8 = .{0} ** 32;
-    var dtls_cookie_secret_prev: [32]u8 = .{0} ** 32;
+    var dtls_cookie_secret: [32]u8 = @splat(0);
+    var dtls_cookie_secret_prev: [32]u8 = @splat(0);
     if (config.psk != null) {
         const tbl_ptr = try allocator.create(dtls.Session.SessionTable);
         errdefer allocator.destroy(tbl_ptr);
@@ -1413,18 +1413,18 @@ fn process_dtls_record(
                         server.process_dtls_coap(record.payload, sess, peer, index);
                     },
                     .alert => {
-                        if (record.payload.len >= 2 and record.payload[0] == @intFromEnum(dtls.types.AlertLevel.fatal)) {
+                        if (record.payload.len >= 2 and record.payload[0] == @backingInt(dtls.types.AlertLevel.fatal)) {
                             log.debug("DTLS: received fatal alert {d}", .{record.payload[1]});
                             tbl.release(sess);
                             return;
-                        } else if (record.payload.len >= 2 and record.payload[1] == @intFromEnum(dtls.types.AlertDescription.close_notify)) {
+                        } else if (record.payload.len >= 2 and record.payload[1] == @backingInt(dtls.types.AlertDescription.close_notify)) {
                             log.debug("DTLS: close_notify from peer", .{});
                             tbl.release(sess);
                             return;
                         }
                     },
                     else => {
-                        log.debug("DTLS: unexpected content type in encrypted record: {d}", .{@intFromEnum(record.content_type)});
+                        log.debug("DTLS: unexpected content type in encrypted record: {d}", .{@backingInt(record.content_type)});
                     },
                 }
             } else {
@@ -1875,7 +1875,7 @@ fn handleBlock1(
 ) ?Block1Result {
     // Extract Request-Tag (RFC 9175 §3) for Block1 disambiguation.
     // Request-Tag option number 292 (RFC 9175).
-    const request_tag_kind: coapz.OptionKind = @enumFromInt(292);
+    const request_tag_kind: coapz.OptionKind = @fromBackingInt(@intCast(292));
     const request_tag: []const u8 = if (packet.find_option(request_tag_kind)) |rt| rt.value else &.{};
 
     if (bv.num == 0) {
@@ -2467,7 +2467,7 @@ fn hasUnrecognizedCriticalOption(
     options: []const coapz.Option,
 ) bool {
     for (options) |opt| {
-        const num = @intFromEnum(opt.kind);
+        const num = @backingInt(opt.kind);
         if (num & 1 == 0) continue; // elective
         if (isRecognizedOption(opt.kind)) continue;
         if (std.mem.indexOfScalar(u16, server.config.recognized_options, num) != null) continue;
@@ -3180,7 +3180,7 @@ test "CON with unknown critical option returns 4.02 Bad Option" {
         .msg_id = 0xCC01,
         .token = &.{0x01},
         .options = &.{
-            .{ .kind = @enumFromInt(99), .value = "x" },
+            .{ .kind = @fromBackingInt(@intCast(99)), .value = "x" },
         },
         .payload = "hello",
         .data_buf = &.{},
@@ -3219,7 +3219,7 @@ test "NON with unknown critical option returns 4.02 Bad Option" {
         .msg_id = 0xCC02,
         .token = &.{0x02},
         .options = &.{
-            .{ .kind = @enumFromInt(99), .value = "x" },
+            .{ .kind = @fromBackingInt(@intCast(99)), .value = "x" },
         },
         .payload = "hello",
         .data_buf = &.{},
@@ -3294,7 +3294,7 @@ test "unknown elective option passes through to handler" {
         .msg_id = 0xCC04,
         .token = &.{0x04},
         .options = &.{
-            .{ .kind = @enumFromInt(100), .value = "ignored" },
+            .{ .kind = @fromBackingInt(@intCast(100)), .value = "ignored" },
         },
         .payload = "data",
         .data_buf = &.{},
@@ -3333,7 +3333,7 @@ test "recognized_options allows custom critical options" {
         .msg_id = 0xCC05,
         .token = &.{0x05},
         .options = &.{
-            .{ .kind = @enumFromInt(99), .value = "custom" },
+            .{ .kind = @fromBackingInt(@intCast(99)), .value = "custom" },
         },
         .payload = "ok",
         .data_buf = &.{},

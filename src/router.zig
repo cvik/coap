@@ -74,7 +74,7 @@ pub fn Router(comptime routes: anytype) type {
             const segments = comptime splitPath(path);
             var it = req.pathSegments();
             var result = CaptureResult{
-                .params = [_]Request.RouteParam{.{}} ** Request.max_route_params,
+                .params = @splat(.{}),
                 .count = 0,
             };
             inline for (segments) |expected| {

@@ -26,7 +26,7 @@ fn parseHeader(buf: []const u8) ?Header {
     // handshake for backward compatibility (e.g. HelloVerifyRequest).
     if (buf[1] != 0xFE or (buf[2] != 0xFD and buf[2] != 0xFF)) return null;
     return .{
-        .content_type = @as(types.ContentType, @enumFromInt(buf[0])),
+        .content_type = @as(types.ContentType, @fromBackingInt(@intCast(buf[0]))),
         .epoch = std.mem.readInt(u16, buf[3..5], .big),
         .sequence_number = std.mem.readInt(u48, buf[5..11], .big),
         .length = std.mem.readInt(u16, buf[11..13], .big),
@@ -42,7 +42,7 @@ fn writeHeader(
     length: u16,
 ) void {
     std.debug.assert(out.len >= types.record_header_len);
-    out[0] = @intFromEnum(content_type);
+    out[0] = @backingInt(content_type);
     // Version: DTLS 1.2 = 0xFE 0xFD
     out[1] = 0xFE;
     out[2] = 0xFD;
@@ -58,7 +58,7 @@ fn buildAd(epoch: u16, seq: u48, content_type: types.ContentType, plaintext_len:
     var ad: [types.record_header_len]u8 = undefined;
     std.mem.writeInt(u16, ad[0..2], epoch, .big);
     std.mem.writeInt(u48, ad[2..8], seq, .big);
-    ad[8] = @intFromEnum(content_type);
+    ad[8] = @backingInt(content_type);
     ad[9] = 0xFE; // DTLS 1.2
     ad[10] = 0xFD;
     std.mem.writeInt(u16, ad[11..13], plaintext_len, .big);
@@ -267,8 +267,8 @@ test "encode/decode plaintext record (epoch 0) round-trip" {
 
 test "encode/decode encrypted record (epoch 1) round-trip" {
     const payload = "secret data";
-    const key = [_]u8{0x01} ** 16;
-    const iv = [_]u8{0x02} ** 4;
+    const key: [16]u8 = @splat(0x01);
+    const iv: [4]u8 = @splat(0x02);
     var seq: u48 = 5;
 
     var buf: [types.record_overhead + payload.len]u8 = undefined;
@@ -291,8 +291,8 @@ test "encode/decode encrypted record (epoch 1) round-trip" {
 
 test "anti-replay window rejects duplicate" {
     const payload = "data";
-    const key = [_]u8{0xAA} ** 16;
-    const iv = [_]u8{0xBB} ** 4;
+    const key: [16]u8 = @splat(0xAA);
+    const iv: [4]u8 = @splat(0xBB);
     var seq: u48 = 10;
 
     var buf: [types.record_overhead + payload.len]u8 = undefined;
@@ -312,8 +312,8 @@ test "anti-replay window rejects duplicate" {
 }
 
 test "anti-replay window accepts out-of-order within window" {
-    const key = [_]u8{0x11} ** 16;
-    const iv = [_]u8{0x22} ** 4;
+    const key: [16]u8 = @splat(0x11);
+    const iv: [4]u8 = @splat(0x22);
     const payload = "pkt";
 
     // Encode records with seq 0, 1, 2.

@@ -14,7 +14,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build examples and benchmark tools
         run: zig build
@@ -23,7 +23,7 @@ jobs:
         run: zig build test
 
       - name: Build optimized artifacts
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=fast
 
       - name: Remote benchmark integration
         run: |

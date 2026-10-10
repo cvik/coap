@@ -263,7 +263,7 @@ test "Block1: handler receives full reassembled body" {
     defer client.deinit();
 
     // 2048-byte payload — requires multiple blocks at default szx=6 (1024 bytes).
-    const payload = [_]u8{0x42} ** 2048;
+    const payload: [2048]u8 = @splat(0x42);
     var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
     block1_received_len = 0;
     var storage: Client.ResponseStorage(0) = .{};
@@ -540,7 +540,7 @@ test "DTLS: Block1 upload delivers reassembled body" {
     try client.handshake();
     try testing.expectEqual(.established, client.dtls_session.?.state);
 
-    const payload = [_]u8{0x42} ** 2048;
+    const payload: [2048]u8 = @splat(0x42);
     var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
     block1_received_len = 0;
     var storage: Client.ResponseStorage(0) = .{};
