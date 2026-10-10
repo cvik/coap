@@ -14,6 +14,7 @@
 /// var server = try coap.Server.init(allocator, .{}, router.handler());
 /// ```
 const std = @import("std");
+const platform = @import("platform.zig");
 const coapz = @import("coapz");
 const handler_mod = @import("handler.zig");
 const Request = handler_mod.Request;
@@ -175,7 +176,7 @@ fn buildRequest(comptime method: coapz.Code, comptime path: []const u8) Request 
             .payload = "test",
             .data_buf = &.{},
         },
-        .peer_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        .peer_address = platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         .arena = testing.allocator,
     };
 }

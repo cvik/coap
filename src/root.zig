@@ -26,7 +26,7 @@
 //! }
 //!
 //! pub fn main() !void {
-//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     var gpa = std.heap.DebugAllocator(.{}){};
 //!     var server = try coap.Server.init(gpa.allocator(), .{}, echo);
 //!     defer server.deinit();
 //!     try server.run();
@@ -39,7 +39,7 @@
 //! const coap = @import("coap");
 //!
 //! pub fn main() !void {
-//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     var gpa = std.heap.DebugAllocator(.{}){};
 //!     const allocator = gpa.allocator();
 //!
 //!     var client = try coap.Client.init(allocator, .{
@@ -116,6 +116,8 @@ pub const ContentFormat = coap.ContentFormat;
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
 const Io = @import("Io.zig");
+/// Linux backend support, also used by the benchmark.
+pub const platform = @import("platform.zig");
 const Exchange = @import("exchange.zig");
 const RateLimiter = @import("rate_limiter.zig");
 const Deferred = @import("deferred.zig");
@@ -137,6 +139,7 @@ test {
     _ = handler;
     _ = constants;
     _ = Io;
+    _ = platform;
     _ = Server;
     _ = Client;
     _ = Exchange;

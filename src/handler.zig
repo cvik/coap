@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("platform.zig");
 const coapz = @import("coapz");
 const Deferred = @import("deferred.zig");
 const ObserverRegistry = @import("observe.zig");
@@ -31,7 +32,7 @@ pub const Request = struct {
     /// kind, raw option iteration).
     packet: coapz.Packet,
     /// Source address of the peer.
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     /// Per-request arena allocator. Resets after the handler returns.
     /// Use for temporary allocations needed during response construction
     /// (e.g. duping option slices via `Response.content()`).
@@ -63,7 +64,7 @@ pub const Request = struct {
     /// Context for observe registration. Provided by the server.
     pub const ObserveContext = struct {
         registry: *ObserverRegistry,
-        peer_address: std.net.Address,
+        peer_address: std.Io.net.IpAddress,
         token: []const u8,
     };
 
@@ -88,7 +89,7 @@ pub const Request = struct {
             self.packet.token,
             self.peer_address,
             ctx.next_msg_id,
-            @truncate(std.time.nanoTimestamp()),
+            @truncate(platform.nanoTimestamp()),
         ) orelse return null;
         return .{ .pool = ctx.pool, .slot_idx = idx };
     }
@@ -293,7 +294,7 @@ pub const Response = struct {
     pub fn withEcho(self: Response, arena: std.mem.Allocator) Response {
         const echo_kind: coapz.OptionKind = @enumFromInt(252);
         var echo_val: [8]u8 = undefined;
-        std.crypto.random.bytes(&echo_val);
+        platform.randomBytes(&echo_val);
         const echo_opt = coapz.Option{ .kind = echo_kind, .value = arena.dupe(u8, &echo_val) catch return self };
         const existing = self.options;
         const opts = arena.alloc(coapz.Option, existing.len + 1) catch return self;
@@ -312,7 +313,7 @@ pub const SimpleHandlerFn = *const fn (Request) ?Response;
 /// Trampoline for simple handlers: recovers the original function pointer
 /// from the type-erased context and calls it.
 pub fn wrapSimple(ctx: ?*anyopaque, request: Request) ?Response {
-    const func: SimpleHandlerFn = @ptrCast(ctx.?);
+    const func: SimpleHandlerFn = @ptrCast(@alignCast(ctx.?));
     return func(request);
 }
 
@@ -379,11 +380,17 @@ fn null_fallible_handler(_: Request) anyerror!?Response {
 }
 
 test "safeWrap converts error to 5.00" {
+    // This test deliberately triggers a handler warning; keep its expected
+    // stderr out of the build summary without silencing production logging.
+    const previous_log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = previous_log_level;
+
     const wrapped = safeWrap(failing_handler);
     const dummy_packet = std.mem.zeroes(coapz.Packet);
     const request = Request{
         .packet = dummy_packet,
-        .peer_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        .peer_address = platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         .arena = testing.allocator,
     };
     const resp = wrapped(request);
@@ -396,7 +403,7 @@ test "safeWrap passes through success" {
     const dummy_packet = std.mem.zeroes(coapz.Packet);
     const request = Request{
         .packet = dummy_packet,
-        .peer_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        .peer_address = platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         .arena = testing.allocator,
     };
     const resp = wrapped(request);
@@ -410,7 +417,7 @@ test "safeWrap passes through null" {
     const dummy_packet = std.mem.zeroes(coapz.Packet);
     const request = Request{
         .packet = dummy_packet,
-        .peer_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        .peer_address = platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         .arena = testing.allocator,
     };
     const resp = wrapped(request);
@@ -432,7 +439,7 @@ fn testRequest(code: coapz.Code, options: []const coapz.Option, body: []const u8
     const parsed = try coapz.Packet.read(testing.allocator, wire);
     return .{
         .packet = parsed,
-        .peer_address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        .peer_address = platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         .arena = testing.allocator,
     };
 }

@@ -3,7 +3,8 @@
 /// Pattern follows exchange.zig: linear probing, backward-shift deletion,
 /// intrusive free list. Clock-hand eviction when the table is full.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
+const posix = platform;
 
 const RateLimiter = @This();
 
@@ -24,20 +25,20 @@ pub const AddrKey = struct {
 
     pub const zero: AddrKey = .{ .family = 0, .addr = .{0} ** 16 };
 
-    pub fn fromAddress(address: std.net.Address) AddrKey {
-        return switch (address.any.family) {
+    pub fn fromAddress(address: std.Io.net.IpAddress) AddrKey {
+        return switch (platform.family(address)) {
             posix.AF.INET => .{
                 .family = posix.AF.INET,
                 .addr = blk: {
                     var a: [16]u8 = .{0} ** 16;
-                    const src: [4]u8 = @bitCast(address.in.sa.addr);
+                    const src = address.ip4.bytes;
                     @memcpy(a[0..4], &src);
                     break :blk a;
                 },
             },
             posix.AF.INET6 => .{
                 .family = posix.AF.INET6,
-                .addr = address.in6.sa.addr,
+                .addr = address.ip6.bytes,
             },
             else => zero,
         };
@@ -457,8 +458,8 @@ test "IPv6 addresses independent from IPv4" {
     });
     defer rl.deinit(testing.allocator);
 
-    const v4 = AddrKey.fromAddress(try std.net.Address.parseIp("127.0.0.1", 5683));
-    const v6 = AddrKey.fromAddress(try std.net.Address.parseIp("::1", 5683));
+    const v4 = AddrKey.fromAddress(try std.Io.net.IpAddress.parse("127.0.0.1", 5683));
+    const v6 = AddrKey.fromAddress(try std.Io.net.IpAddress.parse("::1", 5683));
     const now: i64 = 1_000_000_000;
 
     try testing.expect(rl.allow(v4, now));

@@ -4,8 +4,9 @@
 /// a handshake with OpenSSL's s_server. Skipped when openssl is not
 /// available or does not support PSK-AES128-CCM8.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const testing = std.testing;
-const posix = std.posix;
+const posix = platform;
 
 const dtls = @import("dtls.zig");
 const Record = @import("Record.zig");
@@ -22,49 +23,47 @@ const test_psk_hex = "30313233343536373839616263646566";
 
 /// Check if openssl is available and supports the required cipher.
 fn opensslAvailable() bool {
-    var child = std.process.Child.init(
-        &.{ "openssl", "ciphers", "PSK-AES128-CCM8@SECLEVEL=0" },
-        testing.allocator,
-    );
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return false;
-    const result = child.wait() catch return false;
-    return result == .Exited and result.Exited == 0;
+    var child = std.process.spawn(testing.io, .{
+        .argv = &.{ "openssl", "ciphers", "PSK-AES128-CCM8@SECLEVEL=0" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const result = child.wait(testing.io) catch return false;
+    return result == .exited and result.exited == 0;
 }
 
 /// Generate a self-signed cert for openssl s_server (required even for PSK).
 fn generateTestCert(cert_path: []const u8, key_path: []const u8) bool {
-    var child = std.process.Child.init(&.{
-        "openssl",     "req",        "-x509",       "-newkey",
-        "rsa:2048",    "-keyout",    key_path,      "-out",
-        cert_path,     "-days",      "1",           "-nodes",
-        "-subj",       "/CN=test",   "-batch",
-    }, testing.allocator);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return false;
-    const result = child.wait() catch return false;
-    return result == .Exited and result.Exited == 0;
+    var child = std.process.spawn(testing.io, .{
+        .argv = &.{
+            "openssl", "req",    "-x509", "-newkey",  "rsa:2048",
+            "-keyout", key_path, "-out",  cert_path,  "-days",
+            "1",       "-nodes", "-subj", "/CN=test", "-batch",
+        },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const result = child.wait(testing.io) catch return false;
+    return result == .exited and result.exited == 0;
 }
 
 /// Start OpenSSL DTLS server. Returns the child process.
 /// Caller must hold stdin_pipe open to keep the server alive.
 /// Note: do NOT use -listen — it creates a new connected socket after
 /// cookie verification, so responses go to a different source port.
-fn startOpensslServer(port: u16, psk_hex: []const u8) !std.process.Child {
+fn startOpensslServer(port: u16, psk_hex: []const u8, cert_path: []const u8, key_path: []const u8) !std.process.Child {
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
 
-    var child = std.process.Child.init(&.{
+    return std.process.spawn(testing.io, .{ .argv = &.{
         "openssl",
         "s_server",
         "-dtls1_2",
         "-4",
         "-cert",
-        "/tmp/coap_test_cert.pem",
+        cert_path,
         "-key",
-        "/tmp/coap_test_key.pem",
+        key_path,
         "-psk",
         psk_hex,
         "-psk_identity",
@@ -74,12 +73,7 @@ fn startOpensslServer(port: u16, psk_hex: []const u8) !std.process.Child {
         "-port",
         port_str,
         "-quiet",
-    }, testing.allocator);
-    child.stdin_behavior = .Pipe; // Keep open to prevent server exit.
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    return child;
+    }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
 }
 
 /// Blocking recv with deadline (ms-granularity poll via sleep).
@@ -87,8 +81,8 @@ fn recvWithDeadline(fd: posix.fd_t, buf: []u8, deadline_ns: i128) ?usize {
     while (true) {
         const n = posix.recv(fd, buf, 0) catch |err| switch (err) {
             error.WouldBlock => {
-                if (std.time.nanoTimestamp() >= deadline_ns) return null;
-                std.Thread.sleep(500 * std.time.ns_per_us);
+                if (platform.nanoTimestamp() >= deadline_ns) return null;
+                platform.sleep(500 * std.time.ns_per_us);
                 continue;
             },
             else => return null,
@@ -102,34 +96,41 @@ test "OpenSSL interop: handshake state machine with OpenSSL s_server" {
         std.log.warn("openssl not available or missing PSK-AES128-CCM8, skipping", .{});
         return;
     }
-    if (!generateTestCert("/tmp/coap_test_cert.pem", "/tmp/coap_test_key.pem")) {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    const cert_path = try std.fmt.allocPrint(testing.allocator, "{s}/cert.pem", .{dir_buf[0..dir_len]});
+    defer testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(testing.allocator, "{s}/key.pem", .{dir_buf[0..dir_len]});
+    defer testing.allocator.free(key_path);
+    if (!generateTestCert(cert_path, key_path)) {
         std.log.warn("failed to generate test cert, skipping", .{});
         return;
     }
 
     const port: u16 = 19790;
 
-    var ossl = startOpensslServer(port, test_psk_hex) catch {
+    var ossl = startOpensslServer(port, test_psk_hex, cert_path, key_path) catch {
         std.log.warn("failed to start openssl s_server, skipping", .{});
         return;
     };
     defer {
-        if (ossl.stdin) |*stdin| stdin.close();
+        if (ossl.stdin) |stdin| stdin.close(testing.io);
         ossl.stdin = null;
-        _ = ossl.kill() catch {};
-        _ = ossl.wait() catch {};
+        ossl.kill(testing.io);
     }
 
     // Wait for server to start listening.
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    platform.sleep(500 * std.time.ns_per_ms);
 
     // Create raw UDP socket, bypassing Client abstraction.
-    const dest = try std.net.Address.parseIp("127.0.0.1", port);
+    const dest = try std.Io.net.IpAddress.parse("127.0.0.1", port);
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(fd);
-    try posix.connect(fd, &dest.any, dest.getOsSockLen());
+    try posix.connect(fd, dest);
 
-    var session: Session.Session = std.mem.zeroes(Session.Session);
+    var session: Session.Session = std.mem.zeroInit(Session.Session, .{ .addr = platform.ip4(.{ 0, 0, 0, 0 }, 0) });
     var hs_state: Handshake.ClientHandshakeState = .idle;
     var send_buf: [512]u8 = undefined;
     var recv_buf: [1500]u8 = undefined;
@@ -143,11 +144,11 @@ test "OpenSSL interop: handshake state machine with OpenSSL s_server" {
     };
     _ = posix.send(fd, initial_flight, 0) catch return error.TestUnexpectedResult;
 
-    const deadline_ns: i128 = std.time.nanoTimestamp() + 10 * std.time.ns_per_s;
+    const deadline_ns: i128 = platform.nanoTimestamp() + 10 * std.time.ns_per_s;
 
     // Handshake loop.
     while (hs_state != .complete) {
-        if (std.time.nanoTimestamp() >= deadline_ns) {
+        if (platform.nanoTimestamp() >= deadline_ns) {
             std.debug.print("interop: timeout in state {}\n", .{hs_state});
             return error.TestUnexpectedResult;
         }

@@ -7,7 +7,7 @@
 /// loop drains the ring, sends the response as a new CON, and handles
 /// retransmission until the client ACKs.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
 const coapz = @import("coapz");
 const handler = @import("handler.zig");
 const constants = @import("constants.zig");
@@ -33,7 +33,7 @@ pub const Slot = struct {
     state: std.atomic.Value(State),
     token: [8]u8,
     token_len: u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     /// Message ID for the separate CON response (not the original request).
     msg_id: u16,
     response_length: u16,
@@ -123,7 +123,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Deferred {
             .state = std.atomic.Value(State).init(.free),
             .token = .{0} ** 8,
             .token_len = 0,
-            .peer_address = std.mem.zeroes(std.net.Address),
+            .peer_address = platform.ip4(.{ 0, 0, 0, 0 }, 0),
             .msg_id = 0,
             .response_length = 0,
             .retransmit_count = 0,
@@ -159,7 +159,7 @@ pub fn deinit(self: *Deferred, allocator: std.mem.Allocator) void {
 pub fn allocate(
     self: *Deferred,
     token: []const u8,
-    peer_address: std.net.Address,
+    peer_address: std.Io.net.IpAddress,
     msg_id: u16,
     now_ns: i64,
 ) ?u16 {
@@ -240,7 +240,7 @@ pub fn drainQueue(self: *Deferred, out_buf: []u16) []const u16 {
 
 /// Find a pending/sent slot by message ID and peer address (for ACK matching).
 /// Linear scan — fine for small pool (default 16).
-pub fn findByMsgId(self: *Deferred, msg_id: u16, peer_address: std.net.Address) ?u16 {
+pub fn findByMsgId(self: *Deferred, msg_id: u16, peer_address: std.Io.net.IpAddress) ?u16 {
     for (self.slots, 0..) |*slot, i| {
         const state = slot.state.load(.acquire);
         if ((state == .sent or state == .ready) and
@@ -253,13 +253,8 @@ pub fn findByMsgId(self: *Deferred, msg_id: u16, peer_address: std.net.Address) 
     return null;
 }
 
-fn addrEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        posix.AF.INET => std.mem.eql(u8, std.mem.asBytes(&a.in), std.mem.asBytes(&b.in)),
-        posix.AF.INET6 => std.mem.eql(u8, std.mem.asBytes(&a.in6), std.mem.asBytes(&b.in6)),
-        else => false,
-    };
+fn addrEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    return platform.addressEqual(a, b);
 }
 
 // ── Tests ──
@@ -278,7 +273,7 @@ test "allocate and release" {
 
     const idx = pool.allocate(
         &.{ 0xAA, 0xBB },
-        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         0x1234,
         1_000_000_000,
     ) orelse return error.PoolExhausted;
@@ -296,7 +291,7 @@ test "pool exhaustion" {
     var pool = try Deferred.init(testing.allocator, .{ .max_deferred = 2 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const a = pool.allocate(&.{0x01}, addr, 1, 0);
     const b = pool.allocate(&.{0x02}, addr, 2, 0);
     const c = pool.allocate(&.{0x03}, addr, 3, 0);
@@ -310,7 +305,7 @@ test "enqueue and drain" {
     var pool = try Deferred.init(testing.allocator, .{});
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, 0x1234, 0) orelse
         return error.PoolExhausted;
 
@@ -333,7 +328,7 @@ test "DeferredResponse.respond encodes and enqueues" {
 
     const idx = pool.allocate(
         &.{ 0xAA, 0xBB },
-        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         0x1234,
         0,
     ) orelse return error.PoolExhausted;
@@ -356,7 +351,7 @@ test "DeferredResponse.cancel releases slot" {
 
     const idx = pool.allocate(
         &.{0xAA},
-        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683),
+        platform.ip4(.{ 127, 0, 0, 1 }, 5683),
         0x1234,
         0,
     ) orelse return error.PoolExhausted;
@@ -371,7 +366,7 @@ test "findByMsgId" {
     var pool = try Deferred.init(testing.allocator, .{});
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     const idx = pool.allocate(&.{0xAA}, addr, 0x5678, 0) orelse
         return error.PoolExhausted;
 
@@ -387,7 +382,7 @@ test "concurrent enqueue from multiple threads" {
     var pool = try Deferred.init(testing.allocator, .{ .max_deferred = 8 });
     defer pool.deinit(testing.allocator);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5683);
+    const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
     var indices: [4]u16 = undefined;
     for (&indices, 0..) |*idx, i| {
         idx.* = pool.allocate(&.{0xAA}, addr, @intCast(i), 0) orelse
