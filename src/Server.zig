@@ -167,6 +167,8 @@ rate_limit_rst: []u8,
 
 // DTLS state.
 dtls_sessions: ?*dtls.Session.SessionTable,
+/// Next bounded-cadence handshake maintenance pass, independent of I/O batches.
+dtls_retransmit_check_ns: i64 = 0,
 dtls_cookie_secret: [32]u8,
 dtls_cookie_secret_prev: [32]u8,
 dtls_cookie_rotation_ns: i64,
@@ -2076,12 +2078,21 @@ fn cacheFlight(sess: *dtls.Session.Session, data: []const u8, now_ns: i64) void 
     sess.retransmit_deadline_ns = now_ns + @as(i64, constants.dtls_retransmit_initial_ms) * std.time.ns_per_ms;
 }
 
-/// Scan handshaking DTLS sessions for expired retransmit deadlines.
+const dtls_retransmit_check_interval_ns: i64 = 50 * std.time.ns_per_ms;
+
+/// Check live sessions at a bounded cadence, not all capacity slots per batch.
+/// The existing tick timeout supplies idle wakeups at the same 50ms cadence.
 fn checkDtlsRetransmits(server: *Server) void {
     const tbl = server.dtls_sessions orelse return;
+    if (server.tick_now_ns < server.dtls_retransmit_check_ns) return;
+    server.dtls_retransmit_check_ns = server.tick_now_ns + dtls_retransmit_check_interval_ns;
     const batch: usize = @min(constants.completion_batch_max, server.config.buffer_count);
 
-    for (tbl.slots) |*sess| {
+    var next = tbl.lru_head;
+    while (next != std.math.maxInt(u32)) {
+        const sess = &tbl.slots[next];
+        // Timeout release unlinks this node; capture its successor first.
+        next = sess.lru_next;
         if (sess.state != .handshaking) continue;
         if (sess.last_flight_len == 0) continue;
         if (server.tick_now_ns < sess.retransmit_deadline_ns) continue;
@@ -2516,6 +2527,94 @@ fn send_tick_recv(
     const result = try testing.allocator.alloc(u8, n);
     @memcpy(result, buf[0..n]);
     return result;
+}
+
+test "DTLS retransmit maintenance releases head and tail without skipping live sessions" {
+    var server = try Server.init(testing.allocator, .{
+        .buffer_count = 4,
+        .dtls_session_count = 3,
+        .psk = .{ .identity = "test", .key = "secret" },
+    }, null_handler);
+    defer server.deinit();
+    const table = server.dtls_sessions.?;
+    const tail = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1001), 0).?;
+    const middle = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1002), 0).?;
+    const head = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1003), 0).?;
+    middle.state = .established;
+    middle.last_flight_len = 1;
+    middle.retransmit_count = constants.dtls_max_retransmits;
+    for ([_]*dtls.Session.Session{ head, tail }) |session| {
+        session.last_flight_len = 1;
+        session.retransmit_count = constants.dtls_max_retransmits;
+    }
+    server.tick_now_ns = std.time.ns_per_s;
+    server.checkDtlsRetransmits();
+    try testing.expectEqual(@as(u32, 1), table.count_active);
+    try testing.expectEqual(dtls.Session.State.free, head.state);
+    try testing.expectEqual(dtls.Session.State.free, tail.state);
+    try testing.expectEqual(dtls.Session.State.established, middle.state);
+    try testing.expectEqual(table.lru_head, table.lru_tail);
+    // Slot reuse must not leave a stale maintenance cursor into the free list.
+    const reused = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1004), 0).?;
+    reused.last_flight_len = 1;
+    reused.retransmit_count = constants.dtls_max_retransmits;
+    server.tick_now_ns += dtls_retransmit_check_interval_ns;
+    server.checkDtlsRetransmits();
+    try testing.expectEqual(@as(u32, 1), table.count_active);
+}
+
+test "DTLS retransmit maintenance cadence bounds deadline delay" {
+    var server = try Server.init(testing.allocator, .{
+        .buffer_count = 4,
+        .dtls_session_count = 2,
+        .psk = .{ .identity = "test", .key = "secret" },
+    }, null_handler);
+    defer server.deinit();
+    const table = server.dtls_sessions.?;
+    const session = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1005), 0).?;
+    session.last_flight_len = 1;
+    session.retransmit_count = constants.dtls_max_retransmits;
+    session.retransmit_deadline_ns = std.time.ns_per_s + dtls_retransmit_check_interval_ns - 1;
+    server.tick_now_ns = std.time.ns_per_s;
+    server.checkDtlsRetransmits();
+    server.tick_now_ns = session.retransmit_deadline_ns;
+    server.checkDtlsRetransmits();
+    try testing.expectEqual(@as(u32, 1), table.count_active);
+    server.tick_now_ns += 1;
+    server.checkDtlsRetransmits();
+    try testing.expectEqual(@as(u32, 0), table.count_active);
+    server.tick_now_ns += dtls_retransmit_check_interval_ns;
+    server.checkDtlsRetransmits(); // Empty live list is safe.
+}
+
+test "DTLS retransmit maintenance preserves flight backoff and ignores uncached handshakes" {
+    var server = try Server.init(testing.allocator, .{
+        .port = 19679,
+        .buffer_count = 4,
+        .dtls_session_count = 2,
+        .psk = .{ .identity = "test", .key = "secret" },
+    }, null_handler);
+    defer server.deinit();
+    try server.listen();
+    const table = server.dtls_sessions.?;
+    const uncached = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1006), 0).?;
+    const session = table.allocate(platform.ip4(.{ 127, 0, 0, 1 }, 1007), 0).?;
+    cacheFlight(session, "flight", 0);
+    server.tick_now_ns = session.retransmit_deadline_ns;
+    server.checkDtlsRetransmits();
+    try testing.expectEqual(@as(u8, 1), session.retransmit_count);
+    try testing.expectEqual(constants.dtls_retransmit_initial_ms * 2, session.retransmit_timeout_ms);
+    try testing.expectEqual(server.tick_now_ns + @as(i64, session.retransmit_timeout_ms) * std.time.ns_per_ms, session.retransmit_deadline_ns);
+    try testing.expectEqualStrings("flight", session.last_flight[0..session.last_flight_len]);
+    try testing.expectEqual(@as(u8, 0), uncached.retransmit_count);
+    try testing.expectEqual(@as(u32, 2), table.count_active);
+    // Flush the queued send before the next pass, as the production tick does.
+    _ = try server.io.submit();
+    session.retransmit_timeout_ms = constants.dtls_retransmit_max_ms;
+    server.tick_now_ns = session.retransmit_deadline_ns;
+    server.checkDtlsRetransmits();
+    try testing.expectEqual(constants.dtls_retransmit_max_ms, session.retransmit_timeout_ms);
+    _ = try server.io.submit();
 }
 
 test "init and deinit" {
