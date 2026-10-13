@@ -6,7 +6,8 @@
 /// ```zig
 /// var buf: [uri.max_options]coapz.Option = undefined;
 /// const opts = uri.fromUri("/sensors/temp?unit=celsius", &buf);
-/// const result = try client.call(allocator, .get, opts, &.{});
+/// var storage: coap.Client.ResponseStorage(4096) = .{};
+/// const result = try client.call(storage.buffers(), .get, opts, &.{});
 /// ```
 const std = @import("std");
 const coapz = @import("coapz");

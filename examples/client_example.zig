@@ -16,9 +16,10 @@ pub fn main() !void {
     try client.cast(.get, &.{}, "ping");
     std.debug.print("cast: sent NON GET\n", .{});
 
-    // Blocking CON request/response using path convenience.
-    const result = try client.get(allocator, "/hello");
-    defer result.deinit(allocator);
+    // One reusable response buffer; increase payload capacity for Block2.
+    var storage: coap.Client.ResponseStorage(4096) = .{};
+    const result = try client.get(storage.buffers(), "/hello");
+    // Borrowed result: consume before reusing storage, never deinit it.
 
     std.debug.print("call: code={}, payload={s}\n", .{
         result.code,

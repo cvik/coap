@@ -22,6 +22,7 @@ const SuiteConfig = struct {
     port: u16 = 5683,
     warmup_count: u32 = 1_000,
     window_size: u16 = 256,
+    allocator_kind: enum { debug, smp } = .debug,
     embedded_server: bool = true,
     thread_count: u16 = 0, // 0 = nproc
     count_override: ?u32 = null,
@@ -86,11 +87,13 @@ const scenario_templates = [_]Scenario{
 // ── Main ───────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    const config = parse_args(init.args);
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const config = parse_args(init.args);
+    const allocator = switch (config.allocator_kind) {
+        .debug => gpa.allocator(),
+        .smp => std.heap.smp_allocator,
+    };
     const cpu_count: u16 = if (config.thread_count > 0)
         config.thread_count
     else
@@ -120,6 +123,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     std.debug.print("\x1b[1m── benchmark suite ──\x1b[0m\n\n", .{});
+    std.debug.print("  build {s}; client allocator {s}; DTLS common-wall interval\n", .{
+        @tagName(@import("builtin").mode), @tagName(config.allocator_kind),
+    });
 
     {
         var count_buf: [26]u8 = undefined;
@@ -463,6 +469,31 @@ fn aggregate_plain(allocator: std.mem.Allocator, worker_results: []PlainWorkerRe
 
 // ── DTLS scenario ──────────────────────────────────────────────────────
 
+// All workers finish handshake, warmup, and allocation before measurement.
+const MeasurementGate = struct {
+    remaining: std.atomic.Value(u16),
+    ready: std.atomic.Value(bool) = .init(false),
+    aborted: std.atomic.Value(bool) = .init(false),
+    start_ns: i128 = 0,
+
+    fn wait(self: *MeasurementGate) bool {
+        if (self.aborted.load(.acquire)) return false;
+        if (self.remaining.fetchSub(1, .acq_rel) == 1) {
+            self.start_ns = platform.nanoTimestamp();
+            self.ready.store(true, .release);
+        } else {
+            // Only startup waits here; yielding is outside the measured loop.
+            while (!self.ready.load(.acquire)) std.Thread.yield() catch {};
+        }
+        return !self.aborted.load(.acquire);
+    }
+
+    fn abort(self: *MeasurementGate) void {
+        self.aborted.store(true, .release);
+        self.ready.store(true, .release);
+    }
+};
+
 fn run_scenario_dtls(
     allocator: std.mem.Allocator,
     config: SuiteConfig,
@@ -487,15 +518,21 @@ fn run_scenario_dtls(
         allocator.free(worker_results);
     }
 
+    @memset(worker_results, .{});
+    var gate: MeasurementGate = .{ .remaining = .init(tc) };
+    var spawned: usize = 0;
+    errdefer {
+        gate.abort();
+        for (threads[0..spawned]) |thread| thread.join();
+    }
     for (0..extra) |j| {
-        worker_results[j] = .{};
         threads[j] = try std.Thread.spawn(.{}, dtls_worker, .{
             allocator,         config.host, port,                window,             s.payload_size,
-            s.use_confirmable, per_thread,  config.warmup_count, &worker_results[j],
+            s.use_confirmable, per_thread,  config.warmup_count, &worker_results[j], &gate,
         });
+        spawned += 1;
     }
 
-    worker_results[extra] = .{};
     dtls_worker(
         allocator,
         config.host,
@@ -506,15 +543,20 @@ fn run_scenario_dtls(
         per_thread + remainder,
         config.warmup_count,
         &worker_results[extra],
+        &gate,
     );
 
     for (threads) |t| t.join();
 
-    return aggregate_dtls(allocator, worker_results);
+    return aggregate_dtls(allocator, worker_results, gate.start_ns, s.use_confirmable);
 }
+
+const ResponseStorage = coap.Client.ResponseStorage(0);
 
 const DtlsWorkerResult = struct {
     sent: u64 = 0,
+    received: u64 = 0,
+    finished_ns: i128 = 0,
     errors: u64 = 0,
     latencies: ?[]i64 = null,
     latency_count: u32 = 0,
@@ -531,7 +573,14 @@ fn dtls_worker(
     count: u32,
     warmup_count: u32,
     out: *DtlsWorkerResult,
+    gate: *MeasurementGate,
 ) void {
+    var entered = false;
+    defer if (!entered) {
+        out.errors = count;
+        _ = gate.wait();
+        out.finished_ns = platform.nanoTimestamp();
+    };
     var client = coap.Client.init(allocator, .{
         .host = host,
         .port = port,
@@ -546,11 +595,11 @@ fn dtls_worker(
     defer allocator.free(payload);
     @memset(payload, 'x');
 
-    // Warmup (not timed).
+    // Warmup (not timed); one reusable caller-owned response buffer.
+    var warmup_storage: ResponseStorage = .{};
     if (use_confirmable) {
         for (0..warmup_count) |_| {
-            const r = client.call(allocator, .get, &.{}, payload) catch continue;
-            r.deinit(allocator);
+            _ = client.call(warmup_storage.buffers(), .get, &.{}, payload) catch continue;
         }
     } else {
         for (0..warmup_count) |_| {
@@ -559,9 +608,9 @@ fn dtls_worker(
     }
 
     if (use_confirmable) {
-        dtls_worker_con(&client, allocator, window, payload, count, out);
+        dtls_worker_con(&client, allocator, window, payload, count, out, gate, &entered);
     } else {
-        dtls_worker_non(&client, payload, count, out);
+        dtls_worker_non(&client, payload, count, out, gate, &entered);
     }
 }
 
@@ -572,12 +621,22 @@ fn dtls_worker_con(
     payload: []const u8,
     count: u32,
     out: *DtlsWorkerResult,
+    gate: *MeasurementGate,
+    entered: *bool,
 ) void {
     const timestamps = allocator.alloc(i128, window) catch return;
     defer allocator.free(timestamps);
     @memset(timestamps, 0);
-
+    const responses = allocator.alloc(ResponseStorage, window) catch return;
+    defer allocator.free(responses);
+    const buffer_for_handle = allocator.alloc(u16, window) catch return;
+    defer allocator.free(buffer_for_handle);
+    var free_buffers = std.ArrayList(u16).initCapacity(allocator, window) catch return;
+    defer free_buffers.deinit(allocator);
+    for (0..window) |i| free_buffers.appendAssumeCapacity(@intCast(i));
+    defer for (0..window) |i| client.cancel(@intCast(i));
     const latencies = allocator.alloc(i64, count) catch return;
+    out.latencies = latencies;
 
     var sent: u64 = 0;
     var received: u64 = 0;
@@ -586,55 +645,50 @@ fn dtls_worker_con(
     var total_sent: u32 = 0;
     var in_flight: u16 = 0;
 
-    const bench_start = platform.nanoTimestamp();
-
+    entered.* = true;
+    if (!gate.wait()) return;
+    const bench_start = gate.start_ns;
     while (received + errors < count) {
         while (in_flight < window and total_sent < count) {
-            const handle = client.submit(.get, &.{}, payload) catch {
+            const buffer_index = free_buffers.pop().?;
+            const handle = client.submit(responses[buffer_index].buffers(), .get, &.{}, payload) catch {
+                free_buffers.appendAssumeCapacity(buffer_index);
                 errors += 1;
                 total_sent += 1;
                 continue;
             };
+            buffer_for_handle[handle] = buffer_index;
             timestamps[handle] = platform.nanoTimestamp();
             total_sent += 1;
             in_flight += 1;
             sent += 1;
         }
-
         if (in_flight == 0) break;
-
-        const c = client.poll(allocator, 50) catch {
+        const completion = (client.poll(50) catch {
+            errors = count - received;
+            break;
+        }) orelse continue;
+        in_flight -= 1;
+        free_buffers.appendAssumeCapacity(buffer_for_handle[completion.handle]);
+        const response = completion.result catch {
             errors += 1;
-            if (in_flight > 0) in_flight -= 1;
             continue;
         };
-        const completion = c orelse continue;
-
-        in_flight -|= 1;
-
-        if (completion.result._timeout or completion.result._reset) {
+        if (response.code != .content or !std.mem.eql(u8, response.payload, payload)) {
             errors += 1;
             continue;
         }
-        defer completion.result.deinit(allocator);
-
         received += 1;
-
-        const ts = timestamps[completion.handle];
-        if (ts > 0) {
-            const latency = platform.nanoTimestamp() - ts;
-            if (latency_count < count) {
-                latencies[latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
-                latency_count += 1;
-            }
-            timestamps[completion.handle] = 0;
-        }
+        const latency = platform.nanoTimestamp() - timestamps[completion.handle];
+        latencies[latency_count] = @intCast(@min(latency, std.math.maxInt(i64)));
+        latency_count += 1;
+        timestamps[completion.handle] = 0;
     }
-
-    out.bench_elapsed_ns = platform.nanoTimestamp() - bench_start;
+    out.finished_ns = platform.nanoTimestamp();
+    out.bench_elapsed_ns = out.finished_ns - bench_start;
     out.sent = sent;
+    out.received = received;
     out.errors = errors;
-    out.latencies = latencies;
     out.latency_count = latency_count;
 }
 
@@ -643,11 +697,14 @@ fn dtls_worker_non(
     payload: []const u8,
     count: u32,
     out: *DtlsWorkerResult,
+    gate: *MeasurementGate,
+    entered: *bool,
 ) void {
     var sent: u64 = 0;
     var errors: u64 = 0;
-
-    const bench_start = platform.nanoTimestamp();
+    entered.* = true;
+    if (!gate.wait()) return;
+    const bench_start = gate.start_ns;
 
     for (0..count) |_| {
         client.cast(.get, &.{}, payload) catch {
@@ -657,20 +714,21 @@ fn dtls_worker_non(
         sent += 1;
     }
 
-    out.bench_elapsed_ns = platform.nanoTimestamp() - bench_start;
+    out.finished_ns = platform.nanoTimestamp();
+    out.bench_elapsed_ns = out.finished_ns - bench_start;
     out.sent = sent;
     out.errors = errors;
 }
 
-fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResult) !ScenarioResult {
+fn aggregate_dtls(allocator: std.mem.Allocator, worker_results: []DtlsWorkerResult, start_ns: i128, confirmable: bool) !ScenarioResult {
     var total_sent: u64 = 0;
     var total_errors: u64 = 0;
     var total_lat_count: u64 = 0;
     var max_elapsed_ns: i128 = 0;
 
     for (worker_results) |wr| {
-        total_sent += wr.sent;
-        if (wr.bench_elapsed_ns > max_elapsed_ns) max_elapsed_ns = wr.bench_elapsed_ns;
+        total_sent += if (confirmable) wr.received else wr.sent;
+        max_elapsed_ns = @max(max_elapsed_ns, wr.finished_ns - start_ns);
         total_errors += wr.errors;
         total_lat_count += wr.latency_count;
     }
@@ -1172,6 +1230,7 @@ fn print_usage() void {
         "  --count <n>       Override request count per scenario\n" ++
         "  --warmup <n>      Warmup requests (default: 1000)\n" ++
         "  --window <n>      Client sliding window size (default: 256)\n" ++
+        "  --allocator <k>   Client allocator: debug (default) or smp\n" ++
         "  --threads <n>     Thread count, 0 = nproc (default: 0)\n" ++
         "  --no-server       Don't fork embedded echo server\n" ++
         "  --ipv6            Use IPv6 loopback (::1) instead of IPv4\n" ++
@@ -1222,6 +1281,12 @@ fn parse_args(process_args: std.process.Args) SuiteConfig {
         } else if (std.mem.eql(u8, arg, "--window")) {
             const val = args.next() orelse "256";
             config.window_size = std.fmt.parseInt(u16, val, 10) catch 256;
+        } else if (std.mem.eql(u8, arg, "--allocator")) {
+            const val = args.next() orelse "";
+            config.allocator_kind = std.meta.stringToEnum(@TypeOf(config.allocator_kind), val) orelse {
+                std.debug.print("error: --allocator requires debug or smp\n", .{});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "--threads")) {
             const val = args.next() orelse "0";
             config.thread_count = std.fmt.parseInt(u16, val, 10) catch 0;
