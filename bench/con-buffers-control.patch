@@ -1,0 +1,68 @@
+--- a/bench/client.zig
++++ b/bench/client.zig
+@@ -551,7 +551,12 @@
+     return aggregate_dtls(allocator, worker_results, gate.start_ns, s.use_confirmable);
+ }
+ 
+-const ResponseStorage = coap.Client.ResponseStorage(0);
++// Matched startup reservation; the original API still allocates every result.
++const ResponseStorage = struct {
++    packet: [1280]u8 = undefined,
++    options: [32]coapz.Option = undefined,
++    payload: [0]u8 = undefined,
++};
+ 
+ const DtlsWorkerResult = struct {
+     sent: u64 = 0,
+@@ -596,10 +601,10 @@
+     @memset(payload, 'x');
+ 
+     // Warmup (not timed); one reusable caller-owned response buffer.
+-    var warmup_storage: ResponseStorage = .{};
+     if (use_confirmable) {
+         for (0..warmup_count) |_| {
+-            _ = client.call(warmup_storage.buffers(), .get, &.{}, payload) catch continue;
++            const result = client.call(allocator, .get, &.{}, payload) catch continue;
++            result.deinit(allocator);
+         }
+     } else {
+         for (0..warmup_count) |_| {
+@@ -634,7 +639,6 @@
+     var free_buffers = std.ArrayList(u16).initCapacity(allocator, window) catch return;
+     defer free_buffers.deinit(allocator);
+     for (0..window) |i| free_buffers.appendAssumeCapacity(@intCast(i));
+-    defer for (0..window) |i| client.cancel(@intCast(i));
+     const latencies = allocator.alloc(i64, count) catch return;
+     out.latencies = latencies;
+ 
+@@ -651,7 +655,7 @@
+     while (received + errors < count) {
+         while (in_flight < window and total_sent < count) {
+             const buffer_index = free_buffers.pop().?;
+-            const handle = client.submit(responses[buffer_index].buffers(), .get, &.{}, payload) catch {
++            const handle = client.submit(.get, &.{}, payload) catch {
+                 free_buffers.appendAssumeCapacity(buffer_index);
+                 errors += 1;
+                 total_sent += 1;
+@@ -664,16 +668,18 @@
+             sent += 1;
+         }
+         if (in_flight == 0) break;
+-        const completion = (client.poll(50) catch {
++        const completion = (client.poll(allocator, 50) catch {
+             errors = count - received;
+             break;
+         }) orelse continue;
+         in_flight -= 1;
+         free_buffers.appendAssumeCapacity(buffer_for_handle[completion.handle]);
+-        const response = completion.result catch {
++        const response = completion.result;
++        if (!response.valid()) {
+             errors += 1;
+             continue;
+-        };
++        }
++        defer response.deinit(allocator);
+         if (response.code != .content or !std.mem.eql(u8, response.payload, payload)) {
+             errors += 1;
+             continue;

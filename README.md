@@ -5,7 +5,7 @@ High-performance CoAP server and client library for Zig, built on Linux io_uring
 ### Highlights
 
 - **Simple handler interface** — `fn(Request) ?Response`, with context handlers and error wrappers
-- **Zero allocations in the hot path** — pre-allocated pools, arena resets per batch
+- **Bounded CON response storage** — caller-owned datagram, option, and Block2 buffers; no response heap allocation
 - **Multi-threaded** — SO_REUSEPORT, no shared state between threads
 - **DTLS 1.2 PSK** — pure Zig AES-128-CCM-8, stateless cookies, anti-replay
 - **IPv4 and IPv6** with dual-stack support
@@ -113,8 +113,8 @@ pub fn main() !void {
     try client.cast(.get, &.{}, "ping");
 
     // Blocking CON request/response with retransmission.
-    const result = try client.get(allocator, "/temperature");
-    defer result.deinit(allocator);
+    var storage: coap.Client.ResponseStorage(4096) = .{};
+    const result = try client.get(storage.buffers(), "/temperature");
 
     std.debug.print("response: {s}\n", .{result.payload});
 }
@@ -144,8 +144,8 @@ defer client.deinit();
 
 try client.handshake();
 
-const result = try client.get(allocator, "/temperature");
-defer result.deinit(allocator);
+var storage: coap.Client.ResponseStorage(4096) = .{};
+const result = try client.get(storage.buffers(), "/temperature");
 ```
 
 All send/recv methods automatically encrypt/decrypt after `handshake()`.
@@ -367,22 +367,49 @@ var client = try coap.Client.init(allocator, .{
 defer client.deinit();
 ```
 
+### Caller-owned CON response buffers
+
+`submit`, `call`, `get`, `post`, `put`, `delete`, and `upload` accept
+`Client.ResponseBuffers`, not a response allocator. `ResponseStorage(N)` is a
+convenience type with a 1280-byte wire buffer, 32 option descriptors, and `N`
+bytes for multi-block Block2 reassembly. For other bounds, supply your own
+`packet: []u8`, `options: []coapz.Option`, and `payload: []u8` slices.
+
+Allocate storage at startup. The three regions must be disjoint, and each
+pending request needs independent storage. All returned bytes, tokens, option
+values/descriptors, and reassembled payloads remain valid until **you reuse
+that storage**, including across later receives or client destruction. Results
+are borrowed: **never deinit a result or its packet**. Use separate storage
+when retaining several results; a single reusable buffer suits sequential calls.
+
+Insufficient storage completes the affected handle with
+`ResponseBufferTooSmall`, `ResponseOptionsTooSmall`, or
+`ResponsePayloadTooSmall`. Its client state is released; retry with larger
+storage. No heap fallback or runtime growth occurs. Partial contents after an
+error are unspecified. At most 16 request options are accepted (15 before
+`upload` adds Block1); excess is rejected rather than silently truncated.
+
+This is a breaking API change; no allocating CON compatibility wrappers remain.
+Raw receives and Observe notifications still have explicit allocator APIs.
+CON polling that also routes Observe notifications can therefore allocate for
+those notifications; the CON response itself does not allocate.
+
 ### get / post / put / delete — path convenience
 
 CON request/response by URI string with automatic retransmission.
 Paths and query strings are parsed automatically:
 
 ```zig
-const result = try client.get(allocator, "/sensor/temperature");
-defer result.deinit(allocator);
-// result.code, result.payload, result.options
+var storage: coap.Client.ResponseStorage(4096) = .{};
+const result = try client.get(storage.buffers(), "/sensor/temperature");
+std.debug.print("{s}\n", .{result.payload}); // Consume before reusing storage.
 
 // Query strings work too:
-const r2 = try client.get(allocator, "/sensors?type=temp&floor=2");
-defer r2.deinit(allocator);
+const r2 = try client.get(storage.buffers(), "/sensors?type=temp&floor=2");
+std.debug.print("{s}\n", .{r2.payload});
 
-const r3 = try client.post(allocator, "/log", "event happened");
-defer r3.deinit(allocator);
+const r3 = try client.post(storage.buffers(), "/log", "event happened");
+std.debug.print("{s}\n", .{r3.payload});
 ```
 
 Returns `error.Timeout` after max retransmissions, `error.Reset` if the
@@ -399,7 +426,8 @@ const uri = coap.uri;
 // Parse a full URI into CoAP options:
 var buf: [uri.max_options]coapz.Option = undefined;
 const opts = uri.fromUri("/sensors/temp?unit=celsius&fmt=json", &buf);
-const result = try client.call(allocator, .get, opts, &.{});
+var storage: coap.Client.ResponseStorage(4096) = .{};
+const result = try client.call(storage.buffers(), .get, opts, &.{});
 
 // Or build path and query separately:
 var path_buf: [8]coapz.Option = undefined;
@@ -425,8 +453,8 @@ for simpler path-based requests.
 
 ```zig
 var buf: [coap.uri.max_options]coapz.Option = undefined;
-const result = try client.call(allocator, .get, coap.uri.fromUri("/sensor", &buf), &.{});
-defer result.deinit(allocator);
+var storage: coap.Client.ResponseStorage(4096) = .{};
+const result = try client.call(storage.buffers(), .get, coap.uri.fromUri("/sensor", &buf), &.{});
 ```
 
 ### submit / poll — pipelined async
@@ -441,33 +469,43 @@ var client = try coap.Client.init(allocator, .{
 });
 defer client.deinit();
 
-// Submit multiple requests — returns immediately.
-const h1 = try client.submit(.get, &.{
+var storage: [2]coap.Client.ResponseStorage(4096) = .{ .{}, .{} };
+// Confirm the peer first (NSTART), then pipeline independent buffers.
+_ = try client.get(storage[0].buffers(), "/temperature");
+const h1 = try client.submit(storage[0].buffers(), .get, &.{
     .{ .kind = .uri_path, .value = "temperature" },
 }, &.{});
-const h2 = try client.submit(.get, &.{
+const h2 = try client.submit(storage[1].buffers(), .get, &.{
     .{ .kind = .uri_path, .value = "humidity" },
 }, &.{});
 
-// Poll for completions (handles retransmission, Block2 reassembly).
-while (try client.poll(allocator, 100)) |completion| {
-    defer completion.result.deinit(allocator);
+// A null poll means no completion yet, not that all requests are done.
+var pending: usize = 2;
+while (pending > 0) {
+    const completion = try client.poll(100) orelse continue;
+    pending -= 1;
+    const result = completion.result catch |err| {
+        std.debug.print("handle {d}: {}\n", .{ completion.handle, err });
+        continue;
+    };
     if (completion.handle == h1) {
-        std.debug.print("temp: {s}\n", .{completion.result.payload});
+        std.debug.print("temp: {s}\n", .{result.payload});
     } else if (completion.handle == h2) {
-        std.debug.print("humidity: {s}\n", .{completion.result.payload});
+        std.debug.print("humidity: {s}\n", .{result.payload});
     }
 }
 ```
 
-`poll` returns `null` when the timeout expires with no completion. Check
-`completion.result._timeout` or `._reset` for error conditions. Option
-`value` memory passed to `submit` must remain valid until the corresponding
-completion.
+`poll` returns `null` when there is no completion. `completion.result` is an
+error union, including `Timeout`, `Reset`, and capacity errors, always correlated
+by handle. Request option values must remain valid through completion for
+Block2 continuations. Storage is exclusively borrowed until completion,
+`client.cancel(handle)`, or client destruction. Cancellation releases only
+local state; it does not retract a datagram or stop remote application work.
+Handles are reused: cancel only a currently pending handle.
 
-The blocking `call`/`get`/`post`/`put`/`delete` methods are implemented as
-`submit` + `poll` internally — both APIs share the same slot infrastructure
-and can be mixed freely.
+Blocking calls use `submit` + `poll` internally, but reject existing pending
+requests with `RequestsInFlight` rather than discarding unrelated completions.
 
 ### sendRaw / recvRaw — low-level
 
@@ -575,10 +613,11 @@ Observers are removed when:
 Upload large payloads using Block1 segmentation:
 
 ```zig
-const result = try client.upload(allocator, .put, &.{
+var storage: coap.Client.ResponseStorage(4096) = .{};
+const result = try client.upload(storage.buffers(), .put, &.{
     .{ .kind = .uri_path, .value = "firmware" },
 }, large_payload);
-defer result.deinit(allocator);
+// The final response, including Block2, borrows storage.
 ```
 
 The server's preferred block size is honored if it responds with a
@@ -895,7 +934,11 @@ Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
 `--single-only`, `--multi-only`, `--payload-only <0|100|1000>`, `--ipv6`.
 Use `--help` for all options. For performance comparisons, run one scenario
 per invocation to avoid outstanding NON traffic affecting the next scenario's
-server-side counters. See [the Zig 0.16 migration measurements](docs/ZIG_016_PERFORMANCE.md).
+server-side counters. `--allocator debug|smp` selects the client allocator
+(default: DebugAllocator); this is separate from the Zig build mode. DTLS
+workers synchronize after handshake/warmup and use one common wall interval
+for successful CON response throughput. See [bounded response storage and
+matched benchmarks](docs/CON_BUFFERS.md) and [the Zig 0.16 migration measurements](docs/ZIG_016_PERFORMANCE.md).
 
 ## Requirements
 

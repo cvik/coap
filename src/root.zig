@@ -47,21 +47,19 @@
 //!     });
 //!     defer client.deinit();
 //!
-//!     const result = try client.get(allocator, "/temperature");
-//!     defer result.deinit(allocator);
+//!     var storage: coap.Client.ResponseStorage(4096) = .{};
+//!     const result = try client.get(storage.buffers(), "/temperature");
 //!     std.debug.print("{s}\n", .{result.payload});
 //! }
 //! ```
 //!
 //! ## Memory model
 //!
-//! Both server and client pre-allocate all internal buffers at init.
-//! The server handler receives a per-request arena that resets after
-//! each tick — no per-request heap allocations occur in the hot path.
-//!
-//! Client methods like `get()` and `call()` take a separate allocator
-//! for the response; the caller owns the `Result` and frees it via
-//! `result.deinit(allocator)`.
+//! Server and client protocol buffers are preallocated at init. Server handlers
+//! receive a resettable arena. CON client responses borrow caller-owned
+//! ResponseBuffers, including bounded Block2 storage, with no heap fallback.
+//! Results remain valid until that storage is reused; never deinit them.
+//! Raw receives and Observe notifications retain explicit allocating APIs.
 
 /// CoAP server. See `Server.Config` for configuration options.
 pub const Server = @import("Server.zig");

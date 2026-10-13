@@ -77,8 +77,8 @@ test "DTLS: full handshake and CoAP echo over localhost" {
     try testing.expectEqual(.established, client.dtls_session.?.state);
 
     // CON GET — echo handler returns empty payload for GET.
-    const result = try client.get(testing.allocator, "/test");
-    defer result.deinit(testing.allocator);
+    var storage: Client.ResponseStorage(0) = .{};
+    const result = try client.get(storage.buffers(), "/test");
     try testing.expectEqual(.content, result.code);
 }
 
@@ -111,8 +111,8 @@ test "DTLS: CON POST echo with payload" {
     try testing.expectEqual(.established, client.dtls_session.?.state);
 
     // POST with payload — echo handler returns the payload back.
-    const result = try client.post(testing.allocator, "/echo", "hello-dtls");
-    defer result.deinit(testing.allocator);
+    var storage: Client.ResponseStorage(0) = .{};
+    const result = try client.post(storage.buffers(), "/echo", "hello-dtls");
     try testing.expectEqual(.content, result.code);
     try testing.expectEqualSlices(u8, "hello-dtls", result.payload);
 }
@@ -144,13 +144,13 @@ test "DTLS: multiple requests on one session" {
 
     try client.handshake();
 
+    var storage: Client.ResponseStorage(0) = .{};
     // Send multiple requests sequentially on the same session.
     for (0..5) |i| {
         var payload_buf: [32]u8 = undefined;
         const payload = std.fmt.bufPrint(&payload_buf, "msg-{d}", .{i}) catch unreachable;
 
-        const result = try client.post(testing.allocator, "/echo", payload);
-        defer result.deinit(testing.allocator);
+        const result = try client.post(storage.buffers(), "/echo", payload);
         try testing.expectEqual(.content, result.code);
         try testing.expectEqualSlices(u8, payload, result.payload);
     }
@@ -180,8 +180,8 @@ test "plain UDP works without PSK" {
     defer client.deinit();
 
     // Should work without handshake — no DTLS.
-    const result = try client.get(testing.allocator, "/hello");
-    defer result.deinit(testing.allocator);
+    var storage: Client.ResponseStorage(0) = .{};
+    const result = try client.get(storage.buffers(), "/hello");
     try testing.expectEqual(.content, result.code);
 }
 
@@ -266,8 +266,8 @@ test "Block1: handler receives full reassembled body" {
     const payload = [_]u8{0x42} ** 2048;
     var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
     block1_received_len = 0;
-    const result = try client.upload(testing.allocator, .put, &path_buf, &payload);
-    defer result.deinit(testing.allocator);
+    var storage: Client.ResponseStorage(0) = .{};
+    const result = try client.upload(storage.buffers(), .put, &path_buf, &payload);
 
     try testing.expectEqual(.changed, result.code);
     // Handler should have received the FULL reassembled body (2048 bytes).
@@ -473,13 +473,14 @@ test "DTLS: deferred response is encrypted" {
     try testing.expectEqual(.established, client.dtls_session.?.state);
 
     // Submit CON POST — handler defers.
-    const handle = try client.submit(.post, &.{coapz.Option{ .kind = .uri_path, .value = "deferred" }}, "request");
+    var storage: Client.ResponseStorage(0) = .{};
+    const handle = try client.submit(storage.buffers(), .post, &.{coapz.Option{ .kind = .uri_path, .value = "deferred" }}, "request");
 
     // Wait for handler to capture the deferred handle.
     var attempts: u32 = 0;
     while (!dtls_deferred_ready.load(.acquire)) : (attempts += 1) {
         if (attempts > 200) return error.Timeout;
-        _ = client.poll(testing.allocator, 10) catch {};
+        _ = client.poll(10) catch {};
     }
 
     // Deliver deferred response.
@@ -495,16 +496,14 @@ test "DTLS: deferred response is encrypted" {
     // If sent as plaintext (#83), client won't parse it (expects DTLS records).
     var result: ?Client.Result = null;
     for (0..100) |_| {
-        if (client.poll(testing.allocator, 20) catch null) |completion| {
+        if (client.poll(20) catch null) |completion| {
             if (completion.handle == handle) {
-                result = completion.result;
+                result = try completion.result;
                 break;
             }
-            completion.result.deinit(testing.allocator);
         }
     }
     const r = result orelse return error.Timeout;
-    defer r.deinit(testing.allocator);
 
     try testing.expectEqual(.content, r.code);
     try testing.expectEqualSlices(u8, "deferred-result", r.payload);
@@ -544,8 +543,8 @@ test "DTLS: Block1 upload delivers reassembled body" {
     const payload = [_]u8{0x42} ** 2048;
     var path_buf: [1]coapz.Option = .{coapz.Option{ .kind = .uri_path, .value = "data" }};
     block1_received_len = 0;
-    const result = try client.upload(testing.allocator, .put, &path_buf, &payload);
-    defer result.deinit(testing.allocator);
+    var storage: Client.ResponseStorage(0) = .{};
+    const result = try client.upload(storage.buffers(), .put, &path_buf, &payload);
 
     try testing.expectEqual(.changed, result.code);
     try testing.expectEqual(@as(usize, 2048), block1_received_len);

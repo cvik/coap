@@ -10,8 +10,9 @@
 ///
 /// **Memory:** `init()` pre-allocates send/recv buffers and in-flight slot
 /// tables. These are owned by the client and freed in `deinit()`.
-/// Response data from `call`/`get`/etc. is allocated by the caller-provided
-/// allocator and must be freed via `Result.deinit()`.
+/// CON response APIs decode into caller-owned ResponseBuffers, with bounded
+/// Block2 reassembly and no heap allocation. Results borrow this storage.
+/// Raw receives and Observe notifications retain explicit allocator APIs.
 ///
 /// ## Example
 ///
@@ -19,8 +20,8 @@
 /// var client = try Client.init(allocator, .{ .host = "10.0.0.1" });
 /// defer client.deinit();
 ///
-/// const result = try client.get(allocator, "/sensor/temperature");
-/// defer result.deinit(allocator);
+/// var storage: Client.ResponseStorage(4096) = .{};
+/// const result = try client.get(storage.buffers(), "/sensor/temperature");
 /// std.debug.print("{s}\n", .{result.payload});
 /// ```
 const std = @import("std");
@@ -60,51 +61,65 @@ pub const Config = struct {
 
 /// Response from a CON request (`call`, `get`, `post`, `put`, `delete`, `upload`).
 ///
-/// **Lifetime:** The result owns the parsed packet and (for Block2 reassembly)
-/// a separate payload allocation. The caller must call `deinit()` with the
-/// same allocator passed to the originating call.
-///
-/// ```zig
-/// const result = try client.get(allocator, "/path");
-/// defer result.deinit(allocator);
-/// // use result.code, result.payload, result.options
-/// ```
+/// **Lifetime:** Borrows the storage supplied with the request. All bytes and
+/// option descriptors remain valid until that storage is reused, even after
+/// another receive or client.deinit(). Never deinit this result or its packet.
 pub const Result = struct {
     /// Response code (e.g. `.content`, `.not_found`).
     code: coapz.Code,
-    /// Response options. Backed by `packet`; valid until `deinit()`.
+    /// Response options; descriptors and values borrow caller storage.
     options: []const coapz.Option,
-    /// Response body. Backed by `packet` or by a separate allocation
-    /// when Block2 reassembly occurred. Valid until `deinit()`.
+    /// Body borrows packet storage, or payload storage for Block2 reassembly.
     payload: []const u8,
-    /// The full parsed response packet, for advanced inspection.
+    /// Borrowed packet view, including the complete reassembled payload.
     packet: coapz.Packet,
-    _owns_payload: bool = false,
-    _owns_options: bool = false,
-    _timeout: bool = false,
-    _reset: bool = false,
-    _etag_mismatch: bool = false,
-
-    /// True if response is a normal server reply (not timeout, reset, or error).
-    pub fn valid(self: Result) bool {
-        return !self._timeout and !self._reset and !self._etag_mismatch;
-    }
-
-    /// Free all memory associated with this result. Must be called with
-    /// the same allocator that was passed to `call`/`get`/`post`/etc.
-    /// Safe to call on timeout/reset sentinel results (no-op).
-    pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
-        if (self._timeout or self._reset or self._etag_mismatch) return;
-        if (self._owns_payload) {
-            allocator.free(@constCast(self.payload));
-        }
-        if (self._owns_options) {
-            allocator.free(@constCast(self.options));
-        } else {
-            self.packet.deinit(allocator);
-        }
-    }
 };
+
+/// Caller-owned storage, borrowed exclusively by one request until completion.
+/// Result bytes/options remain valid until the caller reuses this storage.
+/// packet holds one wire datagram; payload bounds multi-block reassembly.
+/// All three regions and every pending request's storage must be disjoint.
+/// Use distinct storage while retaining multiple completed results.
+pub const ResponseBuffers = struct {
+    packet: []u8,
+    options: []coapz.Option,
+    payload: []u8 = &.{},
+};
+
+/// Convenience storage; construct once, then reuse after consuming each result.
+pub fn ResponseStorage(comptime payload_capacity: usize) type {
+    return struct {
+        packet: [constants.buffer_size_default]u8 = undefined,
+        options: [32]coapz.Option = undefined,
+        payload: [payload_capacity]u8 = undefined,
+        pub fn buffers(self: *@This()) ResponseBuffers {
+            return .{ .packet = &self.packet, .options = &self.options, .payload = &self.payload };
+        }
+    };
+}
+
+const packet_view = @import("packet_view.zig");
+
+fn byteRangesOverlap(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    return @intFromPtr(a.ptr) < @intFromPtr(b.ptr) + b.len and
+        @intFromPtr(b.ptr) < @intFromPtr(a.ptr) + a.len;
+}
+
+fn buffersDisjoint(buffers: ResponseBuffers) bool {
+    const options = std.mem.sliceAsBytes(buffers.options);
+    return !byteRangesOverlap(buffers.packet, buffers.payload) and
+        !byteRangesOverlap(buffers.packet, options) and !byteRangesOverlap(buffers.payload, options);
+}
+
+fn buffersOverlap(a: ResponseBuffers, b: ResponseBuffers) bool {
+    const left = [_][]const u8{ a.packet, std.mem.sliceAsBytes(a.options), a.payload };
+    const right = [_][]const u8{ b.packet, std.mem.sliceAsBytes(b.options), b.payload };
+    for (left) |x| for (right) |y| {
+        if (byteRangesOverlap(x, y)) return true;
+    };
+    return false;
+}
 
 /// Opaque handle identifying a submitted async request.
 /// Valid until the corresponding Completion is returned by poll().
@@ -114,8 +129,8 @@ pub const RequestHandle = u16;
 pub const Completion = struct {
     /// Handle matching the one returned by submit().
     handle: RequestHandle,
-    /// The response. Caller must call result.deinit(allocator).
-    result: Result,
+    /// Borrowed response or correlated request failure. No deinit is required.
+    result: anyerror!Result,
 };
 
 // ─── In-flight slot ──────────────────────────────────────────────
@@ -135,7 +150,10 @@ const InFlightSlot = struct {
     send_len: u16,
     next_free: u16,
     // Async Block2 reassembly state.
-    block2_payload: std.ArrayListUnmanaged(u8),
+    response_buffers: ResponseBuffers = .{ .packet = &.{}, .options = &.{} },
+    block2_length: usize = 0,
+    block2_offset: usize = 0,
+    acknowledged: bool = false,
     doing_block2: bool,
     block2_etag: [8]u8,
     block2_etag_len: u4,
@@ -436,7 +454,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
                 @intCast(i + 1)
             else
                 empty_sentinel,
-            .block2_payload = .empty,
+            .block2_length = 0,
             .doing_block2 = false,
             .block2_etag = undefined,
             .block2_etag_len = 0,
@@ -501,7 +519,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
 }
 
 /// Release all client-owned memory and close the socket.
-/// Outstanding `Result` values must be deinited separately by the caller.
+/// Outstanding results remain valid in caller storage; pending borrows end.
 pub fn deinit(client: *Client) void {
     if (client.dtls_session) |*sess| sess.zeroKeys();
     for (&client.observes) |*obs| {
@@ -514,9 +532,6 @@ pub fn deinit(client: *Client) void {
     posix.close(client.fd);
     client.allocator.free(client.send_buf);
     client.allocator.free(client.recv_buf);
-    for (client.slots) |*slot| {
-        slot.block2_payload.deinit(client.allocator);
-    }
     client.allocator.free(client.slots);
     client.allocator.free(client.slot_table);
 }
@@ -697,9 +712,8 @@ pub fn cast(
 /// Automatically retransmits per RFC 7252 §4.2 (up to 4 retries, ~93s).
 /// Transparently reassembles Block2 multi-block responses.
 ///
-/// `allocator` is used to parse the response packet (and to accumulate
-/// Block2 payload when reassembly is needed). The caller owns the
-/// returned `Result` and must call `result.deinit(allocator)`.
+/// The returned Result borrows buffers; consume it before reusing storage.
+/// Returns RequestsInFlight rather than discarding unrelated completions.
 ///
 /// For simple path-based requests, prefer `get()`, `post()`, `put()`,
 /// `delete()` which build URI-Path options automatically.
@@ -709,23 +723,18 @@ pub fn cast(
 /// Returns `error.TooManyInFlight` if `max_in_flight` slots are exhausted.
 pub fn call(
     client: *Client,
-    allocator: std.mem.Allocator,
+    buffers: ResponseBuffers,
     code: coapz.Code,
     options: []const coapz.Option,
     payload: []const u8,
 ) !Result {
-    const handle = try client.submit(code, options, payload);
+    if (client.count_active != 0) return error.RequestsInFlight;
+    const handle = try client.submit(buffers, code, options, payload);
 
     while (true) {
-        const completion = try client.poll(allocator, 50) orelse continue;
-        if (completion.handle == handle) {
-            if (completion.result._timeout) return error.Timeout;
-            if (completion.result._reset) return error.Reset;
-            return completion.result;
-        }
-        // Completion for a different handle — discard.
-        // (Only happens if caller mixed call() with submit/poll.)
-        completion.result.deinit(allocator);
+        const completion = try client.poll(50) orelse continue;
+        std.debug.assert(completion.handle == handle);
+        return completion.result;
     }
 }
 
@@ -735,17 +744,36 @@ pub fn call(
 /// identifies this request in subsequent poll() completions.
 ///
 /// The request is serialized, encrypted (if DTLS), and sent immediately.
-/// Use poll() to drive the event loop and receive completions.
+/// Use poll() to drive the event loop and receive completions. Response buffers
+/// are exclusively borrowed until completion, cancel(), or client.deinit().
+/// Option values must remain valid until completion for Block2 continuations.
+/// At most 16 request options are supported; excess is rejected, not truncated.
 ///
 /// Returns error.TooManyInFlight if max_in_flight slots are exhausted.
 /// Returns error.NstartExceeded if peer is unconfirmed and NSTART
 /// outstanding CONs are already in flight (RFC 7252 §4.7).
 pub fn submit(
     client: *Client,
+    buffers: ResponseBuffers,
     code: coapz.Code,
     options: []const coapz.Option,
     payload: []const u8,
 ) !RequestHandle {
+    if (options.len > 16) return error.TooManyRequestOptions;
+    if (std.debug.runtime_safety) {
+        std.debug.assert(buffersDisjoint(buffers));
+        for (client.slots) |slot| {
+            if (slot.state == .pending) std.debug.assert(!buffersOverlap(buffers, slot.response_buffers));
+        }
+    }
+    var block2_offset: usize = 0;
+    for (options) |option| {
+        if (option.kind == .block2) {
+            const block = option.as_block() orelse return error.InvalidBlock2;
+            if (block.szx == 7) return error.InvalidBlock2;
+            block2_offset = @as(usize, block.num) * (@as(usize, 1) << (@as(u4, block.szx) + 4));
+        }
+    }
     // NSTART enforcement (RFC 7252 §4.7): limit outstanding CONs
     // to nstart until the first successful response from this peer.
     if (!client.peer_confirmed and client.count_active >= constants.nstart) {
@@ -792,7 +820,10 @@ pub fn submit(
     }
     slot.original_options_len = opt_count;
     slot.doing_block2 = false;
-    slot.block2_payload = .empty;
+    slot.response_buffers = buffers;
+    slot.acknowledged = false;
+    slot.block2_length = 0;
+    slot.block2_offset = block2_offset;
     slot.original_handle = slot_idx;
 
     const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
@@ -815,260 +846,142 @@ pub fn submit(
 /// Returns a Completion if any submitted request finished, null if
 /// nothing completed within timeout_ms (0 = non-blocking).
 ///
-/// Caller must call completion.result.deinit(allocator) when done.
+/// completion.result is an error union, correlated by handle. Results borrow
+/// the buffers attached to submit(); no deinit is required.
 ///
 /// Multiple calls to poll() are needed to drain all pending completions
 /// when multiple requests are in flight.
-pub fn poll(
-    client: *Client,
-    allocator: std.mem.Allocator,
-    timeout_ms: i32,
-) !?Completion {
+/// Process responses into the storage attached to submit(). No heap allocation.
+pub fn poll(client: *Client, timeout_ms: i32) !?Completion {
     if (client.count_active == 0) return null;
-
-    // Check retransmissions for all active slots.
     const now = nanoTimestamp();
-    var earliest_retransmit: i64 = now + 50 * std.time.ns_per_ms;
+    var earliest: i64 = now + 50 * std.time.ns_per_ms;
     for (client.slots, 0..) |*slot, i| {
         if (slot.state != .pending) continue;
         if (now >= slot.next_retransmit_ns) {
-            if (slot.retransmit_count >= constants.max_retransmit) {
-                const idx: u16 = @intCast(i);
-                const orig_handle = slot.original_handle;
-                client.freeSlotAndTable(idx);
-                return .{ .handle = orig_handle, .result = timeoutResult() };
-            }
-            const wire = client.send_buf[slot.send_offset..][0..slot.send_len];
-            client.sendCoap(wire) catch {};
+            if (slot.acknowledged or slot.retransmit_count >= constants.max_retransmit)
+                return client.finish(@intCast(i), error.Timeout);
+            client.sendCoap(client.send_buf[slot.send_offset..][0..slot.send_len]) catch |err|
+                return client.finish(@intCast(i), err);
             slot.retransmit_count += 1;
             slot.timeout_ns *= 2;
             slot.next_retransmit_ns = now + @as(i64, @intCast(slot.timeout_ns));
         }
-        if (slot.next_retransmit_ns < earliest_retransmit) {
-            earliest_retransmit = slot.next_retransmit_ns;
-        }
+        earliest = @min(earliest, slot.next_retransmit_ns);
     }
+    const wait_ms: i32 = if (timeout_ms == 0) 0 else @intCast(@max(1, @min(timeout_ms, @divTrunc(earliest - now, std.time.ns_per_ms))));
+    const raw = client.pollRecv(wait_ms) orelse return null;
+    var plaintext: [constants.buffer_size_default]u8 = undefined;
+    const data = client.decryptRecv(raw, &plaintext) orelse return null;
+    if (data.len < 4 or data[0] >> 6 != 1) return null;
+    const tkl: usize = data[0] & 15;
+    if (tkl > 8 or data.len < 4 + tkl) return null;
+    const kind = coapz.Packet.peekKind(data);
+    const mid = coapz.Packet.peekMsgId(data).?;
+    if (kind == .reset or (kind == .acknowledgement and data[1] == 0)) {
+        if (data.len != 4 or data[1] != 0) return null;
+        for (client.slots, 0..) |*slot, i| {
+            if (slot.state != .pending or slot.msg_id != mid) continue;
+            if (kind == .reset) return client.finish(@intCast(i), error.Reset);
+            if (slot.acknowledged) return null;
+            slot.acknowledged = true;
+            slot.next_retransmit_ns = now + @as(i64, constants.max_transmit_wait_ms) * std.time.ns_per_ms;
+            return null;
+        }
+        return null;
+    }
+    const token = data[4..][0..tkl];
+    if (client.routeObserve(token, data)) return null;
+    const idx = client.findSlot(client.tokenKey(token)) orelse return null;
+    const slot = &client.slots[idx];
+    if (!std.mem.eql(u8, slot.token[0..slot.token_len], token)) return null;
+    if (kind == .acknowledgement and mid != slot.msg_id) return null;
+    if (data[1] >> 5 < 2) return null;
+    return client.processResponse(idx, data);
+}
 
-    // Compute effective timeout: min of caller's timeout and next retransmit.
-    const effective_timeout: i32 = blk: {
-        if (timeout_ms == 0) break :blk 0;
-        const retransmit_ms: i64 = @divTrunc(earliest_retransmit - now, std.time.ns_per_ms);
-        break :blk @intCast(@max(1, @min(timeout_ms, retransmit_ms)));
+/// Abandon a currently pending handle and release its storage borrow.
+/// Does not retract a transmitted request or cancel remote application work.
+/// Handles are reusable; never cancel a handle after consuming its completion.
+pub fn cancel(client: *Client, handle: RequestHandle) void {
+    if (handle >= client.slots.len or client.slots[handle].state != .pending) return;
+    client.freeSlotAndTable(handle);
+}
+
+fn finish(client: *Client, idx: u16, result: anyerror!Result) Completion {
+    const handle = client.slots[idx].original_handle;
+    client.freeSlotAndTable(idx);
+    return .{ .handle = handle, .result = result };
+}
+
+fn processResponse(client: *Client, idx: u16, data: []const u8) !?Completion {
+    const slot = &client.slots[idx];
+    const buffers = slot.response_buffers;
+    if (data.len > buffers.packet.len) return client.finish(idx, error.ResponseBufferTooSmall);
+    @memcpy(buffers.packet[0..data.len], data);
+    var packet = packet_view.read(buffers.packet[0..data.len], buffers.options) catch |err| {
+        if (err == error.ResponseOptionsTooSmall) return client.finish(idx, err);
+        return null; // Malformed datagrams do not complete a pending request.
     };
-
-    const raw_data = client.pollRecv(effective_timeout) orelse return null;
-    var pt_buf: [constants.buffer_size_default]u8 = undefined;
-    const data = client.decryptRecv(raw_data, &pt_buf) orelse return null;
-
-    if (data.len < 4) return null;
-
-    const tkl: u8 = data[0] & 0x0F;
-    if (data.len < 4 + tkl) return null;
-    const recv_token = data[4..][0..tkl];
-
-    // Route observe notifications.
-    if (client.routeObserve(recv_token, data)) return null;
-
-    // Find matching slot via token hash table.
-    const key = client.tokenKey(recv_token);
-    const slot_idx = client.findSlot(key) orelse return null;
-    const slot = &client.slots[slot_idx];
-
-    // Verify token matches exactly.
-    if (slot.token_len != tkl) return null;
-    if (!std.mem.eql(u8, slot.token[0..slot.token_len], recv_token)) return null;
-
     client.peer_confirmed = true;
-
-    const response = coapz.Packet.read(allocator, data) catch return null;
-
-    if (response.kind == .reset) {
-        const orig_handle = slot.original_handle;
-        response.deinit(allocator);
-        client.freeSlotAndTable(slot_idx);
-        return .{ .handle = orig_handle, .result = resetResult() };
-    }
-
-    // Block2 handling.
-    var blk2_it = response.find_options(.block2);
-    if (blk2_it.next()) |blk2_opt| {
-        if (blk2_opt.as_block()) |blk2| {
-            // ETag consistency check (RFC 7959 §2.4).
-            if (!checkBlock2Etag(slot, response)) {
-                slot.block2_payload.deinit(allocator);
-                slot.block2_payload = .empty;
-                slot.doing_block2 = false;
-                const orig_handle = slot.original_handle;
-                response.deinit(allocator);
-                client.freeSlotAndTable(slot_idx);
-                return .{ .handle = orig_handle, .result = etagMismatchResult() };
+    if (packet.kind == .confirmable) client.sendAck(packet.msg_id, &.{}) catch |err| return client.finish(idx, err);
+    if (@intFromEnum(packet.code) >> 5 != 2)
+        return client.finish(idx, .{ .code = packet.code, .options = packet.options, .payload = packet.payload, .packet = packet });
+    if (packet.find_option(.block2)) |option| {
+        const block = option.as_block() orelse return client.finish(idx, error.InvalidBlock2);
+        if (block.szx == 7) return client.finish(idx, error.InvalidBlock2);
+        const block_size: usize = @as(usize, 1) << (@as(u4, block.szx) + 4);
+        const offset = @as(u64, block.num) * block_size;
+        // A retransmitted separate CON block must be ACKed but not appended.
+        if (slot.doing_block2 and offset < slot.block2_offset + slot.block2_length) return null;
+        if (offset != slot.block2_offset + slot.block2_length or packet.payload.len > block_size)
+            return client.finish(idx, error.InvalidBlock2);
+        if (!checkBlock2Etag(slot, packet)) return client.finish(idx, error.EtagMismatch);
+        if (block.more or slot.doing_block2) {
+            if (packet.payload.len > buffers.payload.len - slot.block2_length)
+                return client.finish(idx, error.ResponsePayloadTooSmall);
+            @memcpy(buffers.payload[slot.block2_length..][0..packet.payload.len], packet.payload);
+            slot.block2_length += packet.payload.len;
+            slot.doing_block2 = true;
+            if (block.more) {
+                if (packet.payload.len != block_size) return client.finish(idx, error.InvalidBlock2);
+                client.continueBlock2(idx, block.num + 1, block.szx) catch |err| return client.finish(idx, err);
+                return null;
             }
-            if (blk2.more) {
-                slot.block2_payload.appendSlice(allocator, response.payload) catch {
-                    response.deinit(allocator);
-                    client.freeSlotAndTable(slot_idx);
-                    return null;
-                };
-                slot.doing_block2 = true;
-
-                // Save Block2 state before freeing old slot.
-                var saved_b2 = slot.block2_payload;
-                const saved_code = slot.original_code;
-                const saved_olen = slot.original_options_len;
-                const saved_handle = slot.original_handle;
-                var saved_opts: [16]coapz.Option = undefined;
-                @memcpy(saved_opts[0..saved_olen], slot.original_options_buf[0..saved_olen]);
-
-                // Prevent freeSlot from deiniting the ArrayList we're migrating.
-                slot.block2_payload = .empty;
-                slot.doing_block2 = false;
-
-                response.deinit(allocator);
-                client.freeSlotAndTable(slot_idx);
-
-                // Send Block2 continuation, getting a new slot.
-                const new_idx = client.sendBlock2Request(
-                    blk2.num + 1,
-                    blk2.szx,
-                    saved_code,
-                    saved_opts[0..saved_olen],
-                ) catch {
-                    saved_b2.deinit(allocator);
-                    return null;
-                };
-
-                // Migrate Block2 state to new slot.
-                const new_slot = &client.slots[new_idx];
-                new_slot.block2_payload = saved_b2;
-                new_slot.doing_block2 = true;
-                new_slot.block2_etag = slot.block2_etag;
-                new_slot.block2_etag_len = slot.block2_etag_len;
-                new_slot.original_code = saved_code;
-                @memcpy(new_slot.original_options_buf[0..saved_olen], saved_opts[0..saved_olen]);
-                new_slot.original_options_len = saved_olen;
-                new_slot.original_handle = saved_handle;
-
-                return null; // Not complete yet.
-            }
+            packet.payload = buffers.payload[0..slot.block2_length];
         }
+    } else if (slot.doing_block2) return client.finish(idx, error.InvalidBlock2);
+    return client.finish(idx, .{ .code = packet.code, .options = packet.options, .payload = packet.payload, .packet = packet });
+}
+
+fn continueBlock2(client: *Client, idx: u16, num: u32, szx: u3) !void {
+    if (num > 0xfffff) return error.InvalidBlock2;
+    const slot = &client.slots[idx];
+    var options: [17]coapz.Option = undefined;
+    var count: usize = 0;
+    for (slot.original_options_buf[0..slot.original_options_len]) |option| {
+        if (option.kind == .block2 or option.kind == .block1) continue;
+        options[count] = option;
+        count += 1;
     }
-
-    // Final response — may be last block of a Block2 sequence.
-    const was_block2 = slot.doing_block2;
-    var saved_b2 = slot.block2_payload;
-    const orig_handle = slot.original_handle;
-    // Prevent freeSlot from deiniting payload we're using.
-    slot.block2_payload = .empty;
-    slot.doing_block2 = false;
-    client.freeSlotAndTable(slot_idx);
-
-    if (was_block2) {
-        saved_b2.appendSlice(allocator, response.payload) catch {
-            response.deinit(allocator);
-            saved_b2.deinit(allocator);
-            return null;
-        };
-
-        const final_code = response.code;
-        const final_options = allocator.dupe(coapz.Option, response.options) catch {
-            response.deinit(allocator);
-            saved_b2.deinit(allocator);
-            return null;
-        };
-        response.deinit(allocator);
-
-        const full_payload = allocator.alloc(u8, saved_b2.items.len) catch {
-            allocator.free(@constCast(final_options));
-            saved_b2.deinit(allocator);
-            return null;
-        };
-        @memcpy(full_payload, saved_b2.items);
-        saved_b2.deinit(allocator);
-
-        return .{
-            .handle = orig_handle,
-            .result = .{
-                .code = final_code,
-                .options = final_options,
-                .payload = full_payload,
-                .packet = .{
-                    .kind = .acknowledgement,
-                    .code = final_code,
-                    .msg_id = 0,
-                    .token = &.{},
-                    .options = final_options,
-                    .payload = full_payload,
-                    .data_buf = &.{},
-                },
-                ._owns_payload = true,
-                ._owns_options = true,
-            },
-        };
-    }
-
-    return .{
-        .handle = orig_handle,
-        .result = .{
-            .code = response.code,
-            .options = response.options,
-            .payload = response.payload,
-            .packet = response,
-        },
+    var encoded_block: [3]u8 = undefined;
+    options[count] = (coapz.BlockValue{ .num = num, .more = false, .szx = szx }).option(.block2, &encoded_block);
+    count += 1;
+    const Order = struct {
+        fn less(_: void, a: coapz.Option, b: coapz.Option) bool {
+            return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+        }
     };
-}
-
-fn timeoutResult() Result {
-    return .{
-        .code = .empty,
-        .options = &.{},
-        .payload = &.{},
-        .packet = .{
-            .kind = .reset,
-            .code = .empty,
-            .msg_id = 0,
-            .token = &.{},
-            .options = &.{},
-            .payload = &.{},
-            .data_buf = &.{},
-        },
-        ._timeout = true,
-    };
-}
-
-fn resetResult() Result {
-    return .{
-        .code = .empty,
-        .options = &.{},
-        .payload = &.{},
-        .packet = .{
-            .kind = .reset,
-            .code = .empty,
-            .msg_id = 0,
-            .token = &.{},
-            .options = &.{},
-            .payload = &.{},
-            .data_buf = &.{},
-        },
-        ._reset = true,
-    };
-}
-
-fn etagMismatchResult() Result {
-    return .{
-        .code = .empty,
-        .options = &.{},
-        .payload = &.{},
-        .packet = .{
-            .kind = .reset,
-            .code = .empty,
-            .msg_id = 0,
-            .token = &.{},
-            .options = &.{},
-            .payload = &.{},
-            .data_buf = &.{},
-        },
-        ._etag_mismatch = true,
-    };
+    std.mem.sort(coapz.Option, options[0..count], {}, Order.less);
+    const packet: coapz.Packet = .{ .kind = .confirmable, .code = slot.original_code, .msg_id = client.nextMsgId(), .token = slot.token[0..slot.token_len], .options = options[0..count], .payload = &.{}, .data_buf = &.{} };
+    const wire = try packet.writeBuf(client.send_buf[slot.send_offset..][0..client.config.buffer_size]);
+    slot.msg_id = packet.msg_id;
+    slot.send_len = @intCast(wire.len);
+    slot.retransmit_count = 0;
+    slot.acknowledged = false;
+    slot.timeout_ns = client.randomizedTimeout(constants.ack_timeout_ms);
+    slot.next_retransmit_ns = nanoTimestamp() + @as(i64, @intCast(slot.timeout_ns));
+    try client.sendCoap(wire);
 }
 
 // ─── Path convenience methods ────────────────────────────────────
@@ -1076,33 +989,28 @@ fn etagMismatchResult() Result {
 const uri = @import("uri.zig");
 
 /// CON GET by URI path. Splits `path` into URI-Path options and
-/// calls `call()`. Caller must call `result.deinit(allocator)`.
-///
-/// ```zig
-/// const result = try client.get(allocator, "/sensor/temperature");
-/// defer result.deinit(allocator);
-/// ```
-pub fn get(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
+/// calls `call()`. The result borrows the supplied response buffers.
+pub fn get(client: *Client, buffers: ResponseBuffers, path: []const u8) !Result {
     var buf: [uri.max_options]coapz.Option = undefined;
-    return client.call(allocator, .get, uri.fromUri(path, &buf), &.{});
+    return client.call(buffers, .get, uri.fromUri(path, &buf), &.{});
 }
 
-/// CON POST by URI path (with optional query) and payload. Caller must call `result.deinit(allocator)`.
-pub fn post(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
+/// CON POST by URI path and payload. Result borrows buffers.
+pub fn post(client: *Client, buffers: ResponseBuffers, path: []const u8, payload: []const u8) !Result {
     var buf: [uri.max_options]coapz.Option = undefined;
-    return client.call(allocator, .post, uri.fromUri(path, &buf), payload);
+    return client.call(buffers, .post, uri.fromUri(path, &buf), payload);
 }
 
-/// CON PUT by URI path (with optional query) and payload. Caller must call `result.deinit(allocator)`.
-pub fn put(client: *Client, allocator: std.mem.Allocator, path: []const u8, payload: []const u8) !Result {
+/// CON PUT by URI path and payload. Result borrows buffers.
+pub fn put(client: *Client, buffers: ResponseBuffers, path: []const u8, payload: []const u8) !Result {
     var buf: [uri.max_options]coapz.Option = undefined;
-    return client.call(allocator, .put, uri.fromUri(path, &buf), payload);
+    return client.call(buffers, .put, uri.fromUri(path, &buf), payload);
 }
 
-/// CON DELETE by URI path (with optional query). Caller must call `result.deinit(allocator)`.
-pub fn delete(client: *Client, allocator: std.mem.Allocator, path: []const u8) !Result {
+/// CON DELETE by URI path. Result borrows buffers.
+pub fn delete(client: *Client, buffers: ResponseBuffers, path: []const u8) !Result {
     var buf: [uri.max_options]coapz.Option = undefined;
-    return client.call(allocator, .delete, uri.fromUri(path, &buf), &.{});
+    return client.call(buffers, .delete, uri.fromUri(path, &buf), &.{});
 }
 
 // ─── sendRaw / recvRaw ───────────────────────────────────────────
@@ -1244,27 +1152,30 @@ pub fn observe(
 /// each as a separate CON request. Honors the server's preferred block
 /// size if it responds with a smaller SZX value.
 ///
-/// Returns the server's response to the final block. Caller must call
-/// `result.deinit(allocator)`.
+/// Returns the final borrowed response. Intermediate replies reuse the same
+/// buffers; final Block2 reassembly is bounded too. Consume before reuse.
 ///
 /// ```zig
-/// const result = try client.upload(allocator, .put, &.{
+/// var storage: Client.ResponseStorage(4096) = .{};
+/// const result = try client.upload(storage.buffers(), .put, &.{
 ///     .{ .kind = .uri_path, .value = "firmware" },
 /// }, large_payload);
-/// defer result.deinit(allocator);
 /// ```
 pub fn upload(
     client: *Client,
-    allocator: std.mem.Allocator,
+    buffers: ResponseBuffers,
     code: coapz.Code,
     options: []const coapz.Option,
     payload: []const u8,
 ) !Result {
+    if (options.len > 15) return error.TooManyRequestOptions;
+    if (payload.len > std.math.maxInt(u32)) return error.UploadTooLarge;
     var szx = client.config.default_szx;
     var block_size: usize = @as(usize, 1) << (@as(u4, szx) + 4);
 
     var block_num: u32 = 0;
     while (true) {
+        if (block_num > 0xfffff) return error.UploadTooLarge;
         const start = block_num * block_size;
         const end = @min(start + block_size, payload.len);
         const is_last = (end >= payload.len);
@@ -1279,14 +1190,19 @@ pub fn upload(
         const block_opt = block_val.option(.block1, &block_buf);
 
         var combined: [32]coapz.Option = undefined;
-        const opt_count = @min(options.len, 31);
+        const opt_count = options.len;
         for (0..opt_count) |i| {
             combined[i] = options[i];
         }
         combined[opt_count] = block_opt;
+        std.mem.sort(coapz.Option, combined[0 .. opt_count + 1], {}, struct {
+            fn less(_: void, a: coapz.Option, b: coapz.Option) bool {
+                return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+            }
+        }.less);
 
         const result = try client.call(
-            allocator,
+            buffers,
             code,
             combined[0 .. opt_count + 1],
             block_payload,
@@ -1302,21 +1218,15 @@ pub fn upload(
         var resp_blk_it = result.packet.find_options(.block1);
         if (resp_blk_it.next()) |resp_blk_opt| {
             if (resp_blk_opt.as_block()) |resp_blk| {
-                if (resp_code != .@"continue") {
-                    result.deinit(allocator);
-                    return error.UploadRejected;
-                }
+                if (resp_code != .@"continue") return error.UploadRejected;
                 if (resp_blk.szx < szx) {
                     szx = resp_blk.szx;
                     block_size = @as(usize, 1) << (@as(u4, szx) + 4);
                     block_num = @intCast(end / block_size);
-                    result.deinit(allocator);
                     continue;
                 }
             }
         }
-
-        result.deinit(allocator);
 
         if (resp_code != .@"continue") {
             return error.UploadRejected;
@@ -1340,6 +1250,7 @@ fn sendCoap(client: *Client, wire: []const u8) !void {
     if (client.dtls_session) |*sess| {
         if (sess.state != .established) return error.DtlsNotEstablished;
         var enc_buf: [constants.buffer_size_default + dtls.types.record_overhead]u8 = undefined;
+        if (wire.len > constants.buffer_size_default) return error.BufferTooSmall;
         const encrypted = dtls.Record.encodeEncrypted(
             .application_data,
             wire,
@@ -1366,7 +1277,7 @@ fn sendAck(client: *Client, msg_id: u16, token: []const u8) !void {
     };
     var buf: [64]u8 = undefined;
     const wire = ack.writeBuf(&buf) catch return;
-    client.sendCoap(wire) catch {};
+    try client.sendCoap(wire);
 }
 
 /// Non-blocking recv. Returns data slice or null if nothing available.
@@ -1482,201 +1393,6 @@ fn routeObserve(client: *Client, token: []const u8, data: []const u8) bool {
     return false;
 }
 
-/// Wait for a response to a specific in-flight slot.
-/// Handles retransmission, Block2 reassembly (iterative), and observe routing.
-fn waitForResponse(
-    client: *Client,
-    allocator: std.mem.Allocator,
-    cur_slot_idx: u16,
-    original_code: coapz.Code,
-    original_options: []const coapz.Option,
-) !Result {
-    var slot_idx = cur_slot_idx;
-    var assembled_payload: std.ArrayListUnmanaged(u8) = .empty;
-    defer assembled_payload.deinit(allocator);
-    var doing_block2 = false;
-
-    while (true) {
-        const slot = &client.slots[slot_idx];
-        const now = nanoTimestamp();
-
-        // Check retransmission timeout.
-        if (slot.state == .pending and now >= slot.next_retransmit_ns) {
-            if (slot.retransmit_count >= constants.max_retransmit) {
-                client.freeSlotAndTable(slot_idx);
-                return error.Timeout;
-            }
-            const wire = client.send_buf[slot.send_offset..][0..slot.send_len];
-            client.sendCoap(wire) catch {};
-            slot.retransmit_count += 1;
-            slot.timeout_ns *= 2;
-            slot.next_retransmit_ns = now + @as(i64, @intCast(slot.timeout_ns));
-        }
-
-        // Wait until next retransmit deadline or a short poll interval.
-        const retransmit_remaining_ns = slot.next_retransmit_ns - now;
-        const timeout_ms: i32 = @intCast(@max(1, @divTrunc(@min(retransmit_remaining_ns, 50 * std.time.ns_per_ms), std.time.ns_per_ms)));
-        const raw_data = client.pollRecv(timeout_ms) orelse continue;
-        var pt_buf: [constants.buffer_size_default]u8 = undefined;
-        const data = client.decryptRecv(raw_data, &pt_buf) orelse continue;
-
-        if (data.len < 4) continue;
-
-        const tkl: u8 = data[0] & 0x0F;
-        if (data.len < 4 + tkl) continue;
-        const recv_token = data[4..][0..tkl];
-
-        // Route observe notifications.
-        if (client.routeObserve(recv_token, data)) continue;
-
-        // Check if token matches our slot.
-        if (slot.token_len != tkl) continue;
-        if (!std.mem.eql(u8, slot.token[0..slot.token_len], recv_token)) continue;
-
-        client.peer_confirmed = true;
-
-        const response = coapz.Packet.read(allocator, data) catch continue;
-
-        if (response.kind == .reset) {
-            response.deinit(allocator);
-            client.freeSlotAndTable(slot_idx);
-            return error.Reset;
-        }
-
-        // Check for Block2 with more=true.
-        var blk2_it = response.find_options(.block2);
-        if (blk2_it.next()) |blk2_opt| {
-            if (blk2_opt.as_block()) |blk2| {
-                // ETag consistency check (RFC 7959 §2.4).
-                slot.doing_block2 = doing_block2;
-                if (!checkBlock2Etag(slot, response)) {
-                    response.deinit(allocator);
-                    client.freeSlotAndTable(slot_idx);
-                    return error.EtagMismatch;
-                }
-                if (blk2.more) {
-                    try assembled_payload.appendSlice(allocator, response.payload);
-                    doing_block2 = true;
-                    response.deinit(allocator);
-                    client.freeSlotAndTable(slot_idx);
-
-                    slot_idx = try client.sendBlock2Request(
-                        blk2.num + 1,
-                        blk2.szx,
-                        original_code,
-                        original_options,
-                    );
-                    continue;
-                }
-            }
-        }
-
-        // Final response.
-        client.freeSlotAndTable(slot_idx);
-
-        if (doing_block2) {
-            try assembled_payload.appendSlice(allocator, response.payload);
-
-            const final_code = response.code;
-            const final_options = try allocator.dupe(coapz.Option, response.options);
-            response.deinit(allocator);
-
-            const full_payload = try allocator.alloc(u8, assembled_payload.items.len);
-            @memcpy(full_payload, assembled_payload.items);
-
-            return .{
-                .code = final_code,
-                .options = final_options,
-                .payload = full_payload,
-                .packet = .{
-                    .kind = .acknowledgement,
-                    .code = final_code,
-                    .msg_id = 0,
-                    .token = &.{},
-                    .options = final_options,
-                    .payload = full_payload,
-                    .data_buf = &.{},
-                },
-                ._owns_payload = true,
-                ._owns_options = true,
-            };
-        }
-
-        return .{
-            .code = response.code,
-            .options = response.options,
-            .payload = response.payload,
-            .packet = response,
-        };
-    }
-}
-
-/// Send a Block2 continuation GET and set up a new in-flight slot.
-fn sendBlock2Request(
-    client: *Client,
-    block_num: u32,
-    szx: u3,
-    code: coapz.Code,
-    options: []const coapz.Option,
-) !u16 {
-    var token_buf: [8]u8 = undefined;
-    const token = client.makeToken(&token_buf);
-    const msg_id = client.nextMsgId();
-
-    var block_buf: [3]u8 = undefined;
-    const blk = coapz.BlockValue{
-        .num = block_num,
-        .more = false,
-        .szx = szx,
-    };
-    const block_opt = blk.option(.block2, &block_buf);
-
-    var combined: [32]coapz.Option = undefined;
-    const opt_count = @min(options.len, 31);
-    for (0..opt_count) |i| {
-        combined[i] = options[i];
-    }
-    combined[opt_count] = block_opt;
-
-    const packet = coapz.Packet{
-        .kind = .confirmable,
-        .code = code,
-        .msg_id = msg_id,
-        .token = token,
-        .options = combined[0 .. opt_count + 1],
-        .payload = &.{},
-        .data_buf = &.{},
-    };
-
-    const new_slot_idx = try client.allocSlot();
-    const new_slot = &client.slots[new_slot_idx];
-    const offset: u32 = @as(u32, new_slot_idx) * client.config.buffer_size;
-    const slot_buf = client.send_buf[offset..][0..client.config.buffer_size];
-    const wire = packet.writeBuf(slot_buf) catch |err| {
-        client.freeSlot(new_slot_idx);
-        return err;
-    };
-
-    @memcpy(new_slot.token[0..token.len], token);
-    new_slot.token_len = @intCast(token.len);
-    new_slot.msg_id = msg_id;
-    new_slot.retransmit_count = 0;
-    new_slot.send_offset = offset;
-    new_slot.send_len = @intCast(wire.len);
-    new_slot.state = .pending;
-
-    const initial_timeout = client.randomizedTimeout(constants.ack_timeout_ms);
-    new_slot.timeout_ns = initial_timeout;
-    new_slot.next_retransmit_ns = nanoTimestamp() + @as(i64, @intCast(initial_timeout));
-
-    client.insertTable(new_slot_idx, client.tokenKey(token));
-    errdefer client.freeSlotAndTable(new_slot_idx);
-
-    try client.sendCoap(wire);
-
-    return new_slot_idx;
-}
-
 /// Wait for ACK to a specific in-flight slot (for observe registration).
 fn waitForAck(client: *Client, slot_idx: u16) !void {
     const slot = &client.slots[slot_idx];
@@ -1747,8 +1463,7 @@ fn allocSlot(client: *Client) !u16 {
 }
 
 fn freeSlot(client: *Client, idx: u16) void {
-    client.slots[idx].block2_payload.deinit(client.allocator);
-    client.slots[idx].block2_payload = .empty;
+    client.slots[idx].block2_length = 0;
     client.slots[idx].doing_block2 = false;
     client.slots[idx].state = .free;
     client.slots[idx].next_free = client.free_head;
@@ -1942,6 +1657,321 @@ fn nullHandler(_: coap_handler.Request) ?coap_handler.Response {
     return null;
 }
 
+fn metadataEchoHandler(request: coap_handler.Request) ?coap_handler.Response {
+    return .{ .payload = request.packet.payload, .options = &.{
+        .{ .kind = .etag, .value = "tag-data" },
+        .{ .kind = .content_format, .value = &.{0} },
+    } };
+}
+
+fn awaitTestCompletion(client: *Client) !Completion {
+    for (0..100) |_| if (try client.poll(50)) |completion| return completion;
+    return error.NoCompletion;
+}
+
+test "CON responses use caller storage, retain metadata, and perform no allocation" {
+    const port: u16 = 29730;
+    var server = try startTestServer(port, metadataEchoHandler);
+    defer server.deinit();
+    var runner = ServerRunner{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(thread);
+    var client = try Client.init(testing.allocator, .{ .port = port, .max_in_flight = 4 });
+    defer client.deinit();
+    const allocator = client.allocator;
+    defer client.allocator = allocator;
+    client.allocator = testing.failing_allocator;
+    var storage: [4]ResponseStorage(0) = .{ .{}, .{}, .{}, .{} };
+    const first = try client.call(storage[0].buffers(), .get, &.{}, "retained");
+    const one = try client.submit(storage[1].buffers(), .get, &.{}, "one");
+    const two = try client.submit(storage[2].buffers(), .get, &.{}, "two");
+    // Synchronous calls must not silently discard someone else's completion.
+    try testing.expectError(error.RequestsInFlight, client.call(storage[3].buffers(), .get, &.{}, "bad"));
+    var results: [2]Result = undefined;
+    for (0..2) |_| {
+        const completion = try awaitTestCompletion(&client);
+        const i: usize = if (completion.handle == one) 0 else 1;
+        try testing.expect(completion.handle == one or completion.handle == two);
+        results[i] = try completion.result;
+    }
+    _ = try client.call(storage[3].buffers(), .get, &.{}, "overwrite-receive-buffer");
+    try testing.expectEqualSlices(u8, "retained", first.payload);
+    try testing.expectEqualSlices(u8, "one", results[0].payload);
+    try testing.expectEqualSlices(u8, "two", results[1].payload);
+    for ([_]Result{ first, results[0], results[1] }) |result| {
+        try testing.expectEqualSlices(u8, "tag-data", result.packet.find_option(.etag).?.value);
+        try testing.expectEqualSlices(u8, result.payload, result.packet.payload);
+        try testing.expectEqual(@as(usize, 2), result.packet.token.len);
+    }
+}
+
+test "CON packet and option capacity failures are correlated and permit retry" {
+    const port: u16 = 29731;
+    var server = try startTestServer(port, metadataEchoHandler);
+    defer server.deinit();
+    var runner = ServerRunner{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+    defer runner.stop(thread);
+    var client = try Client.init(testing.allocator, .{ .port = port });
+    defer client.deinit();
+    const allocator = client.allocator;
+    defer client.allocator = allocator;
+    client.allocator = testing.failing_allocator;
+    const handle = try client.submit(.{ .packet = &.{}, .options = &.{} }, .get, &.{}, "payload");
+    const completion = try awaitTestCompletion(&client);
+    try testing.expectEqual(handle, completion.handle);
+    try testing.expectError(error.ResponseBufferTooSmall, completion.result);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    var storage: ResponseStorage(0) = .{};
+    const retry = try client.call(storage.buffers(), .get, &.{}, "retry");
+    try testing.expectEqualSlices(u8, "retry", retry.payload);
+    const h2 = try client.submit(.{ .packet = &storage.packet, .options = &.{} }, .get, &.{}, "options");
+    const c2 = try awaitTestCompletion(&client);
+    try testing.expectEqual(h2, c2.handle);
+    try testing.expectError(error.ResponseOptionsTooSmall, c2.result);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    _ = try client.call(storage.buffers(), .get, &.{}, "retry-again");
+}
+
+const bounded_test_body = blk: {
+    @setEvalBranchQuota(4000);
+    var bytes: [3000]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    break :blk bytes;
+};
+
+fn boundedBodyHandler(_: coap_handler.Request) ?coap_handler.Response {
+    return .{ .payload = &bounded_test_body };
+}
+
+test "plain and DTLS Block1/Block2 responses are bounded and allocation-free" {
+    const credentials: dtls.types.Psk = .{ .identity = "bounded", .key = "0123456789abcdef" };
+    for ([_]bool{ false, true }, 0..) |encrypted, i| {
+        const port: u16 = @intCast(29732 + i);
+        var server = try coap_server.init(testing.allocator, .{
+            .port = port,
+            .buffer_count = 16,
+            .buffer_size = 1280,
+            .exchange_count = 16,
+            .rate_limit_ip_count = 0,
+            .max_block_transfers = 8,
+            .max_block_payload = 8192,
+            .psk = if (encrypted) credentials else null,
+        }, boundedBodyHandler);
+        defer server.deinit();
+        try server.listen();
+        var runner = ServerRunner{ .server = &server };
+        const thread = try std.Thread.spawn(.{}, ServerRunner.run, .{&runner});
+        defer runner.stop(thread);
+        var client = try Client.init(testing.allocator, .{ .port = port, .psk = if (encrypted) credentials else null });
+        defer client.deinit();
+        if (encrypted) try client.handshake();
+        const allocator = client.allocator;
+        defer client.allocator = allocator;
+        client.allocator = testing.failing_allocator;
+        var small: ResponseStorage(3000) = .{};
+        for ([_]usize{ 0, 1800, 2999 }) |capacity| {
+            var buffers = small.buffers();
+            buffers.payload = buffers.payload[0..capacity];
+            const handle = try client.submit(buffers, .get, &.{}, &.{});
+            const failed = try awaitTestCompletion(&client);
+            try testing.expectEqual(handle, failed.handle);
+            try testing.expectError(error.ResponsePayloadTooSmall, failed.result);
+            try testing.expectEqual(@as(u16, 0), client.count_active);
+        }
+        var full: ResponseStorage(3000) = .{};
+        const result = try client.get(full.buffers(), "/large");
+        try testing.expectEqualSlices(u8, &bounded_test_body, result.payload);
+        try testing.expectEqual(@as(u32, 3000), result.packet.find_option(.size2).?.as_uint().?);
+        var upload_storage: ResponseStorage(3000) = .{};
+        const uploaded = try client.upload(upload_storage.buffers(), .put, &.{
+            .{ .kind = .uri_path, .value = "large" },
+            .{ .kind = .size1, .value = &.{ 8, 0 } },
+        }, &([_]u8{7} ** 2048));
+        try testing.expectEqualSlices(u8, &bounded_test_body, uploaded.payload);
+        // The second reassembly must not overwrite the first result or metadata.
+        try testing.expectEqualSlices(u8, &bounded_test_body, result.packet.payload);
+        try testing.expectEqual(@as(u32, 3000), result.packet.find_option(.size2).?.as_uint().?);
+    }
+}
+
+test "cancel, timeout, and serialization failure release caller buffer borrows" {
+    const port: u16 = 29734;
+    var server = try startTestServer(port, nullHandler);
+    defer server.deinit();
+    var client = try Client.init(testing.allocator, .{ .port = port, .max_in_flight = 1 });
+    defer client.deinit();
+    const allocator = client.allocator;
+    defer client.allocator = allocator;
+    client.allocator = testing.failing_allocator;
+    var storage: ResponseStorage(0) = .{};
+    const h = try client.submit(storage.buffers(), .get, &.{}, "cancel");
+    client.cancel(h);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    const again = try client.submit(storage.buffers(), .get, &.{}, "timeout");
+    client.slots[again].retransmit_count = constants.max_retransmit;
+    client.slots[again].next_retransmit_ns = nanoTimestamp() - 1;
+    const completion = (try client.poll(0)).?;
+    try testing.expectEqual(again, completion.handle);
+    try testing.expectError(error.Timeout, completion.result);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    try testing.expectError(error.BufferTooSmall, client.submit(storage.buffers(), .get, &.{}, &([_]u8{0} ** 2000)));
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    const valid = try client.submit(storage.buffers(), .get, &.{}, "reused");
+    client.cancel(valid);
+    var block_buf: [3]u8 = undefined;
+    const invalid = (coapz.BlockValue{ .num = 0, .more = false, .szx = 7 }).option(.block2, &block_buf);
+    try testing.expectError(error.InvalidBlock2, client.submit(storage.buffers(), .get, &.{invalid}, &.{}));
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+}
+
+fn injectTestBlock(client: *Client, handle: RequestHandle, num: u32, szx: u3, more: bool, bytes: []const u8, tag: []const u8, kind: coapz.MessageKind) !?Completion {
+    const slot = &client.slots[handle];
+    var block_buf: [3]u8 = undefined;
+    const block = (coapz.BlockValue{ .num = num, .szx = szx, .more = more }).option(.block2, &block_buf);
+    const packet: coapz.Packet = .{ .kind = kind, .code = .content, .msg_id = slot.msg_id, .token = slot.token[0..slot.token_len], .payload = bytes, .data_buf = &.{}, .options = &.{ .{ .kind = .etag, .value = tag }, block } };
+    var wire: [1280]u8 = undefined;
+    return client.processResponse(handle, try packet.writeBuf(&wire));
+}
+
+test "Block2 handles reduced SZX, duplicate separate blocks, and retained option values" {
+    const port: u16 = 29735;
+    var server = try startTestServer(port, nullHandler);
+    defer server.deinit();
+    var client = try Client.init(testing.allocator, .{ .port = port });
+    defer client.deinit();
+    const allocator = client.allocator;
+    defer client.allocator = allocator;
+    client.allocator = testing.failing_allocator;
+    var storage: ResponseStorage(55) = .{};
+    const h = try client.submit(storage.buffers(), .get, &.{
+        .{ .kind = .uri_path, .value = "a" },
+        .{ .kind = .uri_path, .value = "b" },
+        .{ .kind = .size1, .value = &.{55} },
+    }, &.{});
+    const token = client.slots[h].token;
+    try testing.expect((try injectTestBlock(&client, h, 0, 1, true, &([_]u8{1} ** 32), "tag", .acknowledgement)) == null);
+    try testing.expectEqualSlices(u8, token[0..client.config.token_len], client.slots[h].token[0..client.config.token_len]);
+    var decoded_options: [17]coapz.Option = undefined;
+    const pending = &client.slots[h];
+    const continuation = try packet_view.read(client.send_buf[pending.send_offset..][0..pending.send_len], &decoded_options);
+    try testing.expectEqualSlices(u8, "a", continuation.options[0].value);
+    try testing.expectEqualSlices(u8, "b", continuation.options[1].value);
+    try testing.expectEqual(.block2, continuation.options[2].kind);
+    try testing.expectEqual(.size1, continuation.options[3].kind);
+    // Retransmitted separate block: ACK it without duplicate assembly.
+    try testing.expect((try injectTestBlock(&client, h, 0, 1, true, &([_]u8{1} ** 32), "tag", .confirmable)) == null);
+    try testing.expectEqual(@as(usize, 32), client.slots[h].block2_length);
+    try testing.expect((try injectTestBlock(&client, h, 2, 0, true, &([_]u8{2} ** 16), "tag", .acknowledgement)) == null);
+    const completion = (try injectTestBlock(&client, h, 3, 0, false, "1234567", "tag", .acknowledgement)).?;
+    try testing.expectEqual(h, completion.handle);
+    const result = try completion.result;
+    try testing.expectEqualSlices(u8, &([_]u8{1} ** 32 ++ [_]u8{2} ** 16 ++ "1234567".*), result.payload);
+    const next = try client.submit(.{ .packet = &.{}, .options = &.{} }, .get, &.{}, &.{});
+    client.cancel(next);
+    try testing.expectEqualSlices(u8, "tag", result.packet.find_option(.etag).?.value);
+    try testing.expectEqualSlices(u8, result.payload, result.packet.payload);
+}
+
+test "Block2 ETag mismatch and invalid offsets complete with correlated errors" {
+    const port: u16 = 29736;
+    var server = try startTestServer(port, nullHandler);
+    defer server.deinit();
+    var client = try Client.init(testing.allocator, .{ .port = port });
+    defer client.deinit();
+    var storage: ResponseStorage(64) = .{};
+    const h = try client.submit(storage.buffers(), .get, &.{}, &.{});
+    try testing.expect((try injectTestBlock(&client, h, 0, 0, true, &([_]u8{1} ** 16), "a", .acknowledgement)) == null);
+    const mismatch = (try injectTestBlock(&client, h, 1, 0, false, "end", "b", .acknowledgement)).?;
+    try testing.expectEqual(h, mismatch.handle);
+    try testing.expectError(error.EtagMismatch, mismatch.result);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    const h2 = try client.submit(storage.buffers(), .get, &.{}, &.{});
+    const invalid = (try injectTestBlock(&client, h2, 1, 0, true, &([_]u8{1} ** 16), "a", .acknowledgement)).?;
+    try testing.expectEqual(h2, invalid.handle);
+    try testing.expectError(error.InvalidBlock2, invalid.result);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+    var block_buf: [3]u8 = undefined;
+    const last = (coapz.BlockValue{ .num = 0xfffff, .szx = 0, .more = false }).option(.block2, &block_buf);
+    const h3 = try client.submit(storage.buffers(), .get, &.{last}, &.{});
+    const exhausted = (try injectTestBlock(&client, h3, 0xfffff, 0, true, &([_]u8{1} ** 16), "a", .acknowledgement)).?;
+    try testing.expectEqual(h3, exhausted.handle);
+    try testing.expectError(error.InvalidBlock2, exhausted.result);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+}
+
+fn sendTestReply(server: *coap_server, client: *Client, kind: coapz.MessageKind, code: coapz.Code, mid: u16, token: []const u8, payload: []const u8) !void {
+    var address: posix.SocketAddress = undefined;
+    var len: linux.socklen_t = @sizeOf(posix.SocketAddress);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(client.fd, &address.any, &len)));
+    var wire: [1280]u8 = undefined;
+    const packet: coapz.Packet = .{ .kind = kind, .code = code, .msg_id = mid, .token = token, .options = &.{}, .payload = payload, .data_buf = &.{} };
+    _ = try posix.sendto(server.io.fd_socket.?, try packet.writeBuf(&wire), 0, try address.address());
+}
+
+test "poll matches empty ACK/RST by MID and bounds ACKed request lifetime" {
+    const port: u16 = 29737;
+    var server = try startTestServer(port, nullHandler);
+    defer server.deinit();
+    var client = try Client.init(testing.allocator, .{ .port = port });
+    defer client.deinit();
+    const allocator = client.allocator;
+    defer client.allocator = allocator;
+    client.allocator = testing.failing_allocator;
+    var storage: ResponseStorage(0) = .{};
+    const h = try client.submit(storage.buffers(), .get, &.{}, "ack");
+    const mid = client.slots[h].msg_id;
+    try sendTestReply(&server, &client, .acknowledgement, .empty, mid +% 1, &.{}, &.{});
+    try testing.expect((try client.poll(100)) == null);
+    try testing.expect(!client.slots[h].acknowledged);
+    try sendTestReply(&server, &client, .acknowledgement, .empty, mid, &.{}, &.{});
+    try testing.expect((try client.poll(100)) == null);
+    try testing.expect(client.slots[h].acknowledged);
+    const deadline = client.slots[h].next_retransmit_ns;
+    try sendTestReply(&server, &client, .acknowledgement, .empty, mid, &.{}, &.{});
+    try testing.expect((try client.poll(100)) == null);
+    try testing.expectEqual(deadline, client.slots[h].next_retransmit_ns);
+    client.slots[h].next_retransmit_ns = nanoTimestamp() - 1;
+    const timeout = (try client.poll(0)).?;
+    try testing.expectEqual(h, timeout.handle);
+    try testing.expectError(error.Timeout, timeout.result);
+    const h2 = try client.submit(storage.buffers(), .get, &.{}, "reset");
+    const mid2 = client.slots[h2].msg_id;
+    try sendTestReply(&server, &client, .reset, .empty, mid2 +% 1, &.{}, &.{});
+    try testing.expect((try client.poll(100)) == null);
+    try sendTestReply(&server, &client, .reset, .empty, mid2, &.{}, &.{});
+    const reset = (try client.poll(100)).?;
+    try testing.expectEqual(h2, reset.handle);
+    try testing.expectError(error.Reset, reset.result);
+    const h3 = try client.submit(storage.buffers(), .get, &.{}, "separate");
+    const slot = &client.slots[h3];
+    try sendTestReply(&server, &client, .acknowledgement, .empty, slot.msg_id, &.{}, &.{});
+    try testing.expect((try client.poll(100)) == null);
+    try sendTestReply(&server, &client, .confirmable, .content, slot.msg_id +% 1, slot.token[0..slot.token_len], "separate");
+    const completion = (try client.poll(100)).?;
+    try testing.expectEqual(h3, completion.handle);
+    try testing.expectEqualSlices(u8, "separate", (try completion.result).payload);
+    try testing.expectEqual(@as(u16, 0), client.count_active);
+}
+
+test "caller-owned response remains valid after client destruction" {
+    const port: u16 = 29738;
+    var server = try startTestServer(port, nullHandler);
+    defer server.deinit();
+    var client = try Client.init(testing.allocator, .{ .port = port });
+    var alive = true;
+    defer if (alive) client.deinit();
+    var storage: ResponseStorage(0) = .{};
+    const h = try client.submit(storage.buffers(), .get, &.{}, &.{});
+    const completion = (try injectTestBlock(&client, h, 0, 0, false, "owned-by-caller", "tag", .acknowledgement)).?;
+    const result = try completion.result;
+    client.deinit();
+    alive = false;
+    try testing.expectEqualSlices(u8, "owned-by-caller", result.payload);
+    try testing.expectEqualSlices(u8, "tag", result.packet.find_option(.etag).?.value);
+    try testing.expectEqual(@as(usize, 2), result.packet.token.len);
+}
+
 test "init and deinit" {
     var client = try Client.init(testing.allocator, .{
         .port = 15683,
@@ -2023,13 +2053,8 @@ test "call CON round-trip" {
     });
     defer client.deinit();
 
-    const result = try client.call(
-        testing.allocator,
-        .get,
-        &.{},
-        "hello-con",
-    );
-    defer result.deinit(testing.allocator);
+    var storage: ResponseStorage(0) = .{};
+    const result = try client.call(storage.buffers(), .get, &.{}, "hello-con");
 
     try testing.expectEqual(.content, result.code);
     try testing.expectEqualSlices(u8, "hello-con", result.payload);
@@ -2081,8 +2106,8 @@ test "get convenience calls call with path options" {
     });
     defer client.deinit();
 
-    const result = try client.get(testing.allocator, "/hello");
-    defer result.deinit(testing.allocator);
+    var storage: ResponseStorage(0) = .{};
+    const result = try client.get(storage.buffers(), "/hello");
     try testing.expectEqual(coapz.Code.content, result.code);
 }
 
@@ -2097,8 +2122,9 @@ test "submit returns handle without blocking" {
     });
     defer client.deinit();
 
+    var storage: ResponseStorage(0) = .{};
     const start = nanoTimestamp();
-    const handle = try client.submit(.get, &.{}, "hello");
+    const handle = try client.submit(storage.buffers(), .get, &.{}, "hello");
     const elapsed_us = @divTrunc(nanoTimestamp() - start, std.time.ns_per_us);
 
     try testing.expect(elapsed_us < 5000);
@@ -2120,20 +2146,20 @@ test "submit and poll round-trip" {
     });
     defer client.deinit();
 
-    const h = try client.submit(.get, &.{}, "async-hello");
+    var storage: ResponseStorage(0) = .{};
+    const h = try client.submit(storage.buffers(), .get, &.{}, "async-hello");
 
     var completion: ?Completion = null;
     for (0..100) |_| {
-        completion = try client.poll(testing.allocator, 50);
+        completion = try client.poll(50);
         if (completion != null) break;
     }
 
     const c = completion orelse return error.NoCompletion;
-    defer c.result.deinit(testing.allocator);
-
+    const result = try c.result;
     try testing.expectEqual(h, c.handle);
-    try testing.expectEqual(.content, c.result.code);
-    try testing.expectEqualSlices(u8, "async-hello", c.result.payload);
+    try testing.expectEqual(.content, result.code);
+    try testing.expectEqualSlices(u8, "async-hello", result.payload);
 }
 
 test "multiple concurrent submits" {
@@ -2151,20 +2177,19 @@ test "multiple concurrent submits" {
     });
     defer client.deinit();
 
+    var storage: [4]ResponseStorage(0) = .{ .{}, .{}, .{}, .{} };
     // Confirm peer first (NSTART enforcement).
-    const warmup = try client.call(testing.allocator, .get, &.{}, "warmup");
-    warmup.deinit(testing.allocator);
-
-    _ = try client.submit(.get, &.{}, "req-0");
-    _ = try client.submit(.get, &.{}, "req-1");
-    _ = try client.submit(.get, &.{}, "req-2");
-    _ = try client.submit(.get, &.{}, "req-3");
+    _ = try client.call(storage[0].buffers(), .get, &.{}, "warmup");
+    _ = try client.submit(storage[0].buffers(), .get, &.{}, "req-0");
+    _ = try client.submit(storage[1].buffers(), .get, &.{}, "req-1");
+    _ = try client.submit(storage[2].buffers(), .get, &.{}, "req-2");
+    _ = try client.submit(storage[3].buffers(), .get, &.{}, "req-3");
 
     var completed: u8 = 0;
     for (0..200) |_| {
-        const c = try client.poll(testing.allocator, 50) orelse continue;
-        defer c.result.deinit(testing.allocator);
-        try testing.expectEqual(.content, c.result.code);
+        const c = try client.poll(50) orelse continue;
+        const result = try c.result;
+        try testing.expectEqual(.content, result.code);
         completed += 1;
         if (completed == 4) break;
     }
@@ -2182,13 +2207,14 @@ test "NSTART: second submit rejected before first response" {
     });
     defer client.deinit();
 
+    var storage: [2]ResponseStorage(0) = .{ .{}, .{} };
     // First submit should succeed (count_active=0 < nstart=1).
-    _ = try client.submit(.get, &.{}, "first");
+    _ = try client.submit(storage[0].buffers(), .get, &.{}, "first");
 
     // Second submit should fail — peer not confirmed, count_active=1 >= nstart.
     try testing.expectError(
         error.NstartExceeded,
-        client.submit(.get, &.{}, "second"),
+        client.submit(storage[1].buffers(), .get, &.{}, "second"),
     );
 }
 
@@ -2207,14 +2233,15 @@ test "NSTART: submit allowed after peer confirmed via poll" {
     });
     defer client.deinit();
 
+    var storage: [2]ResponseStorage(0) = .{ .{}, .{} };
     // First submit — should work.
-    _ = try client.submit(.get, &.{}, "first");
+    _ = try client.submit(storage[0].buffers(), .get, &.{}, "first");
 
     // Poll until first response arrives — confirms peer.
     var confirmed = false;
     for (0..100) |_| {
-        const c = try client.poll(testing.allocator, 50) orelse continue;
-        c.result.deinit(testing.allocator);
+        const c = try client.poll(50) orelse continue;
+        _ = try c.result;
         confirmed = true;
         break;
     }
@@ -2222,8 +2249,8 @@ test "NSTART: submit allowed after peer confirmed via poll" {
     try testing.expect(client.peer_confirmed);
 
     // Now submit should succeed — peer is confirmed.
-    _ = try client.submit(.get, &.{}, "second");
-    _ = try client.submit(.get, &.{}, "third");
+    _ = try client.submit(storage[0].buffers(), .get, &.{}, "second");
+    _ = try client.submit(storage[1].buffers(), .get, &.{}, "third");
 }
 
 test "NSTART: call confirms peer, subsequent submits work" {
@@ -2244,15 +2271,15 @@ test "NSTART: call confirms peer, subsequent submits work" {
     try testing.expect(!client.peer_confirmed);
 
     // call() does submit+poll internally — should confirm peer.
-    const result = try client.call(testing.allocator, .get, &.{}, "hello");
-    defer result.deinit(testing.allocator);
+    var storage: [4]ResponseStorage(0) = .{ .{}, .{}, .{}, .{} };
+    _ = try client.call(storage[0].buffers(), .get, &.{}, "hello");
 
     try testing.expect(client.peer_confirmed);
 
     // Multiple concurrent submits now work.
-    _ = try client.submit(.get, &.{}, "a");
-    _ = try client.submit(.get, &.{}, "b");
-    _ = try client.submit(.get, &.{}, "c");
+    _ = try client.submit(storage[1].buffers(), .get, &.{}, "a");
+    _ = try client.submit(storage[2].buffers(), .get, &.{}, "b");
+    _ = try client.submit(storage[3].buffers(), .get, &.{}, "c");
 }
 
 test "checkBlock2Etag captures and compares" {
@@ -2267,7 +2294,7 @@ test "checkBlock2Etag captures and compares" {
         .send_offset = 0,
         .send_len = 0,
         .next_free = 0xFFFF,
-        .block2_payload = .empty,
+        .block2_length = 0,
         .doing_block2 = false,
         .block2_etag = undefined,
         .block2_etag_len = 0,

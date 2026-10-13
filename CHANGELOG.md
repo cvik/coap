@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- Breaking: CON response APIs take caller-owned buffers; remove result allocation/deinit and sentinel flags
+- Bound Block2 reassembly; correlate capacity failures and support local request cancellation
+- Preserve Block2 tokens/handles, sort continuation options, and handle empty ACK/RST and separate replies
+- Synchronize DTLS benchmark workers and report common-wall successful-response throughput; add allocator selection
 - Require Zig 0.16.0; replace public peer addresses with `std.Io.net.IpAddress`
 - Retain the Linux io_uring backend with native-address conversion at syscall boundaries
 - Use monotonic clocks for protocol deadlines and timing

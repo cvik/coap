@@ -1,0 +1,24 @@
+{
+  "build_mode": "ReleaseFast",
+  "client_allocator": "DebugAllocator",
+  "transport": "DTLS CON",
+  "count": 30000,
+  "warmup": 1000,
+  "payload": 100,
+  "workers": 1,
+  "window": 32,
+  "scope": "strace -f totals including embedded server, initialization, warmup, measurement, and teardown; traced rates excluded from timing results",
+  "baseline": {
+    "library_commit": "51d6d76dcfc1be0c345602f4eef95991065c8730",
+    "binary_sha256": "210f1807d39dc1912292355924c3f4c07e999126af184013642a87ca4a0cff77",
+    "mmap": 30752,
+    "munmap": 60712,
+    "command": "strace -f -c -e trace=mmap,munmap /tmp/coap-con-buffers-control --dtls-only --con-only --single-only --threads 4 --window 32 --payload-only 100 --count 30000 --warmup 1000 --allocator debug --port 29685"
+  },
+  "candidate": {
+    "binary_sha256": "339966f4269d35cb1a46802d6d4fb7681f43d152154c82b1edf184493ea68d6e",
+    "mmap": 327,
+    "munmap": 306,
+    "command": "strace -f -c -e trace=mmap,munmap /tmp/coap-con-buffers-candidate --dtls-only --con-only --single-only --threads 4 --window 32 --payload-only 100 --count 30000 --warmup 1000 --allocator debug --port 29685"
+  }
+}
