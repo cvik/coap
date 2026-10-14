@@ -66,6 +66,19 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmark client");
     bench_step.dependOn(&run_bench.step);
 
+    // Standalone configurable benchmark server (build only, not run).
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("bench/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_mod.addImport("coap", lib_mod);
+    server_mod.addImport("coapz", coapz_dep.module("coapz"));
+    const server_exe = b.addExecutable(.{ .name = "bench-server", .root_module = server_mod });
+    const install_server = b.addInstallArtifact(server_exe, .{});
+    b.getInstallStep().dependOn(&install_server.step);
+    b.step("bench-server", "Build the standalone benchmark server").dependOn(&install_server.step);
+
     // Tests
     const lib_tests = b.addTest(.{
         .root_module = lib_mod,
@@ -73,6 +86,16 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
+    const bench_test_mod = b.createModule(.{
+        .root_source_file = b.path("bench/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_test_mod.addImport("coap", lib_mod);
+    bench_test_mod.addImport("coapz", coapz_dep.module("coapz"));
+    const bench_tests = b.addTest(.{ .root_module = bench_test_mod });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    test_step.dependOn(&run_bench_tests.step);
 
     // Documentation
     const docs = lib.getEmittedDocs();
