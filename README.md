@@ -922,8 +922,8 @@ Log messages:
 ## Benchmarks
 
 The included bench suite runs a matrix of scenarios grouped by transport
-(Plain/DTLS) × type (NON/CON) × threads × payload size. NON throughput
-is measured server-side via shared-memory counters; CON measures echo
+(Plain/DTLS) × type (NON/CON) × threads × payload size. Embedded NON throughput
+uses shared-memory counters; remote NON uses unique receipt accounting. CON measures echo
 round-trip latency. Results vary by hardware — run on your own system:
 
 ```bash
@@ -939,6 +939,19 @@ server-side counters. `--allocator debug|smp` selects the client allocator
 workers synchronize after handshake/warmup and use one common wall interval
 for successful CON response throughput. See [bounded response storage and
 matched benchmarks](docs/CON_BUFFERS.md) and [the Zig 0.16 migration measurements](docs/ZIG_016_PERFORMANCE.md).
+
+For two-machine testing, build the dedicated configurable server:
+
+```sh
+zig build bench-server -Doptimize=ReleaseFast
+./zig-out/bin/bench-server --bind <server-wireguard-ip> --threads 8 --allocator smp
+```
+
+Connect with `--no-server --host <server-wireguard-ip>`. `--window` and
+`--multi-window` configure per-client CON concurrency. The server supports bounded
+NON receipt accounting, DTLS credential files, capacity/rate/affinity controls,
+and one measurement lease at a time. Plain controls require a trusted network.
+See [remote benchmark setup and accounting](docs/REMOTE_BENCHMARKS.md).
 
 ## Requirements
 

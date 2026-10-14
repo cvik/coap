@@ -16,7 +16,7 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Build examples and benchmark
+      - name: Build examples and benchmark tools
         run: zig build
 
       - name: Run tests
@@ -24,3 +24,8 @@ jobs:
 
       - name: Build optimized artifacts
         run: zig build -Doptimize=ReleaseFast
+
+      - name: Remote benchmark integration
+        run: |
+          sudo prlimit --pid $$ --memlock=8388608:8388608
+          python3 bench/remote-smoke.py
