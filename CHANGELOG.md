@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- Use cooperative io_uring task work, a single pending tick timer and a registered socket
+- Return receive buffers through a shared descriptor ring; account its locked-memory overhead
+- Index completed CON exchanges by address hash without changing eviction/cache policy
 - Add configurable standalone `bench-server` build target and trusted-network remote benchmark protocol
 - Account unique remote NON receipts/loss, isolate run leases, and load DTLS PSKs from bounded files
 - Add per-client multi-thread CON windows; fix plain benchmark MID-wrap/duplicate accounting and startup errors
