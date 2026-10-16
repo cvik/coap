@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Pin coapz v0.4.0 with frontend-inline option decoding and public Observe values
 - Use cooperative io_uring task work, a single pending tick timer and a registered socket
 - Return receive buffers through a shared descriptor ring; account its locked-memory overhead
 - Index completed CON exchanges by address hash without changing eviction/cache policy

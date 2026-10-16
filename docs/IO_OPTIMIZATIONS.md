@@ -1,7 +1,8 @@
 # Server I/O optimizations
 
 This change ports the measured five-part native io_uring prototype without
-changing the coapz dependency, CoAP response-cache policy, or public server API.
+changing CoAP response-cache policy or the public server API. A follow-up commit
+pins the independently released coapz v0.4.0 parser optimization.
 
 - `COOP_TASKRUN` reduces cross-CPU task-work notifications. No `SINGLE_ISSUER`,
   `DEFER_TASKRUN`, or SQPOLL restriction is introduced; existing thread-handoff
@@ -50,6 +51,7 @@ integration covers IPv4/IPv6, native UDP/DTLS, two server workers and client win
 Linux 6.0+ is required by the existing multishot recvmsg path. Shared descriptor
 rings and COOP are supported within that floor. Older kernels, overload/lifecycle
 patterns and different CPUs still warrant workload-specific validation. No empty
-submission skipping or CQE-clearing removal is included. The independently
-proposed coapz inline-helper fix needs a normal release before changing the pin;
-its parser/end-to-end gains are not attributed to this I/O PR.
+submission skipping or CQE-clearing removal is included. The I/O measurements
+above used the original coapz v0.3.0 dependency. The subsequent v0.4.0 pin also
+includes its independently released inline-helper fix; parser/end-to-end gains
+are not attributed to the five I/O changes.
