@@ -674,7 +674,13 @@ processed, but during bursts the pool must absorb all arrivals between
 processing cycles. Set this to at least 2x your expected concurrent clients'
 send window. Default: `512`.
 
-Higher values require more kernel memory per io_uring instance.
+Higher values require more kernel memory per io_uring instance. Buffers are
+returned through a shared provided-buffer ring, without a return-buffer SQE/CQE.
+The payload pool is not pinned; the descriptor ring adds page-rounded locked
+memory, included in the automatic memlock budget estimate.
+
+See [server I/O implementation notes](docs/IO_OPTIMIZATIONS.md) for ownership,
+locked-memory costs and performance limitations.
 
 ### `buffer_size`
 
@@ -955,7 +961,7 @@ See [remote benchmark setup and accounting](docs/REMOTE_BENCHMARKS.md).
 
 ## Requirements
 
-- Linux (io_uring support, kernel 5.13+ for multishot recvmsg)
+- Linux kernel 6.0+ (multishot recvmsg; shared provided-buffer rings and cooperative task running)
 - Zig 0.16.0 (the currently supported toolchain)
 
 ### Migrating from Zig 0.15

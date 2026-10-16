@@ -161,6 +161,7 @@ buffers_outstanding: u16,
 buffers_peak: u16,
 rate_limiter: ?RateLimiter,
 tick_now_ns: i64,
+tick_timeout_pending: bool = false,
 
 /// Pre-allocated RST buffers for rate-limited/shed CON packets.
 rate_limit_rst: []u8,
@@ -216,8 +217,9 @@ pub fn initContext(
 }
 
 /// Clamp buffer_count so that all io_uring instances fit within
-/// RLIMIT_MEMLOCK. Only the ring structures are locked (provided buffers
-/// are not pinned). Each ring locks approximately:
+/// RLIMIT_MEMLOCK. The payload pool is not pinned. Ring structures and
+/// the page-rounded provided-buffer descriptor ring are accounted for.
+/// Each io_uring locks approximately:
 ///   SQ: ring_entries × 64 bytes (io_uring_sqe)
 ///   CQ: ring_entries × 2 × 16 bytes (io_uring_cqe)
 ///   ring_entries = next_pow2(buffer_count × 4)
@@ -235,7 +237,13 @@ fn clampBufferCount(requested: u16, thread_count: u16) u16 {
     while (candidate > 4) {
         const ring_entries = std.math.ceilPowerOfTwo(u32, @as(u32, candidate) *| 4) catch break;
         // SQE: 64 bytes each, CQE: 16 bytes each (2× ring_entries).
-        const locked: u64 = @as(u64, ring_entries) * 96;
+        const buffer_entries = std.math.ceilPowerOfTwo(u32, candidate) catch break;
+        const descriptor_bytes = std.mem.alignForward(
+            u64,
+            @as(u64, buffer_entries) * @sizeOf(linux.io_uring_buf),
+            std.heap.pageSize(),
+        );
+        const locked: u64 = @as(u64, ring_entries) * 96 + descriptor_bytes;
         if (locked <= per_thread) break;
         candidate /= 2;
     }
@@ -712,8 +720,11 @@ pub fn tick(server: *Server) !void {
     // Submit a timeout so wait_cqes unblocks periodically, allowing
     // the run loop to check the shutdown flag even when idle.
     const tick_ts = linux.kernel_timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-    server.io.queue_timeout(&tick_ts) catch {};
-    _ = server.io.submit() catch {};
+    if (!server.tick_timeout_pending) {
+        try server.io.queue_timeout(&tick_ts);
+        server.tick_timeout_pending = true;
+    }
+    _ = try server.io.submit();
 
     const count = try server.io.wait_cqes(cqes[0..], 1);
     var recv_failed = false;
@@ -721,7 +732,10 @@ pub fn tick(server: *Server) !void {
     var processed: u32 = 0;
 
     for (cqes[0..count], 0..) |cqe, index| {
-        if (Io.is_timeout(&cqe)) continue;
+        if (Io.is_timeout(&cqe)) {
+            server.tick_timeout_pending = false;
+            continue;
+        }
         if (Io.is_recv(&cqe) and !Io.is_success(&cqe)) {
             recv_failed = true;
             recv_fail_count += 1;
@@ -2633,6 +2647,112 @@ test "init and deinit with null handler" {
         .buffer_size = 256,
     }, null_handler);
     server.deinit();
+}
+
+test "registered socket remains usable after original descriptor closes" {
+    var server = try Server.init(testing.allocator, .{
+        .port = 19794,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+    posix.close(server.io.fd_socket.?);
+    defer server.io.fd_socket = null; // Avoid closing a reused numeric fd.
+    const fd = try test_client(19794);
+    defer posix.close(fd);
+    const packet = coapz.Packet{
+        .kind = .confirmable,
+        .code = .get,
+        .msg_id = 0x4242,
+        .token = &.{ 1, 2 },
+        .options = &.{},
+        .payload = "registered",
+        .data_buf = &.{},
+    };
+    const wire = try packet.write(testing.allocator);
+    defer testing.allocator.free(wire);
+    const raw = try send_tick_recv(&server, fd, wire);
+    defer testing.allocator.free(raw);
+    const response = try coapz.Packet.read(testing.allocator, raw);
+    defer response.deinit(testing.allocator);
+    try testing.expectEqual(.acknowledgement, response.kind);
+    try testing.expectEqual(.content, response.code);
+    try testing.expectEqual(packet.msg_id, response.msg_id);
+    try testing.expectEqualSlices(u8, packet.token, response.token);
+    try testing.expectEqualStrings("registered", response.payload);
+}
+
+test "provided ring holds buffers, exhausts, and resumes after release" {
+    var server = try Server.init(testing.allocator, .{
+        .port = 19793,
+        .buffer_count = 4,
+        .buffer_size = 256,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+    const fd = try test_client(19793);
+    defer posix.close(fd);
+    const messages = [_][]const u8{ "one", "two", "three", "four", "five" };
+    for (messages) |message| _ = try posix.send(fd, message, 0);
+    var ids: [4]u16 = undefined;
+    var held: usize = 0;
+    var exhausted = false;
+    while (!exhausted) {
+        var cqes: [8]Cqe = undefined;
+        const count = try server.io.wait_cqes(&cqes, 1);
+        for (cqes[0..count]) |cqe| {
+            if (!Io.is_recv(&cqe)) continue;
+            if (cqe.err() == .NOBUFS) {
+                exhausted = true;
+                continue;
+            }
+            try testing.expect(Io.is_success(&cqe));
+            try testing.expect(held < ids.len);
+            const recv = try server.io.decode_recv(&cqe);
+            try testing.expectEqualStrings(messages[held], recv.payload);
+            ids[held] = recv.buffer_id;
+            held += 1;
+        }
+    }
+    try testing.expectEqual(ids.len, held);
+    for (ids, 0..) |id, i| {
+        for (ids[0..i]) |previous| try testing.expect(id != previous);
+    }
+    const sq_tail = server.io.ring.sq.sqe_tail;
+    for (ids) |id| try server.io.release_buffer(id);
+    try testing.expectEqual(sq_tail, server.io.ring.sq.sqe_tail);
+    try server.io.recv_multishot(&server.msg_recv);
+    _ = try server.io.submit();
+    var cqes: [8]Cqe = undefined;
+    const count = try server.io.wait_cqes(&cqes, 1);
+    var resumed = false;
+    for (cqes[0..count]) |cqe| {
+        if (!Io.is_recv(&cqe)) continue;
+        try testing.expect(Io.is_success(&cqe));
+        const recv = try server.io.decode_recv(&cqe);
+        try testing.expectEqualStrings("five", recv.payload);
+        try server.io.release_buffer(recv.buffer_id);
+        resumed = true;
+    }
+    try testing.expect(resumed);
+}
+
+test "single pending tick timer repeatedly wakes an idle server" {
+    var server = try Server.init(testing.allocator, .{
+        .port = 19791,
+        .buffer_count = 8,
+        .buffer_size = 1280,
+    }, echo_handler);
+    defer server.deinit();
+    try setup_for_test(&server);
+    const start = platform.nanoTimestamp();
+    try server.tick();
+    try testing.expect(!server.tick_timeout_pending);
+    try server.tick();
+    try testing.expect(!server.tick_timeout_pending);
+    const elapsed = platform.nanoTimestamp() - start;
+    try testing.expect(elapsed >= 80 * std.time.ns_per_ms);
 }
 
 test "round-trip: NON echo via UDP" {

@@ -33,6 +33,8 @@ pub const Slot = struct {
     completed_at_ns: i64,
     /// Index of next free slot (when state == .free).
     next_free: u16,
+    peer_prev: u16,
+    peer_next: u16,
 };
 
 slots: []Slot,
@@ -44,6 +46,8 @@ response_buffer: []u8,
 /// 0xFFFF = empty sentinel.
 table: []u16,
 table_mask: u16,
+/// Address-hash bucket heads; slots form intrusive doubly linked lists.
+peer_heads: []u16,
 /// Head of intrusive free list through slots.
 free_head: u16,
 /// Count of active (non-free) exchanges.
@@ -75,6 +79,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Exchange {
 
     const table = try allocator.alloc(u16, table_size);
     errdefer allocator.free(table);
+    const peer_heads = try allocator.alloc(u16, table_size);
+    errdefer allocator.free(peer_heads);
+    @memset(peer_heads, empty_sentinel);
 
     // Initialize free list and table.
     for (slots, 0..) |*slot, i| {
@@ -85,6 +92,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Exchange {
             .message_id = 0,
             .response_length = 0,
             .completed_at_ns = 0,
+            .peer_prev = empty_sentinel,
+            .peer_next = empty_sentinel,
             .next_free = if (i + 1 < config.exchange_count)
                 @intCast(i + 1)
             else
@@ -99,6 +108,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Exchange {
         .response_buffer = response_buffer,
         .table = table,
         .table_mask = table_size - 1,
+        .peer_heads = peer_heads,
         .free_head = 0,
         .count_active = 0,
         .config = config,
@@ -109,6 +119,7 @@ pub fn deinit(exchange: *Exchange, allocator: std.mem.Allocator) void {
     allocator.free(exchange.slots);
     allocator.free(exchange.response_buffer);
     allocator.free(exchange.table);
+    allocator.free(exchange.peer_heads);
 }
 
 /// Hash peer address only (no message ID) for peer-based eviction.
@@ -191,7 +202,14 @@ pub fn insert(
         .response_length = @intCast(response_data.len),
         .completed_at_ns = now_ns,
         .next_free = empty_sentinel,
+        .peer_prev = empty_sentinel,
+        .peer_next = empty_sentinel,
     };
+    const bucket = exchange.peerBucket(addr_key);
+    const head = exchange.peer_heads[bucket];
+    slot.peer_next = head;
+    if (head != empty_sentinel) exchange.slots[head].peer_prev = slot_idx;
+    exchange.peer_heads[bucket] = slot_idx;
 
     // Cache the response.
     const offset = @as(usize, slot_idx) * exchange.config.response_size_max;
@@ -221,17 +239,24 @@ pub fn cachedResponse(exchange: *const Exchange, slot_idx: u16) []const u8 {
 }
 
 /// Evict all completed exchanges for a given peer address.
-/// Called when a new (non-duplicate) request arrives from a peer,
-/// proving the peer received all prior responses.
+/// Called by the existing server policy on a new non-duplicate request.
+/// This does not prove reception of every older response.
 pub fn evictPeer(exchange: *Exchange, ak: u32) u16 {
     var evicted: u16 = 0;
-    for (exchange.slots, 0..) |*slot, i| {
-        if (slot.state != .completed) continue;
-        if (slot.addr_key != ak) continue;
-        exchange.remove(@intCast(i));
-        evicted += 1;
+    var idx = exchange.peer_heads[exchange.peerBucket(ak)];
+    while (idx != empty_sentinel) {
+        const next = exchange.slots[idx].peer_next;
+        if (exchange.slots[idx].addr_key == ak) {
+            exchange.remove(idx);
+            evicted += 1;
+        }
+        idx = next;
     }
     return evicted;
+}
+
+fn peerBucket(exchange: *const Exchange, ak: u32) u16 {
+    return @as(u16, @truncate(ak)) & exchange.table_mask;
 }
 
 /// Evict exchanges that have expired past the exchange lifetime.
@@ -261,6 +286,16 @@ pub fn remove(exchange: *Exchange, slot_idx: u16) void {
 
     // Remove from hash table.
     exchange.removeFromTable(slot.peerKey);
+    if (slot.peer_prev == empty_sentinel) {
+        exchange.peer_heads[exchange.peerBucket(slot.addr_key)] = slot.peer_next;
+    } else {
+        exchange.slots[slot.peer_prev].peer_next = slot.peer_next;
+    }
+    if (slot.peer_next != empty_sentinel) {
+        exchange.slots[slot.peer_next].peer_prev = slot.peer_prev;
+    }
+    slot.peer_prev = empty_sentinel;
+    slot.peer_next = empty_sentinel;
 
     // Return to free list.
     slot.state = .free;
@@ -321,6 +356,151 @@ fn wrappingDistance(from: u16, to: u16, mask: u16) u16 {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+fn checkPeerIndex(pool: *const Exchange) !void {
+    var linked: [32]bool = @splat(false);
+    var free: [32]bool = @splat(false);
+    try testing.expect(pool.slots.len <= linked.len);
+    var members: usize = 0;
+    for (pool.peer_heads, 0..) |head, bucket| {
+        var current = head;
+        var previous = empty_sentinel;
+        while (current != empty_sentinel) {
+            try testing.expect(current < pool.slots.len);
+            try testing.expect(!linked[current]);
+            linked[current] = true;
+            const slot = pool.slots[current];
+            try testing.expectEqual(State.completed, slot.state);
+            try testing.expectEqual(previous, slot.peer_prev);
+            try testing.expectEqual(bucket, @as(usize, pool.peerBucket(slot.addr_key)));
+            try testing.expectEqual(current, pool.find(slot.peerKey).?);
+            previous = current;
+            current = slot.peer_next;
+            members += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, pool.count_active), members);
+    var current = pool.free_head;
+    var free_count: usize = 0;
+    while (current != empty_sentinel) {
+        try testing.expect(current < pool.slots.len);
+        try testing.expect(!free[current]);
+        free[current] = true;
+        try testing.expectEqual(State.free, pool.slots[current].state);
+        current = pool.slots[current].next_free;
+        free_count += 1;
+    }
+    try testing.expectEqual(pool.slots.len, members + free_count);
+    for (pool.slots, 0..) |slot, i| {
+        try testing.expectEqual(slot.state == .completed, linked[i]);
+        try testing.expectEqual(slot.state == .free, free[i]);
+    }
+}
+
+fn checkIndexAllocation(allocator: std.mem.Allocator) !void {
+    var pool = try Exchange.init(allocator, .{ .exchange_count = 8, .response_size_max = 16 });
+    defer pool.deinit(allocator);
+}
+
+test "peer index allocation failures are leak free" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkIndexAllocation, .{});
+}
+
+test "peer index handles bucket collisions, middle removal, expiry and reuse" {
+    var pool = try Exchange.init(testing.allocator, .{ .exchange_count = 8, .response_size_max = 16 });
+    defer pool.deinit(testing.allocator);
+    // Same bucket, different address hashes; key table also wraps/probes.
+    const first = pool.insert(15, 1, 1, "first", 0).?;
+    const middle = pool.insert(31, 17, 2, "middle", 20 * std.time.ns_per_ms).?;
+    _ = pool.insert(47, 1, 3, "last", 20 * std.time.ns_per_ms).?;
+    try checkPeerIndex(&pool);
+    pool.remove(middle);
+    pool.remove(middle); // Already-free removal must not corrupt links.
+    try checkPeerIndex(&pool);
+    _ = pool.insert(63, 33, 4, "reuse", 20 * std.time.ns_per_ms).?;
+    try testing.expectEqual(@as(u16, 1), pool.evictExpired(31 * std.time.ns_per_ms, 30));
+    try testing.expect(pool.find(15) == null);
+    try testing.expectEqual(State.free, pool.slots[first].state);
+    try checkPeerIndex(&pool);
+    try testing.expectEqual(@as(u16, 1), pool.evictPeer(1));
+    try testing.expect(pool.find(63) != null);
+    try testing.expectEqualStrings("reuse", pool.cachedResponse(pool.find(63).?));
+    try testing.expectEqual(@as(u16, 0), pool.evictPeer(17));
+    try testing.expectEqual(@as(u16, 1), pool.evictPeer(33));
+    try checkPeerIndex(&pool);
+}
+
+test "peer index retains address hash grouping and rejected insert semantics" {
+    var pool = try Exchange.init(testing.allocator, .{ .exchange_count = 2, .response_size_max = 4 });
+    defer pool.deinit(testing.allocator);
+    _ = pool.insert(1, 0, 1, "one", 0).?;
+    try testing.expect(pool.insert(1, 99, 1, "dup", 1) == null);
+    try testing.expect(pool.insert(2, 7, 2, "large", 1) == null);
+    _ = pool.insert(2, 0, 2, "two", 1).?;
+    try testing.expect(pool.insert(3, 7, 3, "full", 2) == null);
+    try checkPeerIndex(&pool);
+    // Identical addr_key still evicts both, regardless of actual address.
+    try testing.expectEqual(@as(u16, 2), pool.evictPeer(0));
+    try checkPeerIndex(&pool);
+    _ = pool.insert(3, std.math.maxInt(u32), 3, "new", 3).?;
+    try testing.expectEqual(@as(u16, 1), pool.evictPeer(std.math.maxInt(u32)));
+    try checkPeerIndex(&pool);
+}
+
+test "peer index randomized churn matches a scan model" {
+    var pool = try Exchange.init(testing.allocator, .{ .exchange_count = 32, .response_size_max = 16 });
+    defer pool.deinit(testing.allocator);
+    const Entry = struct { active: bool = false, addr: u32 = 0, time: i64 = 0 };
+    var model: [64]Entry = @splat(.{});
+    var seed: u64 = 0x8db39427a21;
+    var now: i64 = 0;
+    for (0..5000) |_| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const id: usize = @intCast((seed >> 16) % model.len);
+        const key: u64 = 0x100000000 + id;
+        const addr: u32 = @intCast((id % 8) * pool.peer_heads.len + id % 2);
+        now += std.time.ns_per_ms;
+        switch ((seed >> 32) % 6) {
+            0, 1, 2 => {
+                const capacity = pool.count_active < pool.config.exchange_count;
+                const inserted = pool.insert(key, addr, @intCast(id), "cache", now);
+                try testing.expectEqual(!model[id].active and capacity, inserted != null);
+                if (inserted != null) model[id] = .{ .active = true, .addr = addr, .time = now };
+            },
+            3 => {
+                if (pool.find(key)) |slot| pool.remove(slot);
+                model[id].active = false;
+            },
+            4 => {
+                var expected: u16 = 0;
+                for (&model) |*entry| {
+                    if (entry.active and entry.addr == addr) {
+                        entry.active = false;
+                        expected += 1;
+                    }
+                }
+                try testing.expectEqual(expected, pool.evictPeer(addr));
+            },
+            5 => {
+                var expected: u16 = 0;
+                for (&model) |*entry| {
+                    if (entry.active and now - entry.time >= 10 * std.time.ns_per_ms) {
+                        entry.active = false;
+                        expected += 1;
+                    }
+                }
+                try testing.expectEqual(expected, pool.evictExpired(now, 10));
+            },
+            else => unreachable,
+        }
+        try checkPeerIndex(&pool);
+        for (model, 0..) |entry, i| {
+            const found = pool.find(0x100000000 + i);
+            try testing.expectEqual(entry.active, found != null);
+            if (found) |slot| try testing.expectEqualStrings("cache", pool.cachedResponse(slot));
+        }
+    }
+}
 
 test "init and deinit" {
     var pool = try Exchange.init(testing.allocator, .{

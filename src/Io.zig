@@ -30,6 +30,8 @@ iovecs: []posix.iovec,
 buffer_count: u16,
 buffer_size: u32,
 fd_socket: ?posix.socket_t,
+buffer_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
+buffer_ring_entries: u16,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -38,12 +40,10 @@ pub fn init(
 ) !Io {
     if (buffer_count == 0 or buffer_size == 0) return error.InvalidConfig;
 
-    // Ring must accommodate send + release_buffer per recv, plus overhead.
-    // Each received packet may generate up to 3 SQEs: release_buffer,
-    // send_msg response, and periodic provide_buffers. The 4x multiplier
-    // covers this worst case with headroom for the multishot recv SQE.
+    // Retain the existing SQ/CQ sizing for sends, receive bursts and timers.
+    // Buffer returns now publish descriptors directly, without an SQE/CQE.
     const ring_entries: u16 = buffer_count *| 4;
-    var ring = try linux.IoUring.init(ring_entries, 0);
+    var ring = try linux.IoUring.init(ring_entries, linux.IORING_SETUP_COOP_TASKRUN);
     errdefer ring.deinit();
 
     const total = @as(usize, buffer_count) * buffer_size;
@@ -53,8 +53,20 @@ pub fn init(
     const iovecs = try allocator.alloc(posix.iovec, buffer_count);
     errdefer allocator.free(iovecs);
 
+    const entries = std.math.ceilPowerOfTwo(u16, buffer_count) catch return error.InvalidConfig;
+    const br = try linux.IoUring.setup_buf_ring(ring.fd, entries, constants.buffer_group_id, .{ .inc = false });
+    linux.IoUring.buf_ring_init(br);
+    const mask = linux.IoUring.buf_ring_mask(entries);
+    for (0..buffer_count) |i| {
+        const offset = i * buffer_size;
+        linux.IoUring.buf_ring_add(br, buffers[offset..][0..buffer_size], @intCast(i), mask, @intCast(i));
+    }
+    linux.IoUring.buf_ring_advance(br, buffer_count);
+
     return .{
         .ring = ring,
+        .buffer_ring = br,
+        .buffer_ring_entries = entries,
         .buffers = buffers,
         .iovecs = iovecs,
         .buffer_count = buffer_count,
@@ -64,7 +76,11 @@ pub fn init(
 }
 
 pub fn deinit(io: *Io, allocator: std.mem.Allocator) void {
+    // Closing the ring first cancels its receive and releases kernel access.
+    // Do not unregister via a potentially reused fd after closing it.
     io.ring.deinit();
+    const ring_bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(io.buffer_ring);
+    std.posix.munmap(ring_bytes[0 .. @as(usize, io.buffer_ring_entries) * @sizeOf(linux.io_uring_buf)]);
     allocator.free(io.buffers);
     allocator.free(io.iovecs);
     if (io.fd_socket) |fd| {
@@ -72,7 +88,7 @@ pub fn deinit(io: *Io, allocator: std.mem.Allocator) void {
     }
 }
 
-/// Bind a UDP socket and provide buffers to the kernel pool.
+/// Bind and register a UDP socket. Buffers were published during init.
 pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
     const address = try platform.parseIp(bind_address, port);
     const family = platform.family(address);
@@ -108,24 +124,8 @@ pub fn setup(io: *Io, port: u16, bind_address: []const u8) !void {
         };
     }
 
-    // Provide initial buffer pool to the kernel.
-    // Note: register_buffers is intentionally not called — the server
-    // uses provided buffers (IOSQE_BUFFER_SELECT) not fixed buffer I/O,
-    // and register_buffers pins pages against RLIMIT_MEMLOCK which limits
-    // the number of io_uring instances that can run concurrently.
-    _ = try io.ring.provide_buffers(
-        @intFromEnum(UserData.provide_buffers),
-        @ptrCast(io.buffers.ptr),
-        io.buffer_size,
-        io.buffer_count,
-        constants.buffer_group_id,
-        0,
-    );
-    _ = try io.ring.submit();
-    const cqe = try io.ring.copy_cqe();
-    if (cqe.err() != .SUCCESS) {
-        return error.BufferSetupFailed;
-    }
+    try io.ring.register_files(&.{fd});
+    // The initial buffers were published in the shared ring during init.
 }
 
 /// Queue a multishot recvmsg operation.
@@ -133,10 +133,10 @@ pub fn recv_multishot(
     io: *Io,
     msg_header: *linux.msghdr,
 ) !void {
-    const fd = io.fd_socket orelse return error.SocketNotReady;
+    _ = io.fd_socket orelse return error.SocketNotReady;
     const sqe = try io.ring.get_sqe();
-    sqe.prep_recvmsg_multishot(fd, msg_header, MSG_TRUNC);
-    sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+    sqe.prep_recvmsg_multishot(0, msg_header, MSG_TRUNC);
+    sqe.flags |= linux.IOSQE_BUFFER_SELECT | linux.IOSQE_FIXED_FILE;
     sqe.user_data = @intFromEnum(UserData.recv_msg);
     sqe.buf_index = constants.buffer_group_id;
 }
@@ -146,9 +146,10 @@ pub fn send_msg(
     io: *Io,
     msg_header: *linux.msghdr_const,
 ) !void {
-    const fd = io.fd_socket orelse return error.SocketNotReady;
+    _ = io.fd_socket orelse return error.SocketNotReady;
     const sqe = try io.ring.get_sqe();
-    sqe.prep_sendmsg(fd, msg_header, 0);
+    sqe.prep_sendmsg(0, msg_header, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
     sqe.user_data = @intFromEnum(UserData.send_msg);
 }
 
@@ -166,18 +167,19 @@ pub fn submit(io: *Io) !u32 {
     return io.ring.submit();
 }
 
-/// Return a provided buffer to the kernel pool.
+/// Return a provided buffer once all references into it have been consumed/copied.
+/// A single producer publishes one whole datagram buffer; incremental mode is off.
 pub fn release_buffer(io: *Io, buffer_id: u16) !void {
     if (buffer_id >= io.buffer_count) return error.InvalidBufferId;
     const offset = @as(usize, buffer_id) * io.buffer_size;
-    _ = try io.ring.provide_buffers(
-        @intFromEnum(UserData.provide_buffers),
-        @ptrCast(io.buffers.ptr + offset),
-        io.buffer_size,
-        1,
-        constants.buffer_group_id,
+    linux.IoUring.buf_ring_add(
+        io.buffer_ring,
+        io.buffers[offset..][0..io.buffer_size],
         buffer_id,
+        linux.IoUring.buf_ring_mask(io.buffer_ring_entries),
+        0,
     );
+    linux.IoUring.buf_ring_advance(io.buffer_ring, 1);
 }
 
 /// Extract the peer address and payload from a recv CQE.
@@ -249,6 +251,15 @@ pub fn is_success(cqe: *const Cqe) bool {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+fn checkInitAllocation(allocator: std.mem.Allocator) !void {
+    var io = try Io.init(allocator, 4, 256);
+    defer io.deinit(allocator);
+}
+
+test "provided ring init cleans up after allocation failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkInitAllocation, .{});
+}
 
 test "SO_REUSEPORT allows two instances on same port" {
     const port: u16 = 19691;
