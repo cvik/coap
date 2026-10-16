@@ -115,7 +115,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     else
         @intCast(@min(std.Thread.getCpuCount() catch 1, 256));
 
-    var scenarios: [scenario_templates.len]?Scenario = .{null} ** scenario_templates.len;
+    var scenarios: [scenario_templates.len]?Scenario = @splat(null);
     var total: u16 = 0;
     for (scenario_templates, 0..) |tmpl, i| {
         if (config.payload_filter) |size| {
@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const counters = try alloc_shared_counters();
-    var results: [scenario_templates.len]?ScenarioResult = .{null} ** scenario_templates.len;
+    var results: [scenario_templates.len]?ScenarioResult = @splat(null);
     var current_group: ?ServerGroup = null;
     var server_pid: ?posix.pid_t = null;
     var scenario_num: u16 = 0;
@@ -327,7 +327,7 @@ fn run_scenario_plain_non(
     const per_thread = count / tc;
     const remainder = count % tc;
 
-    var send_errors: [256]u64 = .{0} ** 256;
+    var send_errors: [256]u64 = @splat(0);
     var spawned: usize = 0;
     errdefer for (threads[0..spawned]) |thread| thread.join();
 
@@ -960,7 +960,7 @@ fn run_bench(
         timestamps[token] = 0;
         consecutive_timeouts = 0;
         in_flight -= 1;
-        if (recv_buf[1] != @intFromEnum(coapz.Code.content)) {
+        if (recv_buf[1] != @backingInt(coapz.Code.content)) {
             result.errors += 1;
             continue;
         }
@@ -1145,7 +1145,7 @@ fn percentile_us(sorted: []i64, p: f64) f64 {
 }
 
 fn format_label(template: []const u8, thread_count: u16) [24]u8 {
-    var buf: [24]u8 = .{' '} ** 24;
+    var buf: [24]u8 = @splat(' ');
     var out_i: usize = 0;
     var in_i: usize = 0;
     while (in_i < template.len and out_i < buf.len) {
@@ -1284,7 +1284,7 @@ fn print_scenario_tree(
                 const l_branch: []const u8 = if (leaf_last) "└─" else "├─";
 
                 const tc: u16 = if (s.multi_thread) cpu_count else 1;
-                var leaf_buf: [12]u8 = .{' '} ** 12;
+                var leaf_buf: [12]u8 = @splat(' ');
                 _ = std.fmt.bufPrint(&leaf_buf, "{d:>2}T  {d:>4}B", .{ tc, s.payload_size }) catch {};
 
                 std.debug.print("  " ++ D ++ "{s}{s}{s}" ++ Z ++ " {s}", .{ tr_cont, ty_cont, l_branch, &leaf_buf });

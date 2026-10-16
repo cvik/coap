@@ -270,7 +270,7 @@ Any work on the above must preserve these properties:
 3. **No per-packet syscalls beyond io_uring** — batch submission
 4. **Common-case paths pay no tax for optional features** — separate responses,
    block transfers, observe registries must not add overhead when unused
-5. **Benchmark regression gate** — run `zig build bench -Doptimize=ReleaseFast`
+5. **Benchmark regression gate** — run `zig build bench -Doptimize=fast`
    before and after. No regressions in req/s or p99 latency for plain
    NON/CON echo workloads.
 

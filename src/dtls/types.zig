@@ -86,8 +86,8 @@ pub fn isDtlsContentType(byte: u8) bool {
 
 /// Encode a DTLS alert record (2 bytes: level + description).
 pub fn encodeAlert(level: AlertLevel, desc: AlertDescription, out: *[2]u8) void {
-    out[0] = @intFromEnum(level);
-    out[1] = @intFromEnum(desc);
+    out[0] = @backingInt(level);
+    out[1] = @backingInt(desc);
 }
 
 test "isDtlsContentType" {

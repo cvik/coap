@@ -933,7 +933,7 @@ uses shared-memory counters; remote NON uses unique receipt accounting. CON meas
 round-trip latency. Results vary by hardware — run on your own system:
 
 ```bash
-zig build bench -Doptimize=ReleaseFast
+zig build bench -Doptimize=fast
 ```
 
 Filter flags: `--plain-only`, `--dtls-only`, `--con-only`, `--non-only`,
@@ -944,12 +944,13 @@ server-side counters. `--allocator debug|smp` selects the client allocator
 (default: DebugAllocator); this is separate from the Zig build mode. DTLS
 workers synchronize after handshake/warmup and use one common wall interval
 for successful CON response throughput. See [bounded response storage and
-matched benchmarks](docs/CON_BUFFERS.md) and [the Zig 0.16 migration measurements](docs/ZIG_016_PERFORMANCE.md).
+matched benchmarks](docs/CON_BUFFERS.md), [the Zig 0.17 migration measurements](docs/ZIG_017_PERFORMANCE.md)
+and [the historical Zig 0.16 measurements](docs/ZIG_016_PERFORMANCE.md).
 
 For two-machine testing, build the dedicated configurable server:
 
 ```sh
-zig build bench-server -Doptimize=ReleaseFast
+zig build bench-server -Doptimize=fast
 ./zig-out/bin/bench-server --bind <server-wireguard-ip> --threads 8 --allocator smp
 ```
 
@@ -962,7 +963,14 @@ See [remote benchmark setup and accounting](docs/REMOTE_BENCHMARKS.md).
 ## Requirements
 
 - Linux kernel 6.0+ (multishot recvmsg; shared provided-buffer rings and cooperative task running)
-- Zig 0.16.0 (the currently supported toolchain)
+- Zig 0.17.0 (the currently supported toolchain)
+
+### Migrating from Zig 0.16
+
+Use optimization names `debug`, `safe`, `fast` and `small` (for example,
+`-Doptimize=fast`). Build scripts forward benchmark arguments through
+`run_bench.addPassthruArgs()`. The library's public API and io_uring backend
+are unchanged by this toolchain migration relative to current `main`.
 
 ### Migrating from Zig 0.15
 

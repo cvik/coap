@@ -97,7 +97,7 @@ test "prf: known-answer" {
     //   seed   = 64 zero bytes (client_random || server_random placeholder)
     const secret = "psk identity";
     const label = "master secret";
-    const seed = [_]u8{0x00} ** 64;
+    const seed: [64]u8 = @splat(0x00);
 
     // Expected: first 48 bytes of PRF output (standard master_secret length)
     const expected = [48]u8{

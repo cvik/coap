@@ -23,14 +23,14 @@ pub const AddrKey = struct {
     family: u16,
     addr: [16]u8,
 
-    pub const zero: AddrKey = .{ .family = 0, .addr = .{0} ** 16 };
+    pub const zero: AddrKey = .{ .family = 0, .addr = @splat(0) };
 
     pub fn fromAddress(address: std.Io.net.IpAddress) AddrKey {
         return switch (platform.family(address)) {
             posix.AF.INET => .{
                 .family = posix.AF.INET,
                 .addr = blk: {
-                    var a: [16]u8 = .{0} ** 16;
+                    var a: [16]u8 = @splat(0);
                     const src = address.ip4.bytes;
                     @memcpy(a[0..4], &src);
                     break :blk a;
@@ -50,7 +50,7 @@ pub const AddrKey = struct {
 
     pub fn hash(self: AddrKey) u64 {
         var h: u64 = 0xcbf29ce484222325;
-        const fam_bytes: [2]u8 = @bitCast(self.family);
+        const fam_bytes = std.mem.toBytes(self.family);
         for (fam_bytes) |b| {
             h ^= b;
             h *%= 0x100000001b3;
@@ -320,8 +320,8 @@ fn ipv4Key(comptime ip: u32) AddrKey {
     return .{
         .family = posix.AF.INET,
         .addr = blk: {
-            var a: [16]u8 = .{0} ** 16;
-            a[0..4].* = @bitCast(ip);
+            var a: [16]u8 = @splat(0);
+            a[0..4].* = std.mem.toBytes(ip);
             break :blk a;
         },
     };

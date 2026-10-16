@@ -65,9 +65,9 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !BlockTransfer {
         slot.* = .{
             .state = .free,
             .kind = .block1_receiving,
-            .token = .{0} ** 8,
+            .token = @splat(0),
             .token_len = 0,
-            .request_tag = .{0} ** 8,
+            .request_tag = @splat(0),
             .request_tag_len = 0,
             .peer_address = platform.ip4(.{ 0, 0, 0, 0 }, 0),
             .payload_length = 0,
@@ -116,14 +116,14 @@ pub fn allocate(
         .state = .active,
         .kind = kind,
         .token = blk: {
-            var t: [8]u8 = .{0} ** 8;
+            var t: [8]u8 = @splat(0);
             const len = @min(token.len, 8);
             @memcpy(t[0..len], token[0..len]);
             break :blk t;
         },
         .token_len = @intCast(@min(token.len, 8)),
         .request_tag = blk: {
-            var rt: [8]u8 = .{0} ** 8;
+            var rt: [8]u8 = @splat(0);
             const len = @min(request_tag.len, 8);
             @memcpy(rt[0..len], request_tag[0..len]);
             break :blk rt;
@@ -304,7 +304,7 @@ test "block1: reassemble three fragments" {
     const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
-    const block = [_]u8{0x42} ** 1024;
+    const block: [1024]u8 = @splat(0x42);
     try testing.expect(pool.appendBlock1(idx, 0, true, &block) == .more);
     try testing.expect(pool.appendBlock1(idx, 1, true, &block) == .more);
     try testing.expect(pool.appendBlock1(idx, 2, false, &block) == .complete);
@@ -335,7 +335,7 @@ test "block1: error on payload too large" {
     const idx = pool.allocate(&.{0xAA}, addr, .block1_receiving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
-    const big = [_]u8{0x42} ** 101;
+    const big: [101]u8 = @splat(0x42);
     try testing.expect(pool.appendBlock1(idx, 0, false, &big) == .error_too_large);
 }
 
@@ -344,7 +344,7 @@ test "block2: store payload and serve blocks" {
     defer pool.deinit(testing.allocator);
 
     const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
-    const payload = [_]u8{0x42} ** 2500;
+    const payload: [2500]u8 = @splat(0x42);
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -371,7 +371,7 @@ test "block2: smaller SZX negotiation" {
     defer pool.deinit(testing.allocator);
 
     const addr = platform.ip4(.{ 127, 0, 0, 1 }, 5683);
-    const payload = [_]u8{0x42} ** 600;
+    const payload: [600]u8 = @splat(0x42);
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
@@ -417,7 +417,7 @@ test "block2: payload_length readable after release for Size2" {
     const idx = pool.allocate(&.{0xAA}, addr, .block2_serving, 6, 0, &.{}) orelse
         return error.PoolExhausted;
 
-    const payload = [_]u8{0x42} ** 500;
+    const payload: [500]u8 = @splat(0x42);
     pool.storeBlock2Payload(idx, &payload);
 
     // Serve last block (only block for 500 bytes at SZX=6=1024).

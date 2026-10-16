@@ -121,7 +121,7 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Deferred {
     for (slots, 0..) |*slot, i| {
         slot.* = .{
             .state = std.atomic.Value(State).init(.free),
-            .token = .{0} ** 8,
+            .token = @splat(0),
             .token_len = 0,
             .peer_address = platform.ip4(.{ 0, 0, 0, 0 }, 0),
             .msg_id = 0,
@@ -173,7 +173,7 @@ pub fn allocate(
     slot.* = .{
         .state = std.atomic.Value(State).init(.pending),
         .token = blk: {
-            var t: [8]u8 = .{0} ** 8;
+            var t: [8]u8 = @splat(0);
             const len = @min(token.len, 8);
             @memcpy(t[0..len], token[0..len]);
             break :blk t;

@@ -1,6 +1,6 @@
 # Two-machine benchmarks
 
-Linux and Zig 0.16.0 are required. `bench-server` is a dedicated echo/measurement
+Linux and Zig 0.17.0 are required. `bench-server` is a dedicated echo/measurement
 server, not an example application server. Allow sufficient locked-memory budget
 for its io_uring workers (`ulimit -l`; local verification/CI use 8192 KiB). An
 insufficient budget can fail startup with `SystemResources`, even after buffer
@@ -14,7 +14,7 @@ DTLS-PSK, and one active measurement session at a time. Configuration is CLI-onl
 On the server machine, bind explicitly to its WireGuard address:
 
 ```sh
-zig build bench-server -Doptimize=ReleaseFast
+zig build bench-server -Doptimize=fast
 ./zig-out/bin/bench-server --bind <server-wg-ip> --port 5683 \
   --threads 8 --allocator smp --exchange-count 4096
 ```
@@ -28,13 +28,13 @@ On the client machine:
 
 ```sh
 # Completed CON responses over the client's measurement interval.
-zig build bench -Doptimize=ReleaseFast -- \
+zig build bench -Doptimize=fast -- \
   --no-server --host <server-wg-ip> --port 5683 \
   --threads 8 --multi-only --multi-window 256 \
   --plain-only --con-only --allocator smp --count 3000000
 
 # Unique NON requests received at the remote handler, including explicit loss.
-zig build bench -Doptimize=ReleaseFast -- \
+zig build bench -Doptimize=fast -- \
   --no-server --host <server-wg-ip> --port 5683 \
   --threads 8 --multi-only --plain-only --non-only \
   --allocator smp --count 3000000
@@ -79,7 +79,7 @@ values or printed; owned parsing/key buffers are cleared after use.
   --threads 8 --allocator smp --exchange-count 4096 --psk-file bench-psk.json
 
 # Client machine; replace --con-only with --non-only for receipt accounting.
-zig build bench -Doptimize=ReleaseFast -- \
+zig build bench -Doptimize=fast -- \
   --no-server --host <server-wg-ip> --port 5684 \
   --threads 8 --multi-only --multi-window 256 --allocator smp \
   --dtls-only --con-only --psk-file bench-psk.json --count 3000000
@@ -165,8 +165,8 @@ payloads. Concurrent requests needed to fill it depend on RTT, not just cores.
 
 ```sh
 zig build test
-zig build test -Doptimize=ReleaseSafe
-zig build -Doptimize=ReleaseFast
+zig build test -Doptimize=safe
+zig build -Doptimize=fast
 python3 bench/remote-smoke.py
 ```
 

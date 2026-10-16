@@ -25,7 +25,7 @@ pub const SocketAddress = extern union {
 
     pub fn init(a: std.Io.net.IpAddress) SocketAddress {
         return switch (a) {
-            .ip4 => |v| .{ .ip4 = .{ .port = std.mem.nativeToBig(u16, v.port), .addr = @bitCast(v.bytes) } },
+            .ip4 => |v| .{ .ip4 = .{ .port = std.mem.nativeToBig(u16, v.port), .addr = std.mem.bytesToValue(u32, &v.bytes) } },
             .ip6 => |v| .{ .ip6 = .{ .port = std.mem.nativeToBig(u16, v.port), .addr = v.bytes, .flowinfo = std.mem.nativeToBig(u32, v.flow), .scope_id = v.interface.index } },
         };
     }
@@ -40,7 +40,7 @@ pub const SocketAddress = extern union {
 
     pub fn address(a: *const SocketAddress) !std.Io.net.IpAddress {
         return switch (a.any.family) {
-            AF.INET => .{ .ip4 = .{ .port = std.mem.bigToNative(u16, a.ip4.port), .bytes = @bitCast(a.ip4.addr) } },
+            AF.INET => .{ .ip4 = .{ .port = std.mem.bigToNative(u16, a.ip4.port), .bytes = std.mem.toBytes(a.ip4.addr) } },
             AF.INET6 => .{ .ip6 = .{ .port = std.mem.bigToNative(u16, a.ip6.port), .bytes = a.ip6.addr, .flow = std.mem.bigToNative(u32, a.ip6.flowinfo), .interface = .{ .index = a.ip6.scope_id } } },
             else => error.UnsupportedAddressFamily,
         };
@@ -189,7 +189,7 @@ pub fn dup2(old: fd_t, new: fd_t) SocketError!void {
     _ = try result(linux.dup2(old, new));
 }
 pub fn waitpid(pid: pid_t, flags: u32) void {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     while (linux.errno(linux.waitpid(pid, &status, flags)) == .INTR) {}
 }
 
@@ -211,6 +211,15 @@ test "UDP syscall boundary reports WouldBlock and transfers datagrams" {
     try std.testing.expectEqual(@as(usize, 1), try poll(&fds, 1000));
     const received = try recv(receiver, &buffer, 0);
     try std.testing.expectEqualStrings("ping", buffer[0..received]);
+}
+
+test "IPv4 socket bytes preserve network byte order" {
+    const address = ip4(.{ 1, 2, 3, 4 }, 0x1234);
+    const sa = SocketAddress.init(address);
+    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 1, 2, 3, 4 }, sa.bytes()[2..8]);
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), sa.bytes()[8..16]);
+    const decoded = try sa.address();
+    try std.testing.expect(addressEqual(address, decoded));
 }
 
 test "native addresses round-trip through Linux socket representation" {

@@ -48,17 +48,17 @@ pub fn read(data: []const u8, options: []coapz.Option) Error!coapz.Packet {
         kind = std.math.add(u16, kind, delta) catch return error.InvalidOption;
         if (len > data.len - pos) return error.TruncatedOption;
         if (count >= options.len) return error.ResponseOptionsTooSmall;
-        options[count] = .{ .kind = @enumFromInt(kind), .value = data[pos..][0..len] };
+        options[count] = .{ .kind = @fromBackingInt(@intCast(kind)), .value = data[pos..][0..len] };
         count += 1;
         pos += len;
     }
-    return .{ .kind = @enumFromInt((data[0] >> 4) & 3), .code = @enumFromInt(data[1]), .msg_id = std.mem.readInt(u16, data[2..4], .big), .token = data[4..][0..tkl], .options = options[0..count], .payload = payload, .data_buf = &.{} };
+    return .{ .kind = @fromBackingInt(@intCast((data[0] >> 4) & 3)), .code = @fromBackingInt(@intCast(data[1])), .msg_id = std.mem.readInt(u16, data[2..4], .big), .token = data[4..][0..tkl], .options = options[0..count], .payload = payload, .data_buf = &.{} };
 }
 
 test "packet view decodes extended lengths, deltas, and repeated options" {
-    const a = [_]u8{7} ** 13;
-    const b = [_]u8{9} ** 269;
-    const packet: coapz.Packet = .{ .kind = .confirmable, .code = .content, .msg_id = 500, .token = "12345678", .payload = "end", .data_buf = &.{}, .options = &.{ .{ .kind = .uri_path, .value = &a }, .{ .kind = .uri_path, .value = &.{} }, .{ .kind = .size1, .value = &b }, .{ .kind = @enumFromInt(64000), .value = "x" } } };
+    const a: [13]u8 = @splat(7);
+    const b: [269]u8 = @splat(9);
+    const packet: coapz.Packet = .{ .kind = .confirmable, .code = .content, .msg_id = 500, .token = "12345678", .payload = "end", .data_buf = &.{}, .options = &.{ .{ .kind = .uri_path, .value = &a }, .{ .kind = .uri_path, .value = &.{} }, .{ .kind = .size1, .value = &b }, .{ .kind = @fromBackingInt(@intCast(64000)), .value = "x" } } };
     var wire: [1024]u8 = undefined;
     const data = try packet.writeBuf(&wire);
     var options: [4]coapz.Option = undefined;

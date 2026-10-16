@@ -12,12 +12,15 @@
 - Bound Block2 reassembly; correlate capacity failures and support local request cancellation
 - Preserve Block2 tokens/handles, sort continuation options, and handle empty ACK/RST and separate replies
 - Synchronize DTLS benchmark workers and report common-wall successful-response throughput; add allocator selection
-- Require Zig 0.16.0; replace public peer addresses with `std.Io.net.IpAddress`
+- Require Zig 0.17.0; replace public peer addresses with `std.Io.net.IpAddress`
 - Retain the Linux io_uring backend with native-address conversion at syscall boundaries
 - Use monotonic clocks for protocol deadlines and timing
 - Update allocator examples, benchmark argument handling, OpenSSL process APIs and CI
 - Vectorize full-block CCM CBC-MAC XOR; add independent boundary test vectors
 - Add `--payload-only` benchmark filtering and document migration performance measurements
+- Adopt Zig 0.17 array splats, backing-integer builtins, build argument forwarding and optimization names
+- Preserve native-endian Linux socket bytes across the Zig 0.17 `@bitCast` change; add socket-layout/decode tests
+- Avoid Zig 0.17 CCM array/vector bit-cast scalarization with unaligned byte-vector views; verify ciphertext and auth-failure output on unaligned buffers
 
 ## [0.7.2] - 2026-03-21
 - Fix: Block1 reassembled body now reaches handler (#81)

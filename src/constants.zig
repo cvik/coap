@@ -1,6 +1,5 @@
 /// Default configuration values and CoAP transmission parameters.
 /// RFC 7252 section 4.8.
-
 /// Default number of provided buffers for io_uring.
 /// Must exceed the max burst between tick() calls (client window size)
 /// plus headroom for packets arriving during CQE processing.

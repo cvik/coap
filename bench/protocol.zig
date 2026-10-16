@@ -14,14 +14,14 @@ pub const Start = struct {
         var bytes: [start_len]u8 = undefined;
         @memcpy(bytes[0..16], &self.nonce);
         std.mem.writeInt(u32, bytes[16..20], self.expected, .big);
-        bytes[20] = @intFromEnum(self.mode);
+        bytes[20] = @backingInt(self.mode);
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Start {
         if (bytes.len != start_len) return error.InvalidStart;
         const count = std.mem.readInt(u32, bytes[16..20], .big);
         if (count == 0 or count > max_requests or bytes[20] > 1) return error.InvalidStart;
-        return .{ .nonce = bytes[0..16].*, .expected = count, .mode = @enumFromInt(bytes[20]) };
+        return .{ .nonce = bytes[0..16].*, .expected = count, .mode = @fromBackingInt(@intCast(bytes[20])) };
     }
 };
 pub const Stats = struct {
